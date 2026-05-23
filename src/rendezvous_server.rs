@@ -555,6 +555,38 @@ impl RendezvousServer {
                             "relay target is not allowed by Nemo policy",
                         )
                         .await;
+                        let mut rr = RelayResponse {
+                            refuse_reason: "relay target is not allowed by Nemo policy".to_owned(),
+                            ..Default::default()
+                        };
+                        rr.set_id(nemo_id);
+                        let mut msg_out = RendezvousMessage::new();
+                        msg_out.set_relay_response(rr);
+                        allow_err!(self.send_to_tcp_sync(msg_out, addr).await);
+                        return true;
+                    }
+                    #[cfg(feature = "nemo-management-api")]
+                    if let Some((controller_id, reason)) = crate::nemo_management::controller_policy_rejection_from_field(
+                        &self.pm,
+                        &rf.licence_key,
+                        &nemo_id,
+                    )
+                    .await
+                    {
+                        crate::nemo_management::record_policy_rejection(
+                            &controller_id,
+                            addr,
+                            &reason,
+                        )
+                        .await;
+                        let mut rr = RelayResponse {
+                            refuse_reason: reason,
+                            ..Default::default()
+                        };
+                        rr.set_id(nemo_id);
+                        let mut msg_out = RendezvousMessage::new();
+                        msg_out.set_relay_response(rr);
+                        allow_err!(self.send_to_tcp_sync(msg_out, addr).await);
                         return true;
                     }
                     #[cfg(feature = "nemo-management-api")]
@@ -792,7 +824,7 @@ impl RendezvousServer {
             });
             return Ok((msg_out, None));
         }
-        let id = ph.id;
+        let id = ph.id.clone();
         #[cfg(feature = "nemo-management-api")]
         let nemo_nat_type = ph.nat_type.value();
         #[cfg(feature = "nemo-management-api")]
@@ -806,6 +838,24 @@ impl RendezvousServer {
             let mut msg_out = RendezvousMessage::new();
             msg_out.set_punch_hole_response(PunchHoleResponse {
                 failure: punch_hole_response::Failure::OFFLINE.into(),
+                other_failure: "target peer is not allowed by Nemo policy".to_owned(),
+                ..Default::default()
+            });
+            return Ok((msg_out, None));
+        }
+        #[cfg(feature = "nemo-management-api")]
+        if let Some((controller_id, reason)) = crate::nemo_management::controller_policy_rejection_from_field(
+            &self.pm,
+            &ph.version,
+            &id,
+        )
+        .await
+        {
+            crate::nemo_management::record_policy_rejection(&controller_id, addr, &reason).await;
+            let mut msg_out = RendezvousMessage::new();
+            msg_out.set_punch_hole_response(PunchHoleResponse {
+                failure: punch_hole_response::Failure::OFFLINE.into(),
+                other_failure: reason,
                 ..Default::default()
             });
             return Ok((msg_out, None));

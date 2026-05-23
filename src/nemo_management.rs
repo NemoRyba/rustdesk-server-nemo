@@ -23,6 +23,9 @@ use tokio::sync::RwLock;
 
 const EVENT_LIMIT: usize = 500;
 const MAX_MANAGEMENT_POLICY_VALUE_LEN: usize = 4096;
+const NEMO_SOURCE_PREFIX: &str = "nemo-source-v1:";
+const OPTION_NEMO_OUTBOUND_ENABLED: &str = "nemo-outbound-enabled";
+const OPTION_NEMO_OUTBOUND_TARGETS: &str = "nemo-outbound-targets";
 // Current client policy keys that are newer than this server fork's embedded
 // hbb_common key tables, plus Nemo-only GUI/management options.
 const CLIENT_MANAGEMENT_POLICY_KEYS: &[&str] = &[
@@ -85,6 +88,8 @@ const CLIENT_MANAGEMENT_POLICY_KEYS: &[&str] = &[
     "allow-remote-config-modification",
     "allow-numeric-one-time-password",
     "nemo-permanent-password",
+    OPTION_NEMO_OUTBOUND_ENABLED,
+    OPTION_NEMO_OUTBOUND_TARGETS,
     "enable-lan-discovery",
     "direct-server",
     "direct-access-port",
@@ -482,6 +487,83 @@ pub(crate) async fn is_peer_allowed(pm: &PeerMap, id: &str) -> bool {
     pm.is_peer_allowed_for_control(id, company_only()).await
 }
 
+fn target_allowed_by_controller_policy(targets: Option<&String>, target_id: &str) -> bool {
+    let Some(targets) = targets else {
+        return true;
+    };
+    if targets.trim().is_empty() {
+        return true;
+    }
+    targets
+        .split(|ch: char| ch == ',' || ch == ';' || ch.is_whitespace())
+        .map(str::trim)
+        .filter(|target| !target.is_empty())
+        .any(|target| target == "*" || target == target_id)
+}
+
+fn controller_source_identity(source_field: &str) -> Option<(String, Vec<u8>)> {
+    let start = source_field.find(NEMO_SOURCE_PREFIX)? + NEMO_SOURCE_PREFIX.len();
+    let payload = &source_field[start..];
+    let mut parts = payload.splitn(2, ':');
+    let source_id = parts.next()?.trim();
+    let source_uuid = parts.next()?.split_whitespace().next()?.trim();
+    if source_id.is_empty() || source_uuid.is_empty() {
+        return None;
+    }
+    let source_uuid = base64::decode(source_uuid).ok()?;
+    Some((source_id.to_owned(), source_uuid))
+}
+
+async fn controller_policy_rejection(
+    pm: &PeerMap,
+    source_id: &str,
+    source_uuid: &[u8],
+    target_id: &str,
+) -> Option<String> {
+    let source_id = source_id.trim();
+    if source_id.is_empty() {
+        return None;
+    }
+    let source = match pm.get_registered(source_id).await {
+        Ok(Some(source)) => source,
+        Ok(None) => return Some("controller is not registered by Nemo policy".to_owned()),
+        Err(err) => {
+            log::error!("failed to verify controller {}: {}", source_id, err);
+            return Some("controller policy could not be verified".to_owned());
+        }
+    };
+    if source_uuid.is_empty() || source.uuid.as_slice() != source_uuid {
+        return Some("controller identity rejected by Nemo policy".to_owned());
+    }
+    if matches!(source.status, Some(0)) {
+        return Some("controller is blocked by Nemo policy".to_owned());
+    }
+    let policy = management_policy_from_peer(&source.management_policy);
+    if policy
+        .options
+        .get(OPTION_NEMO_OUTBOUND_ENABLED)
+        .map(|value| value == "N")
+        .unwrap_or(false)
+    {
+        return Some("outgoing connections are disabled by Nemo policy".to_owned());
+    }
+    if !target_allowed_by_controller_policy(policy.options.get(OPTION_NEMO_OUTBOUND_TARGETS), target_id)
+    {
+        return Some("target is not allowed by Nemo policy".to_owned());
+    }
+    None
+}
+
+pub(crate) async fn controller_policy_rejection_from_field(
+    pm: &PeerMap,
+    source_field: &str,
+    target_id: &str,
+) -> Option<(String, String)> {
+    let (source_id, source_uuid) = controller_source_identity(source_field)?;
+    let reason = controller_policy_rejection(pm, &source_id, &source_uuid, target_id).await?;
+    Some((source_id, reason))
+}
+
 pub(crate) async fn peer_stats(id: &str) -> NemoPeerStats {
     STATS
         .read()
@@ -777,10 +859,17 @@ async fn client_policy(
     if let Some(version) = request.policy_version.as_deref() {
         log::trace!("Client {} requested management policy after {}", request.id, version);
     }
+    let mut policy = management_policy_from_peer(&peer.management_policy);
+    if matches!(peer.status, Some(0)) {
+        policy.allow_user_override = false;
+        policy
+            .options
+            .insert(OPTION_NEMO_OUTBOUND_ENABLED.to_owned(), "N".to_owned());
+    }
     let payload = ClientPolicyPayload {
         id: peer.id.clone(),
         issued_at: now_iso(),
-        policy: management_policy_from_peer(&peer.management_policy),
+        policy,
     };
     let payload_bytes = serde_json::to_vec(&payload).map_err(server_error)?;
     let signed_payload = state

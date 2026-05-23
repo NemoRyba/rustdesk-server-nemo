@@ -63,6 +63,8 @@ git revert <nemo-management-api-commit>
 - `POST /nemo/api/peers/{id}/block`
 - `POST /nemo/api/peers/{id}/allow`
 - `POST /nemo/api/peers/{id}/reset-policy`
+- `POST /nemo/api/peers/{id}/delete`
+- `POST /nemo/api/peers/delete`
 - `GET /nemo/api/peers/{id}/management-policy`
 - `PUT /nemo/api/peers/{id}/management-policy` with JSON body `{"allow_user_override":false,"options":{"enable-clipboard":"N"}}`
 - `POST /nemo/api/client/policy` with JSON body `{"id":"123456789","uuid":"base64"}`
@@ -115,6 +117,24 @@ registered peer row and returns:
 If hbbs has a signing key, `signed_payload` is the signed JSON bytes of
 `payload`. Nemo clients should configure the same public key in the Management
 dialog so policy is applied only when the signature verifies.
+
+Blocked peers also receive `nemo-outbound-enabled=N` as an authoritative
+management option. Updated Nemo clients use that option to disable outgoing
+connections locally.
+
+The server can additionally enforce controller-side policy during rendezvous
+when an updated Nemo client identifies itself in the request:
+
+- `nemo-outbound-enabled=N` rejects all outgoing control attempts from that
+  controller.
+- `nemo-outbound-targets` limits outgoing control attempts to exact target IDs
+  separated by comma, semicolon, or whitespace. `*` allows every target.
+
+The source identity is encoded inside existing RustDesk rendezvous fields, so
+this does not require a fork of the `hbb_common` protobuf submodule. Older
+clients that do not send a Nemo source identity can still be blocked as targets
+and can receive management policy, but hbbs cannot authenticate them as
+controllers during rendezvous.
 
 ## Data Covered
 
