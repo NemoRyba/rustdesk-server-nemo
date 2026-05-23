@@ -256,6 +256,15 @@ impl Database {
             .await?;
         Ok(result.rows_affected() > 0)
     }
+
+    pub async fn delete_registered_peer(&self, id: &str) -> ResultType<bool> {
+        let mut conn = self.pool.get().await?;
+        let result = sqlx::query("delete from peer where id = ?")
+            .bind(id)
+            .execute(conn.deref_mut())
+            .await?;
+        Ok(result.rows_affected() > 0)
+    }
 }
 
 fn registered_peer_from_row(row: SqliteRow) -> RegisteredPeer {

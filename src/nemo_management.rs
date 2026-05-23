@@ -15,7 +15,7 @@ use once_cell::sync::Lazy;
 use serde_derive::{Deserialize, Serialize};
 use sodiumoxide::crypto::sign;
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     net::SocketAddr,
     sync::atomic::{AtomicBool, Ordering},
 };
@@ -363,6 +363,17 @@ struct ManagementPolicyResponse {
     policy: ManagementPolicy,
 }
 
+#[derive(Deserialize)]
+struct DeletePeersRequest {
+    ids: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct DeletePeersResponse {
+    deleted: Vec<String>,
+    missing: Vec<String>,
+}
+
 #[derive(Serialize)]
 struct StatsPeerResponse {
     id: String,
@@ -426,7 +437,9 @@ pub(crate) async fn spawn_hbbs_api(
         .route("/nemo/admin/", get(admin_gui))
         .route("/nemo/api/health", get(health))
         .route("/nemo/api/peers", get(list_peers))
+        .route("/nemo/api/peers/delete", post(delete_peers))
         .route("/nemo/api/peers/:id", get(get_peer))
+        .route("/nemo/api/peers/:id/delete", post(delete_peer))
         .route("/nemo/api/peers/:id/block", post(block_peer))
         .route("/nemo/api/peers/:id/allow", post(allow_peer))
         .route("/nemo/api/peers/:id/reset-policy", post(reset_peer_policy))
@@ -808,6 +821,24 @@ async fn reset_peer_policy(
     set_peer_policy(&state.pm, &id, None).await
 }
 
+async fn delete_peer(
+    Path(id): Path<String>,
+    Extension(state): Extension<HbbsApiState>,
+    headers: HeaderMap,
+) -> ApiResult<DeletePeersResponse> {
+    require_auth(&headers, &state.token)?;
+    delete_peer_ids(&state.pm, vec![id]).await
+}
+
+async fn delete_peers(
+    Extension(state): Extension<HbbsApiState>,
+    headers: HeaderMap,
+    Json(request): Json<DeletePeersRequest>,
+) -> ApiResult<DeletePeersResponse> {
+    require_auth(&headers, &state.token)?;
+    delete_peer_ids(&state.pm, request.ids).await
+}
+
 async fn get_policy(
     Extension(state): Extension<HbbsApiState>,
     headers: HeaderMap,
@@ -874,6 +905,28 @@ async fn get_events(
         .cloned()
         .collect();
     Ok(Json(EventsResponse { events }))
+}
+
+async fn delete_peer_ids(pm: &PeerMap, ids: Vec<String>) -> ApiResult<DeletePeersResponse> {
+    let mut seen = HashSet::new();
+    let mut deleted = Vec::new();
+    let mut missing = Vec::new();
+    for id in ids {
+        let id = id.trim().to_owned();
+        if id.is_empty() || !seen.insert(id.clone()) {
+            continue;
+        }
+        let was_deleted = pm.delete_registered(&id).await.map_err(server_error)?;
+        if was_deleted {
+            deleted.push(id.clone());
+            let mut store = STATS.write().await;
+            store.peers.remove(&id);
+            record_event_locked(&mut store, "peer-delete", Some(&id), None, "deleted".to_owned());
+        } else {
+            missing.push(id);
+        }
+    }
+    Ok(Json(DeletePeersResponse { deleted, missing }))
 }
 
 async fn set_peer_policy(

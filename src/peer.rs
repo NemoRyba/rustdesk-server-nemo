@@ -229,6 +229,14 @@ impl PeerMap {
             .await
     }
 
+    pub(crate) async fn delete_registered(&self, id: &str) -> ResultType<bool> {
+        let deleted = self.db.delete_registered_peer(id).await?;
+        if deleted {
+            self.map.write().await.remove(id);
+        }
+        Ok(deleted)
+    }
+
     pub(crate) async fn peer_status(&self, id: &str) -> ResultType<Option<i64>> {
         if let Some(peer) = self.get_in_memory(id).await {
             let peer = peer.read().await;

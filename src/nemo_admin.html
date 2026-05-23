@@ -53,6 +53,14 @@
       background: #f8fafb;
     }
 
+    button:disabled,
+    button:disabled:hover {
+      border-color: var(--line);
+      background: #f3f5f7;
+      color: #9aa5b1;
+      cursor: not-allowed;
+    }
+
     button.primary {
       background: var(--accent);
       border-color: var(--accent);
@@ -234,6 +242,7 @@
       display: flex;
       align-items: center;
       justify-content: space-between;
+      flex-wrap: wrap;
       gap: 10px;
       padding: 10px 12px;
       border-bottom: 1px solid var(--line);
@@ -254,6 +263,15 @@
       width: min(650px, 100%);
     }
 
+    .peer-tools {
+      display: grid;
+      grid-template-columns: minmax(280px, 650px) auto;
+      gap: 8px;
+      align-items: center;
+      justify-content: end;
+      max-width: 100%;
+    }
+
     .table-wrap {
       overflow: auto;
       max-height: calc(100vh - 250px);
@@ -261,7 +279,7 @@
 
     table {
       width: 100%;
-      min-width: 980px;
+      min-width: 1080px;
       border-collapse: collapse;
     }
 
@@ -293,6 +311,19 @@
     tbody tr:hover,
     tbody tr.selected {
       background: #eef8f9;
+    }
+
+    .select-cell {
+      width: 42px;
+      text-align: center;
+    }
+
+    .select-cell input {
+      min-height: auto;
+      width: 16px;
+      height: 16px;
+      padding: 0;
+      vertical-align: middle;
     }
 
     .mono {
@@ -475,11 +506,13 @@
       }
 
       .panel-head,
+      .peer-tools,
       .filters,
       .side {
         grid-template-columns: 1fr;
       }
 
+      .peer-tools,
       .filters {
         width: 100%;
       }
@@ -516,23 +549,27 @@
       <section class="panel">
         <div class="panel-head">
           <h2 class="panel-title">Peers</h2>
-          <div class="filters">
-            <input id="search" type="search" placeholder="Search ID or address">
-            <select id="filter">
-              <option value="all">All peers</option>
-              <option value="online">Online</option>
-              <option value="offline">Offline</option>
-              <option value="allowed">Allowed</option>
-              <option value="blocked">Blocked</option>
-              <option value="unapproved">Unapproved</option>
-            </select>
-            <button id="clear">Clear</button>
+          <div class="peer-tools">
+            <div class="filters">
+              <input id="search" type="search" placeholder="Search ID or address">
+              <select id="filter">
+                <option value="all">All peers</option>
+                <option value="online">Online</option>
+                <option value="offline">Offline</option>
+                <option value="allowed">Allowed</option>
+                <option value="blocked">Blocked</option>
+                <option value="unapproved">Unapproved</option>
+              </select>
+              <button id="clear">Clear</button>
+            </div>
+            <button id="deleteSelected" class="danger" disabled>Delete selected</button>
           </div>
         </div>
         <div class="table-wrap">
           <table>
             <thead>
               <tr>
+                <th class="select-cell"><input id="selectAllPeers" type="checkbox" aria-label="Select all visible peers"></th>
                 <th>ID</th>
                 <th>State</th>
                 <th>Policy</th>
@@ -576,6 +613,7 @@
       stats: null,
       events: [],
       selectedId: null,
+      selectedIds: new Set(),
       timer: null
     };
     const managementOptions = [
@@ -642,6 +680,16 @@
     $("refresh").addEventListener("click", loadAll);
     $("search").addEventListener("input", renderPeers);
     $("filter").addEventListener("change", renderPeers);
+    $("selectAllPeers").addEventListener("change", (event) => {
+      const peers = filteredPeers();
+      if (event.target.checked) {
+        peers.forEach((peer) => state.selectedIds.add(peer.id));
+      } else {
+        peers.forEach((peer) => state.selectedIds.delete(peer.id));
+      }
+      renderPeers();
+    });
+    $("deleteSelected").addEventListener("click", deleteSelectedPeers);
     $("clear").addEventListener("click", () => {
       $("search").value = "";
       $("filter").value = "all";
@@ -689,6 +737,9 @@
         ]);
         $("companyOnly").checked = !!health.company_only;
         state.peers = peers.peers || [];
+        const currentIds = new Set(state.peers.map((peer) => peer.id));
+        state.selectedIds = new Set([...state.selectedIds].filter((id) => currentIds.has(id)));
+        if (state.selectedId && !currentIds.has(state.selectedId)) state.selectedId = null;
         state.stats = stats;
         state.events = events.events || [];
         setHealth("ok", "Online");
@@ -749,6 +800,7 @@
 
       for (const peer of peers) {
         const tr = document.createElement("tr");
+        const checked = state.selectedIds.has(peer.id) ? "checked" : "";
         tr.className = peer.id === state.selectedId ? "selected" : "";
         tr.addEventListener("click", () => {
           state.selectedId = peer.id;
@@ -756,6 +808,7 @@
           renderDetail();
         });
         tr.innerHTML = `
+          <td class="select-cell"><input class="peer-select" type="checkbox" data-id="${escapeHtml(peer.id)}" ${checked} aria-label="Select ${escapeHtml(peer.id)}"></td>
           <td class="mono">${escapeHtml(peer.id)}</td>
           <td>${badge(peer.online ? "online" : "offline")}</td>
           <td>${badge(peer.policy)}</td>
@@ -770,21 +823,71 @@
               <button data-action="allow" data-id="${escapeHtml(peer.id)}">Allow</button>
               <button class="danger" data-action="block" data-id="${escapeHtml(peer.id)}">Block</button>
               <button data-action="reset-policy" data-id="${escapeHtml(peer.id)}">Reset</button>
+              <button class="danger" data-action="delete" data-id="${escapeHtml(peer.id)}">Delete</button>
             </div>
           </td>
         `;
         tbody.appendChild(tr);
       }
 
+      tbody.querySelectorAll(".peer-select").forEach((checkbox) => {
+        checkbox.addEventListener("click", (event) => event.stopPropagation());
+        checkbox.addEventListener("change", (event) => {
+          const id = event.currentTarget.dataset.id;
+          if (event.currentTarget.checked) {
+            state.selectedIds.add(id);
+          } else {
+            state.selectedIds.delete(id);
+          }
+          updateSelectionControls(peers);
+        });
+      });
+
       tbody.querySelectorAll("button[data-action]").forEach((button) => {
         button.addEventListener("click", async (event) => {
           event.stopPropagation();
           const id = event.currentTarget.dataset.id;
           const action = event.currentTarget.dataset.action;
-          await api(`/nemo/api/peers/${encodeURIComponent(id)}/${action}`, { method: "POST" });
-          await loadAll();
+          if (action === "delete") {
+            await deletePeerIds([id]);
+          } else {
+            await api(`/nemo/api/peers/${encodeURIComponent(id)}/${action}`, { method: "POST" });
+            await loadAll();
+          }
         });
       });
+      updateSelectionControls(peers);
+    }
+
+    function updateSelectionControls(peers = filteredPeers()) {
+      const visibleSelected = peers.filter((peer) => state.selectedIds.has(peer.id)).length;
+      const selectAll = $("selectAllPeers");
+      selectAll.checked = peers.length > 0 && visibleSelected === peers.length;
+      selectAll.indeterminate = visibleSelected > 0 && visibleSelected < peers.length;
+
+      const deleteButton = $("deleteSelected");
+      deleteButton.disabled = state.selectedIds.size === 0;
+      deleteButton.textContent = state.selectedIds.size
+        ? `Delete selected (${state.selectedIds.size})`
+        : "Delete selected";
+    }
+
+    async function deleteSelectedPeers() {
+      await deletePeerIds([...state.selectedIds]);
+    }
+
+    async function deletePeerIds(ids) {
+      const uniqueIds = [...new Set(ids)].filter(Boolean);
+      if (!uniqueIds.length) return;
+      const label = uniqueIds.length === 1 ? uniqueIds[0] : `${uniqueIds.length} peers`;
+      if (!confirm(`Delete ${label}? Online peers may re-register automatically.`)) return;
+      await api("/nemo/api/peers/delete", {
+        method: "POST",
+        body: JSON.stringify({ ids: uniqueIds })
+      });
+      uniqueIds.forEach((id) => state.selectedIds.delete(id));
+      if (uniqueIds.includes(state.selectedId)) state.selectedId = null;
+      await loadAll();
     }
 
     function renderDetail() {
