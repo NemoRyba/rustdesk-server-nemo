@@ -64,7 +64,7 @@ git revert <nemo-management-api-commit>
 - `POST /nemo/api/peers/{id}/allow`
 - `POST /nemo/api/peers/{id}/reset-policy`
 - `GET /nemo/api/peers/{id}/management-policy`
-- `PUT /nemo/api/peers/{id}/management-policy` with JSON body `{"options":{"enable-clipboard":"N"}}`
+- `PUT /nemo/api/peers/{id}/management-policy` with JSON body `{"allow_user_override":false,"options":{"enable-clipboard":"N"}}`
 - `POST /nemo/api/client/policy` with JSON body `{"id":"123456789","uuid":"base64"}`
 - `GET /nemo/api/policy`
 - `PUT /nemo/api/policy` with JSON body `{"company_only":true}`
@@ -89,11 +89,13 @@ Per-client management policy is stored in SQLite `peer.management_policy`.
 The first policy shape is:
 
 ```json
-{"options":{"enable-clipboard":"N","enable-file-transfer":"Y"}}
+{"allow_user_override":false,"options":{"enable-clipboard":"N","enable-file-transfer":"Y"}}
 ```
 
-Only known RustDesk controlled-side option keys are accepted. Unknown keys and
-unknown values are dropped before storage.
+Only known RustDesk user-facing option keys are accepted. Unknown keys are
+dropped before storage. By default `allow_user_override` is false, so the
+client treats policy values as fixed/authoritative settings. When it is true,
+the same values are applied as defaults and users may override them locally.
 
 The client policy endpoint validates the client's base64 UUID against the
 registered peer row and returns:
@@ -105,7 +107,7 @@ registered peer row and returns:
   "payload": {
     "id": "123456789",
     "issued_at": "2026-05-23T12:00:00Z",
-    "policy": {"options": {"enable-clipboard": "N"}}
+    "policy": {"allow_user_override": false, "options": {"enable-clipboard": "N"}}
   }
 }
 ```

@@ -68,7 +68,8 @@
     }
 
     input,
-    select {
+    select,
+    textarea {
       min-height: 34px;
       border: 1px solid var(--line);
       border-radius: 6px;
@@ -80,6 +81,7 @@
 
     input:focus,
     select:focus,
+    textarea:focus,
     button:focus {
       outline: 2px solid rgba(8, 127, 140, .22);
       outline-offset: 1px;
@@ -401,6 +403,16 @@
       justify-content: flex-end;
     }
 
+    .policy-json {
+      width: 100%;
+      min-height: 150px;
+      resize: vertical;
+      font-family: "Cascadia Mono", "Consolas", monospace;
+      font-size: 12px;
+      line-height: 1.35;
+      white-space: pre;
+    }
+
     .event {
       display: grid;
       gap: 3px;
@@ -567,20 +579,57 @@
       timer: null
     };
     const managementOptions = [
-      ["enable-keyboard", "Keyboard and mouse"],
-      ["enable-clipboard", "Clipboard"],
-      ["enable-file-transfer", "File transfer"],
-      ["enable-camera", "Camera"],
-      ["enable-terminal", "Terminal"],
-      ["enable-audio", "Audio"],
-      ["enable-tunnel", "TCP tunneling"],
-      ["enable-remote-restart", "Remote restart"],
-      ["enable-record-session", "Session recording"],
-      ["enable-block-input", "Block local input"],
-      ["enable-privacy-mode", "Privacy mode"],
-      ["enable-remote-printer", "Remote printer"],
-      ["allow-remote-config-modification", "Remote config changes"],
-      ["enable-lan-discovery", "LAN discovery"]
+      ["enable-keyboard", "Keyboard and mouse", "bool"],
+      ["enable-clipboard", "Clipboard", "bool"],
+      ["enable-file-transfer", "File transfer", "bool"],
+      ["enable-camera", "Camera", "bool"],
+      ["enable-terminal", "Terminal", "bool"],
+      ["enable-audio", "Audio", "bool"],
+      ["enable-tunnel", "TCP tunneling", "bool"],
+      ["enable-remote-restart", "Remote restart", "bool"],
+      ["enable-record-session", "Session recording", "bool"],
+      ["enable-block-input", "Block local input", "bool"],
+      ["enable-privacy-mode", "Privacy mode", "bool"],
+      ["enable-remote-printer", "Remote printer", "bool"],
+      ["allow-remote-config-modification", "Remote config changes", "bool"],
+      ["enable-lan-discovery", "LAN discovery", "bool"],
+      ["allow-auto-disconnect", "Auto disconnect", "bool"],
+      ["allow-auto-record-incoming", "Auto record incoming", "bool"],
+      ["allow-auto-record-outgoing", "Auto record outgoing", "bool"],
+      ["allow-remove-wallpaper", "Remove wallpaper", "bool"],
+      ["allow-always-software-render", "Software render allowed", "bool"],
+      ["allow-websocket", "Use WebSocket", "bool"],
+      ["disable-udp", "Disable UDP", "bool"],
+      ["allow-insecure-tls-fallback", "Insecure TLS fallback", "bool"],
+      ["allow-auto-update", "Auto update", "bool"],
+      ["enable-confirm-closing-tabs", "Confirm closing tabs", "bool"],
+      ["enable-open-new-connections-in-tabs", "Open connections in tabs", "bool"],
+      ["allow-d3d-render", "D3D render", "bool"],
+      ["use-texture-render", "Texture render", "bool"],
+      ["custom-rendezvous-server", "ID server", "text"],
+      ["relay-server", "Relay server", "text"],
+      ["api-server", "API server", "text"],
+      ["key", "Server public key", "text"],
+      ["direct-access-port", "Direct access port", "text"],
+      ["whitelist", "IP whitelist", "text"],
+      ["proxy-url", "Proxy URL", "text"],
+      ["proxy-username", "Proxy username", "text"],
+      ["verification-method", "Verification method", "select", [["", "Local"], ["use-temporary-password", "Temporary password"], ["use-permanent-password", "Permanent password"], ["use-both-passwords", "Both passwords"]]],
+      ["approve-mode", "Approval mode", "select", [["", "Local"], ["password-click", "Password + click"], ["click", "Click"], ["password", "Password"]]],
+      ["temporary-password-length", "Temporary password length", "text"],
+      ["access-mode", "Access mode", "text"],
+      ["auto-disconnect-timeout", "Auto disconnect timeout", "text"],
+      ["lang", "Language", "text"],
+      ["theme", "Theme", "select", [["", "Local"], ["dark", "Dark"], ["light", "Light"], ["system", "System"]]],
+      ["video-save-directory", "Recording directory", "text"],
+      ["codec-preference", "Codec preference", "text"],
+      ["image_quality", "Image quality", "text"],
+      ["custom-fps", "FPS", "text"],
+      ["view_style", "View style", "text"],
+      ["show_remote_cursor", "Show remote cursor", "bool"],
+      ["lock_after_session_end", "Lock after session", "bool"],
+      ["privacy_mode", "Privacy mode default", "bool"],
+      ["sync-init-clipboard", "Sync initial clipboard", "bool"]
     ];
 
     const tokenInput = $("token");
@@ -747,7 +796,11 @@
         return;
       }
       const stats = peer.stats || {};
-      const policyOptions = peer.management_policy?.options || {};
+      const managementPolicy = peer.management_policy || {};
+      const policyOptions = managementPolicy.options || {};
+      const allowUserOverride = !!managementPolicy.allow_user_override;
+      const advancedOptions = {};
+      Object.keys(policyOptions).sort().forEach((key) => advancedOptions[key] = policyOptions[key]);
       detail.className = "detail";
       detail.innerHTML = `
         <dl class="kv">
@@ -770,22 +823,36 @@
         </dl>
         <div class="management-policy">
           <h3>Management</h3>
+          <label class="switch"><input id="allowUserOverride" type="checkbox" ${allowUserOverride ? "checked" : ""}>Allow user override</label>
           <div class="policy-grid">
-            ${managementOptions.map(([key, label]) => policyControl(key, label, policyOptions[key] || "")).join("")}
+            ${managementOptions.map((option) => policyControl(option, policyOptions[option[0]] || "")).join("")}
           </div>
+          <textarea id="policyOptionsJson" class="policy-json" spellcheck="false">${escapeHtml(JSON.stringify(advancedOptions, null, 2))}</textarea>
           <div class="policy-actions">
             <button id="saveManagementPolicy" class="primary">Save Management</button>
           </div>
         </div>
       `;
       $("saveManagementPolicy").addEventListener("click", async () => {
-        const options = {};
-        detail.querySelectorAll("select[data-policy-key]").forEach((select) => {
-          if (select.value) options[select.dataset.policyKey] = select.value;
+        let options = {};
+        const raw = $("policyOptionsJson").value.trim();
+        if (raw) {
+          options = JSON.parse(raw);
+          if (!options || Array.isArray(options) || typeof options !== "object") throw new Error("Advanced settings must be a JSON object");
+        }
+        detail.querySelectorAll("[data-policy-key]").forEach((input) => {
+          if (input.value) {
+            options[input.dataset.policyKey] = input.value;
+          } else {
+            delete options[input.dataset.policyKey];
+          }
         });
         await api(`/nemo/api/peers/${encodeURIComponent(peer.id)}/management-policy`, {
           method: "PUT",
-          body: JSON.stringify({ options })
+          body: JSON.stringify({
+            allow_user_override: $("allowUserOverride").checked,
+            options
+          })
         });
         await loadAll();
       });
@@ -813,14 +880,22 @@
       return `<span class="badge ${escapeAttr(label)}">${escapeHtml(label)}</span>`;
     }
 
-    function policyControl(key, label, value) {
+    function policyControl(option, value) {
+      const [key, label, type, choices] = option;
+      if (type === "text") {
+        return `
+          <div class="policy-row">
+            <label for="policy-${escapeAttr(key)}">${escapeHtml(label)}</label>
+            <input id="policy-${escapeAttr(key)}" data-policy-key="${escapeHtml(key)}" value="${escapeHtml(value)}" placeholder="Local">
+          </div>
+        `;
+      }
+      const items = choices || [["", "Local"], ["Y", "Allow"], ["N", "Deny"]];
       return `
         <div class="policy-row">
           <label for="policy-${escapeAttr(key)}">${escapeHtml(label)}</label>
-          <select id="policy-${escapeAttr(key)}" data-policy-key="${escapeAttr(key)}">
-            <option value="" ${value ? "" : "selected"}>Local</option>
-            <option value="Y" ${value === "Y" ? "selected" : ""}>Allow</option>
-            <option value="N" ${value === "N" ? "selected" : ""}>Deny</option>
+          <select id="policy-${escapeAttr(key)}" data-policy-key="${escapeHtml(key)}">
+            ${items.map(([itemValue, itemLabel]) => `<option value="${escapeHtml(itemValue)}" ${value === itemValue ? "selected" : ""}>${escapeHtml(itemLabel)}</option>`).join("")}
           </select>
         </div>
       `;

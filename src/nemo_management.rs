@@ -10,7 +10,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use hbb_common::{bail, log, tokio, ResultType};
+use hbb_common::{bail, config::keys, log, tokio, ResultType};
 use once_cell::sync::Lazy;
 use serde_derive::{Deserialize, Serialize};
 use sodiumoxide::crypto::sign;
@@ -22,22 +22,7 @@ use std::{
 use tokio::sync::RwLock;
 
 const EVENT_LIMIT: usize = 500;
-const MANAGEMENT_POLICY_KEYS: &[&str] = &[
-    "enable-keyboard",
-    "enable-clipboard",
-    "enable-file-transfer",
-    "enable-camera",
-    "enable-terminal",
-    "enable-audio",
-    "enable-tunnel",
-    "enable-remote-restart",
-    "enable-record-session",
-    "enable-block-input",
-    "enable-privacy-mode",
-    "enable-remote-printer",
-    "allow-remote-config-modification",
-    "enable-lan-discovery",
-];
+const MAX_MANAGEMENT_POLICY_VALUE_LEN: usize = 4096;
 
 static COMPANY_ONLY: AtomicBool = AtomicBool::new(false);
 static STATS: Lazy<RwLock<NemoStatsStore>> = Lazy::new(|| RwLock::new(NemoStatsStore::default()));
@@ -126,11 +111,15 @@ struct PolicyRequest {
 #[derive(Clone, Default, Serialize, Deserialize)]
 struct ManagementPolicy {
     #[serde(default)]
+    allow_user_override: bool,
+    #[serde(default)]
     options: HashMap<String, String>,
 }
 
 #[derive(Deserialize)]
 struct ManagementPolicyRequest {
+    #[serde(default)]
+    allow_user_override: bool,
     #[serde(default)]
     options: HashMap<String, String>,
 }
@@ -569,6 +558,7 @@ async fn update_peer_management_policy(
 ) -> ApiResult<ManagementPolicyResponse> {
     require_auth(&headers, &state.token)?;
     let policy = sanitize_management_policy(ManagementPolicy {
+        allow_user_override: request.allow_user_override,
         options: request.options,
     });
     let serialized = serialize_management_policy(&policy)?;
@@ -808,21 +798,30 @@ fn management_policy_from_peer(value: &Option<String>) -> ManagementPolicy {
 
 fn sanitize_management_policy(mut policy: ManagementPolicy) -> ManagementPolicy {
     policy.options.retain(|key, value| {
-        let Some(normalized) = normalize_management_policy_value(value) else {
+        let Some(normalized) = sanitize_management_policy_value(key, value) else {
             return false;
         };
         *value = normalized;
-        MANAGEMENT_POLICY_KEYS.contains(&key.as_str())
+        true
     });
     policy
 }
 
-fn normalize_management_policy_value(value: &str) -> Option<String> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "1" | "y" | "yes" | "true" | "on" | "allow" | "allowed" => Some("Y".to_owned()),
-        "0" | "n" | "no" | "false" | "off" | "deny" | "denied" => Some("N".to_owned()),
-        _ => None,
+fn sanitize_management_policy_value(key: &str, value: &str) -> Option<String> {
+    if !is_management_policy_key(key) {
+        return None;
     }
+    let value = value.trim();
+    if value.len() > MAX_MANAGEMENT_POLICY_VALUE_LEN {
+        return None;
+    }
+    Some(value.to_owned())
+}
+
+fn is_management_policy_key(key: &str) -> bool {
+    keys::KEYS_SETTINGS.contains(&key)
+        || keys::KEYS_LOCAL_SETTINGS.contains(&key)
+        || keys::KEYS_DISPLAY_SETTINGS.contains(&key)
 }
 
 fn serialize_management_policy(policy: &ManagementPolicy) -> Result<Option<String>, ApiFailure> {
