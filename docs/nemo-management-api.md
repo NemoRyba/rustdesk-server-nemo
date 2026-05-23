@@ -26,6 +26,14 @@ Authorization: Bearer change-me
 X-Nemo-Token: change-me
 ```
 
+The built-in admin GUI is served by the same feature/API:
+
+```text
+http://127.0.0.1:21120/nemo/admin
+```
+
+If `--nemo-api-token` is set, enter the same token in the GUI token field.
+
 ## Disable
 
 Runtime off:
@@ -48,6 +56,7 @@ git revert <nemo-management-api-commit>
 
 ## Endpoints
 
+- `GET /nemo/admin`
 - `GET /nemo/api/health`
 - `GET /nemo/api/peers?limit=100&offset=0`
 - `GET /nemo/api/peers/{id}`

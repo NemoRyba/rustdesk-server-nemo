@@ -1,0 +1,780 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Nemo Admin</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f6f7f9;
+      --panel: #ffffff;
+      --line: #d6dce2;
+      --muted: #62707f;
+      --text: #18212b;
+      --accent: #087f8c;
+      --accent-strong: #05606a;
+      --danger: #b42318;
+      --ok: #1f7a4d;
+      --warn: #a45d00;
+      --shadow: 0 8px 22px rgba(24, 33, 43, .07);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font: 14px/1.45 "Segoe UI", system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+    }
+
+    button,
+    input,
+    select {
+      font: inherit;
+    }
+
+    button {
+      min-height: 34px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #fff;
+      color: var(--text);
+      cursor: pointer;
+      padding: 6px 10px;
+      white-space: nowrap;
+    }
+
+    button:hover {
+      border-color: #9aa8b6;
+      background: #f8fafb;
+    }
+
+    button.primary {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: #fff;
+    }
+
+    button.primary:hover {
+      background: var(--accent-strong);
+    }
+
+    button.danger {
+      color: var(--danger);
+    }
+
+    input,
+    select {
+      min-height: 34px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #fff;
+      color: var(--text);
+      padding: 6px 9px;
+      min-width: 0;
+    }
+
+    input:focus,
+    select:focus,
+    button:focus {
+      outline: 2px solid rgba(8, 127, 140, .22);
+      outline-offset: 1px;
+    }
+
+    .app {
+      min-height: 100vh;
+      display: grid;
+      grid-template-rows: auto auto 1fr;
+    }
+
+    .topbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 12px 18px;
+      background: var(--panel);
+      border-bottom: 1px solid var(--line);
+      position: sticky;
+      top: 0;
+      z-index: 4;
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      min-width: 160px;
+    }
+
+    .mark {
+      width: 28px;
+      height: 28px;
+      border-radius: 6px;
+      background:
+        linear-gradient(135deg, transparent 0 44%, rgba(255,255,255,.48) 45% 55%, transparent 56%),
+        var(--accent);
+      box-shadow: inset 0 -10px 18px rgba(0,0,0,.12);
+    }
+
+    h1 {
+      margin: 0;
+      font-size: 17px;
+      font-weight: 700;
+      letter-spacing: 0;
+    }
+
+    .top-actions {
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
+    .token {
+      width: min(320px, 38vw);
+    }
+
+    .switch {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      min-height: 34px;
+      padding: 0 4px;
+      color: var(--muted);
+      white-space: nowrap;
+    }
+
+    .switch input {
+      min-height: auto;
+      width: 17px;
+      height: 17px;
+      accent-color: var(--accent);
+    }
+
+    .status {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      color: var(--muted);
+      min-width: 100px;
+    }
+
+    .dot {
+      width: 9px;
+      height: 9px;
+      border-radius: 999px;
+      background: #9aa8b6;
+      flex: 0 0 auto;
+    }
+
+    .dot.ok {
+      background: var(--ok);
+    }
+
+    .dot.bad {
+      background: var(--danger);
+    }
+
+    .summary {
+      display: grid;
+      grid-template-columns: repeat(6, minmax(120px, 1fr));
+      gap: 10px;
+      padding: 14px 18px 0;
+    }
+
+    .metric {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 10px 12px;
+      box-shadow: var(--shadow);
+      min-height: 72px;
+    }
+
+    .metric strong {
+      display: block;
+      font-size: 22px;
+      line-height: 1.15;
+      margin: 2px 0 5px;
+    }
+
+    .metric span {
+      color: var(--muted);
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: .04em;
+    }
+
+    main {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 370px;
+      gap: 14px;
+      padding: 14px 18px 18px;
+      min-height: 0;
+    }
+
+    .panel {
+      min-width: 0;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      box-shadow: var(--shadow);
+      overflow: hidden;
+    }
+
+    .panel-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--line);
+      background: #fbfcfd;
+    }
+
+    .panel-title {
+      margin: 0;
+      font-size: 14px;
+      font-weight: 700;
+    }
+
+    .filters {
+      display: grid;
+      grid-template-columns: minmax(160px, 1fr) 150px auto;
+      gap: 8px;
+      align-items: center;
+      width: min(650px, 100%);
+    }
+
+    .table-wrap {
+      overflow: auto;
+      max-height: calc(100vh - 250px);
+    }
+
+    table {
+      width: 100%;
+      min-width: 980px;
+      border-collapse: collapse;
+    }
+
+    th,
+    td {
+      text-align: left;
+      border-bottom: 1px solid #edf0f3;
+      padding: 8px 10px;
+      vertical-align: middle;
+      white-space: nowrap;
+    }
+
+    th {
+      position: sticky;
+      top: 0;
+      z-index: 1;
+      background: #f7f9fa;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: .04em;
+    }
+
+    tr {
+      cursor: pointer;
+    }
+
+    tbody tr:hover,
+    tbody tr.selected {
+      background: #eef8f9;
+    }
+
+    .mono {
+      font-family: "Cascadia Mono", "Consolas", monospace;
+      font-size: 13px;
+    }
+
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 24px;
+      min-width: 74px;
+      border-radius: 999px;
+      padding: 2px 8px;
+      font-size: 12px;
+      font-weight: 700;
+      background: #edf0f3;
+      color: #3d4955;
+    }
+
+    .badge.allowed,
+    .badge.open,
+    .badge.online {
+      background: #e4f4eb;
+      color: var(--ok);
+    }
+
+    .badge.blocked,
+    .badge.offline {
+      background: #fde8e7;
+      color: var(--danger);
+    }
+
+    .badge.unapproved {
+      background: #fff3d8;
+      color: var(--warn);
+    }
+
+    .row-actions {
+      display: flex;
+      gap: 6px;
+    }
+
+    .side {
+      display: grid;
+      grid-template-rows: minmax(260px, auto) minmax(240px, 1fr);
+      gap: 14px;
+      min-width: 0;
+    }
+
+    .detail,
+    .events {
+      padding: 12px;
+      overflow: auto;
+    }
+
+    .kv {
+      display: grid;
+      grid-template-columns: 130px minmax(0, 1fr);
+      gap: 7px 12px;
+      margin: 0;
+    }
+
+    .kv dt {
+      color: var(--muted);
+    }
+
+    .kv dd {
+      margin: 0;
+      min-width: 0;
+      overflow-wrap: anywhere;
+    }
+
+    .event {
+      display: grid;
+      gap: 3px;
+      padding: 8px 0;
+      border-bottom: 1px solid #edf0f3;
+    }
+
+    .event strong {
+      font-size: 13px;
+    }
+
+    .event span {
+      color: var(--muted);
+      font-size: 12px;
+      overflow-wrap: anywhere;
+    }
+
+    .empty,
+    .error {
+      padding: 24px;
+      color: var(--muted);
+      text-align: center;
+    }
+
+    .error {
+      color: var(--danger);
+    }
+
+    @media (max-width: 1120px) {
+      .summary {
+        grid-template-columns: repeat(3, minmax(120px, 1fr));
+      }
+
+      main {
+        grid-template-columns: 1fr;
+      }
+
+      .side {
+        grid-template-columns: 1fr 1fr;
+        grid-template-rows: auto;
+      }
+    }
+
+    @media (max-width: 760px) {
+      .topbar {
+        align-items: stretch;
+        flex-direction: column;
+      }
+
+      .top-actions {
+        justify-content: flex-start;
+      }
+
+      .token {
+        width: 100%;
+      }
+
+      .summary {
+        grid-template-columns: repeat(2, minmax(120px, 1fr));
+      }
+
+      .panel-head,
+      .filters,
+      .side {
+        grid-template-columns: 1fr;
+      }
+
+      .filters {
+        width: 100%;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <header class="topbar">
+      <div class="brand">
+        <div class="mark" aria-hidden="true"></div>
+        <h1>Nemo Admin</h1>
+      </div>
+      <div class="top-actions">
+        <span class="status"><span id="healthDot" class="dot"></span><span id="healthText">Idle</span></span>
+        <input id="token" class="token" type="password" autocomplete="off" placeholder="API token">
+        <button id="saveToken">Save</button>
+        <label class="switch"><input id="companyOnly" type="checkbox">Company only</label>
+        <label class="switch"><input id="autoRefresh" type="checkbox" checked>Auto</label>
+        <button id="refresh" class="primary">Refresh</button>
+      </div>
+    </header>
+
+    <section class="summary" aria-label="Summary">
+      <div class="metric"><span>Peers</span><strong id="mPeers">0</strong></div>
+      <div class="metric"><span>Online</span><strong id="mOnline">0</strong></div>
+      <div class="metric"><span>Direct Attempts</span><strong id="mDirect">0</strong></div>
+      <div class="metric"><span>Forced Relay</span><strong id="mRelay">0</strong></div>
+      <div class="metric"><span>Policy Rejects</span><strong id="mReject">0</strong></div>
+      <div class="metric"><span>Relay Requests</span><strong id="mRelayReq">0</strong></div>
+    </section>
+
+    <main>
+      <section class="panel">
+        <div class="panel-head">
+          <h2 class="panel-title">Peers</h2>
+          <div class="filters">
+            <input id="search" type="search" placeholder="Search ID or address">
+            <select id="filter">
+              <option value="all">All peers</option>
+              <option value="online">Online</option>
+              <option value="offline">Offline</option>
+              <option value="allowed">Allowed</option>
+              <option value="blocked">Blocked</option>
+              <option value="unapproved">Unapproved</option>
+            </select>
+            <button id="clear">Clear</button>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>ID</th>
+                <th>State</th>
+                <th>Policy</th>
+                <th>Registered IP</th>
+                <th>Public Addr</th>
+                <th>Seen</th>
+                <th>Direct</th>
+                <th>Forced Relay</th>
+                <th>Relay</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody id="peers"></tbody>
+          </table>
+          <div id="peerEmpty" class="empty">No peers loaded</div>
+        </div>
+      </section>
+
+      <aside class="side">
+        <section class="panel">
+          <div class="panel-head">
+            <h2 class="panel-title">Selected Peer</h2>
+          </div>
+          <div id="detail" class="detail empty">Select a peer</div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head">
+            <h2 class="panel-title">Events</h2>
+          </div>
+          <div id="events" class="events empty">No events loaded</div>
+        </section>
+      </aside>
+    </main>
+  </div>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const state = {
+      peers: [],
+      stats: null,
+      events: [],
+      selectedId: null,
+      timer: null
+    };
+
+    const tokenInput = $("token");
+    tokenInput.value = localStorage.getItem("nemoAdminToken") || "";
+
+    $("saveToken").addEventListener("click", () => {
+      localStorage.setItem("nemoAdminToken", tokenInput.value.trim());
+      loadAll();
+    });
+    $("refresh").addEventListener("click", loadAll);
+    $("search").addEventListener("input", renderPeers);
+    $("filter").addEventListener("change", renderPeers);
+    $("clear").addEventListener("click", () => {
+      $("search").value = "";
+      $("filter").value = "all";
+      renderPeers();
+    });
+    $("companyOnly").addEventListener("change", async (event) => {
+      await api("/nemo/api/policy", {
+        method: "PUT",
+        body: JSON.stringify({ company_only: event.target.checked })
+      });
+      await loadAll();
+    });
+    $("autoRefresh").addEventListener("change", schedule);
+
+    function headers() {
+      const h = { "Accept": "application/json" };
+      const token = tokenInput.value.trim();
+      if (token) h["Authorization"] = `Bearer ${token}`;
+      return h;
+    }
+
+    async function api(path, options = {}) {
+      const opts = { ...options, headers: { ...headers(), ...(options.headers || {}) } };
+      if (opts.body) opts.headers["Content-Type"] = "application/json";
+      const res = await fetch(path, opts);
+      if (!res.ok) {
+        let message = `${res.status} ${res.statusText}`;
+        try {
+          const json = await res.json();
+          if (json.error) message = json.error;
+        } catch (_) {}
+        throw new Error(message);
+      }
+      return res.json();
+    }
+
+    async function loadAll() {
+      setHealth("loading", "Loading");
+      try {
+        const [health, peers, stats, events] = await Promise.all([
+          api("/nemo/api/health"),
+          api("/nemo/api/peers?limit=1000"),
+          api("/nemo/api/stats"),
+          api("/nemo/api/events?limit=80")
+        ]);
+        $("companyOnly").checked = !!health.company_only;
+        state.peers = peers.peers || [];
+        state.stats = stats;
+        state.events = events.events || [];
+        setHealth("ok", "Online");
+        renderSummary();
+        renderPeers();
+        renderEvents();
+        renderDetail();
+      } catch (err) {
+        setHealth("bad", err.message || "Error");
+        $("peerEmpty").textContent = err.message || "Failed to load peers";
+        $("peerEmpty").className = "error";
+      }
+    }
+
+    function setHealth(kind, text) {
+      $("healthDot").className = `dot ${kind === "ok" ? "ok" : kind === "bad" ? "bad" : ""}`;
+      $("healthText").textContent = text;
+    }
+
+    function renderSummary() {
+      const totals = state.stats?.totals || {};
+      $("mPeers").textContent = state.peers.length;
+      $("mOnline").textContent = state.peers.filter((p) => p.online).length;
+      $("mDirect").textContent = totals.direct_attempts || 0;
+      $("mRelay").textContent = totals.relay_forced || 0;
+      $("mReject").textContent = totals.policy_rejections || 0;
+      $("mRelayReq").textContent = totals.relay_requests || 0;
+    }
+
+    function filteredPeers() {
+      const q = $("search").value.trim().toLowerCase();
+      const filter = $("filter").value;
+      return state.peers.filter((peer) => {
+        const text = [
+          peer.id,
+          peer.registered_ip,
+          peer.public_addr,
+          peer.policy,
+          peer.stats?.last_relay_server
+        ].filter(Boolean).join(" ").toLowerCase();
+        if (q && !text.includes(q)) return false;
+        if (filter === "online") return peer.online;
+        if (filter === "offline") return !peer.online;
+        if (filter === "allowed") return peer.policy === "allowed" || peer.policy === "open";
+        if (filter === "blocked") return peer.policy === "blocked";
+        if (filter === "unapproved") return peer.policy === "unapproved";
+        return true;
+      });
+    }
+
+    function renderPeers() {
+      const tbody = $("peers");
+      const peers = filteredPeers();
+      tbody.innerHTML = "";
+      $("peerEmpty").style.display = peers.length ? "none" : "block";
+      $("peerEmpty").className = "empty";
+      $("peerEmpty").textContent = "No matching peers";
+
+      for (const peer of peers) {
+        const tr = document.createElement("tr");
+        tr.className = peer.id === state.selectedId ? "selected" : "";
+        tr.addEventListener("click", () => {
+          state.selectedId = peer.id;
+          renderPeers();
+          renderDetail();
+        });
+        tr.innerHTML = `
+          <td class="mono">${escapeHtml(peer.id)}</td>
+          <td>${badge(peer.online ? "online" : "offline")}</td>
+          <td>${badge(peer.policy)}</td>
+          <td class="mono">${escapeHtml(peer.registered_ip || "")}</td>
+          <td class="mono">${escapeHtml(peer.public_addr || "")}</td>
+          <td>${formatSeen(peer.last_seen_ms_ago)}</td>
+          <td>${peer.stats?.direct_attempts || 0}</td>
+          <td>${peer.stats?.relay_forced || 0}</td>
+          <td class="mono">${escapeHtml(peer.stats?.last_relay_server || "")}</td>
+          <td>
+            <div class="row-actions">
+              <button data-action="allow" data-id="${escapeHtml(peer.id)}">Allow</button>
+              <button class="danger" data-action="block" data-id="${escapeHtml(peer.id)}">Block</button>
+              <button data-action="reset-policy" data-id="${escapeHtml(peer.id)}">Reset</button>
+            </div>
+          </td>
+        `;
+        tbody.appendChild(tr);
+      }
+
+      tbody.querySelectorAll("button[data-action]").forEach((button) => {
+        button.addEventListener("click", async (event) => {
+          event.stopPropagation();
+          const id = event.currentTarget.dataset.id;
+          const action = event.currentTarget.dataset.action;
+          await api(`/nemo/api/peers/${encodeURIComponent(id)}/${action}`, { method: "POST" });
+          await loadAll();
+        });
+      });
+    }
+
+    function renderDetail() {
+      const peer = state.peers.find((item) => item.id === state.selectedId);
+      const detail = $("detail");
+      if (!peer) {
+        detail.className = "detail empty";
+        detail.textContent = "Select a peer";
+        return;
+      }
+      const stats = peer.stats || {};
+      detail.className = "detail";
+      detail.innerHTML = `
+        <dl class="kv">
+          <dt>ID</dt><dd class="mono">${escapeHtml(peer.id)}</dd>
+          <dt>State</dt><dd>${badge(peer.online ? "online" : "offline")}</dd>
+          <dt>Policy</dt><dd>${badge(peer.policy)}</dd>
+          <dt>Registered IP</dt><dd class="mono">${escapeHtml(peer.registered_ip || "")}</dd>
+          <dt>Public Addr</dt><dd class="mono">${escapeHtml(peer.public_addr || "")}</dd>
+          <dt>Last Seen</dt><dd>${formatSeen(peer.last_seen_ms_ago)}</dd>
+          <dt>Direct</dt><dd>${stats.direct_attempts || 0}</dd>
+          <dt>Local Addr</dt><dd>${stats.local_addr_attempts || 0}</dd>
+          <dt>Forced Relay</dt><dd>${stats.relay_forced || 0}</dd>
+          <dt>Relay Requests</dt><dd>${stats.relay_requests || 0}</dd>
+          <dt>Relay Responses</dt><dd>${stats.relay_responses || 0}</dd>
+          <dt>NAT</dt><dd>${escapeHtml(stats.last_nat_type || "")}</dd>
+          <dt>Relay Server</dt><dd class="mono">${escapeHtml(stats.last_relay_server || "")}</dd>
+          <dt>Last From</dt><dd class="mono">${escapeHtml(stats.last_punch_from_addr || "")}</dd>
+          <dt>Last Target</dt><dd class="mono">${escapeHtml(stats.last_punch_to_addr || "")}</dd>
+          <dt>Created</dt><dd>${escapeHtml(peer.created_at || "")}</dd>
+        </dl>
+      `;
+    }
+
+    function renderEvents() {
+      const events = $("events");
+      if (!state.events.length) {
+        events.className = "events empty";
+        events.textContent = "No events loaded";
+        return;
+      }
+      events.className = "events";
+      events.innerHTML = state.events.map((event) => `
+        <div class="event">
+          <strong>${escapeHtml(event.kind)}${event.peer_id ? ` / ${escapeHtml(event.peer_id)}` : ""}</strong>
+          <span>${escapeHtml(event.at)}${event.remote_addr ? ` / ${escapeHtml(event.remote_addr)}` : ""}</span>
+          <span>${escapeHtml(event.detail || "")}</span>
+        </div>
+      `).join("");
+    }
+
+    function badge(value) {
+      const label = value || "unknown";
+      return `<span class="badge ${escapeAttr(label)}">${escapeHtml(label)}</span>`;
+    }
+
+    function formatSeen(ms) {
+      if (ms === null || ms === undefined) return "";
+      if (ms < 1000) return `${ms} ms`;
+      const seconds = Math.round(ms / 1000);
+      if (seconds < 60) return `${seconds} s`;
+      const minutes = Math.round(seconds / 60);
+      if (minutes < 60) return `${minutes} m`;
+      const hours = Math.round(minutes / 60);
+      return `${hours} h`;
+    }
+
+    function escapeHtml(value) {
+      return String(value).replace(/[&<>"']/g, (ch) => ({
+        "&": "&amp;",
+        "<": "&lt;",
+        ">": "&gt;",
+        '"': "&quot;",
+        "'": "&#039;"
+      }[ch]));
+    }
+
+    function escapeAttr(value) {
+      return escapeHtml(value).replace(/\s+/g, "-").toLowerCase();
+    }
+
+    function schedule() {
+      if (state.timer) clearInterval(state.timer);
+      state.timer = null;
+      if ($("autoRefresh").checked) {
+        state.timer = setInterval(loadAll, 5000);
+      }
+    }
+
+    schedule();
+    loadAll();
+  </script>
+</body>
+</html>

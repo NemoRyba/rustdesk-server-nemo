@@ -6,6 +6,7 @@ use crate::{
 use axum::{
     extract::{Extension, Path, Query},
     http::{header::AUTHORIZATION, HeaderMap, StatusCode},
+    response::Html,
     routing::{get, post},
     Json, Router,
 };
@@ -193,6 +194,9 @@ pub(crate) async fn spawn_hbbs_api(pm: PeerMap) -> ResultType<()> {
 
     let state = HbbsApiState { pm, token };
     let app = Router::new()
+        .route("/nemo", get(admin_gui))
+        .route("/nemo/admin", get(admin_gui))
+        .route("/nemo/admin/", get(admin_gui))
         .route("/nemo/api/health", get(health))
         .route("/nemo/api/peers", get(list_peers))
         .route("/nemo/api/peers/:id", get(get_peer))
@@ -214,6 +218,10 @@ pub(crate) async fn spawn_hbbs_api(pm: PeerMap) -> ResultType<()> {
         }
     });
     Ok(())
+}
+
+async fn admin_gui() -> Html<&'static str> {
+    Html(include_str!("nemo_admin.html"))
 }
 
 pub(crate) fn company_only() -> bool {
