@@ -84,6 +84,7 @@ const CLIENT_MANAGEMENT_POLICY_KEYS: &[&str] = &[
     "enable-perm-change-in-accept-window",
     "allow-remote-config-modification",
     "allow-numeric-one-time-password",
+    "nemo-permanent-password",
     "enable-lan-discovery",
     "direct-server",
     "direct-access-port",

@@ -654,6 +654,9 @@
       ["proxy-username", "Proxy username", "text"],
       ["verification-method", "Verification method", "select", [["", "Local"], ["use-temporary-password", "Temporary password"], ["use-permanent-password", "Permanent password"], ["use-both-passwords", "Both passwords"]]],
       ["approve-mode", "Approval mode", "select", [["", "Local"], ["password-click", "Password + click"], ["click", "Click"], ["password", "Password"]]],
+      ["nemo-permanent-password", "Incoming access password", "password"],
+      ["default-connect-password", "Outgoing default password", "password"],
+      ["disable-change-permanent-password", "Lock password changes", "bool"],
       ["temporary-password-length", "Temporary password length", "text"],
       ["access-mode", "Access mode", "text"],
       ["auto-disconnect-timeout", "Auto disconnect timeout", "text"],
@@ -985,11 +988,11 @@
 
     function policyControl(option, value) {
       const [key, label, type, choices] = option;
-      if (type === "text") {
+      if (type === "text" || type === "password") {
         return `
           <div class="policy-row">
             <label for="policy-${escapeAttr(key)}">${escapeHtml(label)}</label>
-            <input id="policy-${escapeAttr(key)}" data-policy-key="${escapeHtml(key)}" value="${escapeHtml(value)}" placeholder="Local">
+            <input id="policy-${escapeAttr(key)}" type="${type === "password" ? "password" : "text"}" autocomplete="new-password" data-policy-key="${escapeHtml(key)}" value="${escapeHtml(value)}" placeholder="Local">
           </div>
         `;
       }
