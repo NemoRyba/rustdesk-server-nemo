@@ -58,6 +58,7 @@ pub struct RegisteredPeer {
     pub status: Option<i64>,
     pub note: Option<String>,
     pub created_at: Option<String>,
+    pub management_policy: Option<String>,
 }
 
 impl Database {
@@ -94,6 +95,7 @@ impl Database {
                 user blob,
                 status tinyint,
                 note varchar(300),
+                management_policy text,
                 info text not null
             ) without rowid;
             create unique index if not exists index_peer_id on peer (id);
@@ -126,6 +128,10 @@ impl Database {
             .await
             .ok();
         sqlx::query("alter table peer add column created_at datetime not null default(current_timestamp)")
+            .execute(&mut *conn)
+            .await
+            .ok();
+        sqlx::query("alter table peer add column management_policy text")
             .execute(&mut *conn)
             .await
             .ok();
@@ -188,7 +194,7 @@ impl Database {
     ) -> ResultType<Vec<RegisteredPeer>> {
         let mut conn = self.pool.get().await?;
         let rows = sqlx::query(
-            "select guid, id, uuid, pk, user, status, note, info, datetime(created_at) as created_at
+            "select guid, id, uuid, pk, user, status, note, management_policy, info, datetime(created_at) as created_at
              from peer
              order by created_at desc, id asc
              limit ? offset ?",
@@ -203,7 +209,7 @@ impl Database {
     pub async fn get_registered_peer(&self, id: &str) -> ResultType<Option<RegisteredPeer>> {
         let mut conn = self.pool.get().await?;
         let row = sqlx::query(
-            "select guid, id, uuid, pk, user, status, note, info, datetime(created_at) as created_at
+            "select guid, id, uuid, pk, user, status, note, management_policy, info, datetime(created_at) as created_at
              from peer
              where id = ?",
         )
@@ -236,6 +242,20 @@ impl Database {
         };
         Ok(result.rows_affected() > 0)
     }
+
+    pub async fn set_peer_management_policy(
+        &self,
+        id: &str,
+        management_policy: Option<&str>,
+    ) -> ResultType<bool> {
+        let mut conn = self.pool.get().await?;
+        let result = sqlx::query("update peer set management_policy = ? where id = ?")
+            .bind(management_policy)
+            .bind(id)
+            .execute(conn.deref_mut())
+            .await?;
+        Ok(result.rows_affected() > 0)
+    }
 }
 
 fn registered_peer_from_row(row: SqliteRow) -> RegisteredPeer {
@@ -249,6 +269,7 @@ fn registered_peer_from_row(row: SqliteRow) -> RegisteredPeer {
         note: row.try_get("note").ok(),
         info: row.try_get("info").unwrap_or_default(),
         created_at: row.try_get("created_at").ok(),
+        management_policy: row.try_get("management_policy").ok(),
     }
 }
 

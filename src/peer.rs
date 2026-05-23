@@ -219,6 +219,16 @@ impl PeerMap {
         Ok(updated)
     }
 
+    pub(crate) async fn set_peer_management_policy(
+        &self,
+        id: &str,
+        management_policy: Option<&str>,
+    ) -> ResultType<bool> {
+        self.db
+            .set_peer_management_policy(id, management_policy)
+            .await
+    }
+
     pub(crate) async fn peer_status(&self, id: &str) -> ResultType<Option<i64>> {
         if let Some(peer) = self.get_in_memory(id).await {
             let peer = peer.read().await;

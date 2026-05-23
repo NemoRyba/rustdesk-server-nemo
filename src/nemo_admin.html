@@ -365,6 +365,42 @@
       overflow-wrap: anywhere;
     }
 
+    .management-policy {
+      display: grid;
+      gap: 10px;
+      margin-top: 14px;
+      padding-top: 12px;
+      border-top: 1px solid #edf0f3;
+    }
+
+    .management-policy h3 {
+      margin: 0;
+      font-size: 13px;
+      font-weight: 700;
+    }
+
+    .policy-grid {
+      display: grid;
+      gap: 7px;
+    }
+
+    .policy-row {
+      display: grid;
+      grid-template-columns: minmax(130px, 1fr) 120px;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .policy-row label {
+      min-width: 0;
+      overflow-wrap: anywhere;
+    }
+
+    .policy-actions {
+      display: flex;
+      justify-content: flex-end;
+    }
+
     .event {
       display: grid;
       gap: 3px;
@@ -530,6 +566,22 @@
       selectedId: null,
       timer: null
     };
+    const managementOptions = [
+      ["enable-keyboard", "Keyboard and mouse"],
+      ["enable-clipboard", "Clipboard"],
+      ["enable-file-transfer", "File transfer"],
+      ["enable-camera", "Camera"],
+      ["enable-terminal", "Terminal"],
+      ["enable-audio", "Audio"],
+      ["enable-tunnel", "TCP tunneling"],
+      ["enable-remote-restart", "Remote restart"],
+      ["enable-record-session", "Session recording"],
+      ["enable-block-input", "Block local input"],
+      ["enable-privacy-mode", "Privacy mode"],
+      ["enable-remote-printer", "Remote printer"],
+      ["allow-remote-config-modification", "Remote config changes"],
+      ["enable-lan-discovery", "LAN discovery"]
+    ];
 
     const tokenInput = $("token");
     tokenInput.value = localStorage.getItem("nemoAdminToken") || "";
@@ -695,6 +747,7 @@
         return;
       }
       const stats = peer.stats || {};
+      const policyOptions = peer.management_policy?.options || {};
       detail.className = "detail";
       detail.innerHTML = `
         <dl class="kv">
@@ -715,7 +768,27 @@
           <dt>Last Target</dt><dd class="mono">${escapeHtml(stats.last_punch_to_addr || "")}</dd>
           <dt>Created</dt><dd>${escapeHtml(peer.created_at || "")}</dd>
         </dl>
+        <div class="management-policy">
+          <h3>Management</h3>
+          <div class="policy-grid">
+            ${managementOptions.map(([key, label]) => policyControl(key, label, policyOptions[key] || "")).join("")}
+          </div>
+          <div class="policy-actions">
+            <button id="saveManagementPolicy" class="primary">Save Management</button>
+          </div>
+        </div>
       `;
+      $("saveManagementPolicy").addEventListener("click", async () => {
+        const options = {};
+        detail.querySelectorAll("select[data-policy-key]").forEach((select) => {
+          if (select.value) options[select.dataset.policyKey] = select.value;
+        });
+        await api(`/nemo/api/peers/${encodeURIComponent(peer.id)}/management-policy`, {
+          method: "PUT",
+          body: JSON.stringify({ options })
+        });
+        await loadAll();
+      });
     }
 
     function renderEvents() {
@@ -738,6 +811,19 @@
     function badge(value) {
       const label = value || "unknown";
       return `<span class="badge ${escapeAttr(label)}">${escapeHtml(label)}</span>`;
+    }
+
+    function policyControl(key, label, value) {
+      return `
+        <div class="policy-row">
+          <label for="policy-${escapeAttr(key)}">${escapeHtml(label)}</label>
+          <select id="policy-${escapeAttr(key)}" data-policy-key="${escapeAttr(key)}">
+            <option value="" ${value ? "" : "selected"}>Local</option>
+            <option value="Y" ${value === "Y" ? "selected" : ""}>Allow</option>
+            <option value="N" ${value === "N" ? "selected" : ""}>Deny</option>
+          </select>
+        </div>
+      `;
     }
 
     function formatSeen(ms) {

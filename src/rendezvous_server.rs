@@ -101,6 +101,8 @@ impl RendezvousServer {
     #[tokio::main(flavor = "multi_thread")]
     pub async fn start(port: i32, serial: i32, key: &str, rmem: usize) -> ResultType<()> {
         let (key, sk) = Self::get_server_sk(key);
+        #[cfg(feature = "nemo-management-api")]
+        let nemo_server_secret_key = sk.clone();
         let nat_port = port - 1;
         let ws_port = port + 2;
         let pm = PeerMap::new().await?;
@@ -150,7 +152,12 @@ impl RendezvousServer {
         #[cfg(feature = "nemo-management-api")]
         {
             crate::nemo_management::init_from_args();
-            crate::nemo_management::spawn_hbbs_api(rs.pm.clone()).await?;
+            crate::nemo_management::spawn_hbbs_api(
+                rs.pm.clone(),
+                key.clone(),
+                nemo_server_secret_key,
+            )
+            .await?;
         }
         let mut listener = create_tcp_listener(port).await?;
         let mut listener2 = create_tcp_listener(nat_port).await?;

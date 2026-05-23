@@ -63,6 +63,9 @@ git revert <nemo-management-api-commit>
 - `POST /nemo/api/peers/{id}/block`
 - `POST /nemo/api/peers/{id}/allow`
 - `POST /nemo/api/peers/{id}/reset-policy`
+- `GET /nemo/api/peers/{id}/management-policy`
+- `PUT /nemo/api/peers/{id}/management-policy` with JSON body `{"options":{"enable-clipboard":"N"}}`
+- `POST /nemo/api/client/policy` with JSON body `{"id":"123456789","uuid":"base64"}`
 - `GET /nemo/api/policy`
 - `PUT /nemo/api/policy` with JSON body `{"company_only":true}`
 - `GET /nemo/api/stats`
@@ -79,6 +82,37 @@ Peer status is stored in the existing SQLite `peer.status` column:
 `--nemo-company-only Y` makes remote-control targets require status `1`.
 Registration is still allowed so new devices can appear in the peer list before
 an admin allows them.
+
+## Client Management Policy
+
+Per-client management policy is stored in SQLite `peer.management_policy`.
+The first policy shape is:
+
+```json
+{"options":{"enable-clipboard":"N","enable-file-transfer":"Y"}}
+```
+
+Only known RustDesk controlled-side option keys are accepted. Unknown keys and
+unknown values are dropped before storage.
+
+The client policy endpoint validates the client's base64 UUID against the
+registered peer row and returns:
+
+```json
+{
+  "server_public_key": "base64",
+  "signed_payload": "base64",
+  "payload": {
+    "id": "123456789",
+    "issued_at": "2026-05-23T12:00:00Z",
+    "policy": {"options": {"enable-clipboard": "N"}}
+  }
+}
+```
+
+If hbbs has a signing key, `signed_payload` is the signed JSON bytes of
+`payload`. Nemo clients should configure the same public key in the Management
+dialog so policy is applied only when the signature verifies.
 
 ## Data Covered
 

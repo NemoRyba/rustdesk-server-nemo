@@ -13,6 +13,7 @@ use axum::{
 use hbb_common::{bail, log, tokio, ResultType};
 use once_cell::sync::Lazy;
 use serde_derive::{Deserialize, Serialize};
+use sodiumoxide::crypto::sign;
 use std::{
     collections::{HashMap, VecDeque},
     net::SocketAddr,
@@ -21,6 +22,23 @@ use std::{
 use tokio::sync::RwLock;
 
 const EVENT_LIMIT: usize = 500;
+const MANAGEMENT_POLICY_KEYS: &[&str] = &[
+    "enable-keyboard",
+    "enable-clipboard",
+    "enable-file-transfer",
+    "enable-camera",
+    "enable-terminal",
+    "enable-audio",
+    "enable-tunnel",
+    "enable-remote-restart",
+    "enable-record-session",
+    "enable-block-input",
+    "enable-privacy-mode",
+    "enable-remote-printer",
+    "allow-remote-config-modification",
+    "enable-lan-discovery",
+];
+
 static COMPANY_ONLY: AtomicBool = AtomicBool::new(false);
 static STATS: Lazy<RwLock<NemoStatsStore>> = Lazy::new(|| RwLock::new(NemoStatsStore::default()));
 
@@ -28,6 +46,8 @@ static STATS: Lazy<RwLock<NemoStatsStore>> = Lazy::new(|| RwLock::new(NemoStatsS
 struct HbbsApiState {
     pm: PeerMap,
     token: Option<String>,
+    server_public_key: String,
+    server_secret_key: Option<sign::SecretKey>,
 }
 
 #[derive(Default)]
@@ -103,6 +123,40 @@ struct PolicyRequest {
     company_only: Option<bool>,
 }
 
+#[derive(Clone, Default, Serialize, Deserialize)]
+struct ManagementPolicy {
+    #[serde(default)]
+    options: HashMap<String, String>,
+}
+
+#[derive(Deserialize)]
+struct ManagementPolicyRequest {
+    #[serde(default)]
+    options: HashMap<String, String>,
+}
+
+#[derive(Deserialize)]
+struct ClientPolicyRequest {
+    id: String,
+    uuid: String,
+    #[serde(default)]
+    policy_version: Option<String>,
+}
+
+#[derive(Serialize)]
+struct ClientPolicyPayload {
+    id: String,
+    issued_at: String,
+    policy: ManagementPolicy,
+}
+
+#[derive(Serialize)]
+struct ClientPolicyResponse {
+    server_public_key: String,
+    signed_payload: String,
+    payload: ClientPolicyPayload,
+}
+
 #[derive(Serialize)]
 struct PeerListResponse {
     limit: usize,
@@ -123,6 +177,7 @@ struct PeerResponse {
     status: Option<i64>,
     policy: String,
     allowed_for_control: bool,
+    management_policy: ManagementPolicy,
     registered_ip: Option<String>,
     public_addr: Option<String>,
     online: bool,
@@ -143,6 +198,12 @@ struct PolicyResponse {
     company_only: bool,
     blocked_status: i64,
     allowed_status: i64,
+}
+
+#[derive(Serialize)]
+struct ManagementPolicyResponse {
+    id: String,
+    policy: ManagementPolicy,
 }
 
 #[derive(Serialize)]
@@ -174,7 +235,11 @@ pub(crate) fn init_from_args() {
     );
 }
 
-pub(crate) async fn spawn_hbbs_api(pm: PeerMap) -> ResultType<()> {
+pub(crate) async fn spawn_hbbs_api(
+    pm: PeerMap,
+    server_public_key: String,
+    server_secret_key: Option<sign::SecretKey>,
+) -> ResultType<()> {
     if !is_truthy(&get_arg_or("nemo-api", "N".to_owned())) {
         return Ok(());
     }
@@ -192,7 +257,12 @@ pub(crate) async fn spawn_hbbs_api(pm: PeerMap) -> ResultType<()> {
         );
     }
 
-    let state = HbbsApiState { pm, token };
+    let state = HbbsApiState {
+        pm,
+        token,
+        server_public_key,
+        server_secret_key,
+    };
     let app = Router::new()
         .route("/nemo", get(admin_gui))
         .route("/nemo/admin", get(admin_gui))
@@ -203,6 +273,11 @@ pub(crate) async fn spawn_hbbs_api(pm: PeerMap) -> ResultType<()> {
         .route("/nemo/api/peers/:id/block", post(block_peer))
         .route("/nemo/api/peers/:id/allow", post(allow_peer))
         .route("/nemo/api/peers/:id/reset-policy", post(reset_peer_policy))
+        .route(
+            "/nemo/api/peers/:id/management-policy",
+            get(get_peer_management_policy).put(update_peer_management_policy),
+        )
+        .route("/nemo/api/client/policy", post(client_policy))
         .route("/nemo/api/policy", get(get_policy).put(update_policy))
         .route("/nemo/api/stats", get(get_stats))
         .route("/nemo/api/events", get(get_events))
@@ -468,6 +543,86 @@ async fn get_peer(
     Ok(Json(peer_response(&state.pm, peer).await))
 }
 
+async fn get_peer_management_policy(
+    Path(id): Path<String>,
+    Extension(state): Extension<HbbsApiState>,
+    headers: HeaderMap,
+) -> ApiResult<ManagementPolicyResponse> {
+    require_auth(&headers, &state.token)?;
+    let peer = state
+        .pm
+        .get_registered(&id)
+        .await
+        .map_err(server_error)?
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "peer not found"))?;
+    Ok(Json(ManagementPolicyResponse {
+        id: peer.id,
+        policy: management_policy_from_peer(&peer.management_policy),
+    }))
+}
+
+async fn update_peer_management_policy(
+    Path(id): Path<String>,
+    Extension(state): Extension<HbbsApiState>,
+    headers: HeaderMap,
+    Json(request): Json<ManagementPolicyRequest>,
+) -> ApiResult<ManagementPolicyResponse> {
+    require_auth(&headers, &state.token)?;
+    let policy = sanitize_management_policy(ManagementPolicy {
+        options: request.options,
+    });
+    let serialized = serialize_management_policy(&policy)?;
+    let updated = state
+        .pm
+        .set_peer_management_policy(&id, serialized.as_deref())
+        .await
+        .map_err(server_error)?;
+    if !updated {
+        return Err(api_error(StatusCode::NOT_FOUND, "peer not found"));
+    }
+    let mut store = STATS.write().await;
+    record_event_locked(
+        &mut store,
+        "management-policy-update",
+        Some(&id),
+        None,
+        format!("options={}", policy.options.len()),
+    );
+    Ok(Json(ManagementPolicyResponse { id, policy }))
+}
+
+async fn client_policy(
+    Extension(state): Extension<HbbsApiState>,
+    Json(request): Json<ClientPolicyRequest>,
+) -> ApiResult<ClientPolicyResponse> {
+    let peer = state
+        .pm
+        .get_registered(&request.id)
+        .await
+        .map_err(server_error)?
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "peer not found"))?;
+    validate_client_policy_request(&peer, &request)?;
+    if let Some(version) = request.policy_version.as_deref() {
+        log::trace!("Client {} requested management policy after {}", request.id, version);
+    }
+    let payload = ClientPolicyPayload {
+        id: peer.id.clone(),
+        issued_at: now_iso(),
+        policy: management_policy_from_peer(&peer.management_policy),
+    };
+    let payload_bytes = serde_json::to_vec(&payload).map_err(server_error)?;
+    let signed_payload = state
+        .server_secret_key
+        .as_ref()
+        .map(|secret_key| base64::encode(sign::sign(&payload_bytes, secret_key)))
+        .unwrap_or_default();
+    Ok(Json(ClientPolicyResponse {
+        server_public_key: state.server_public_key,
+        signed_payload,
+        payload,
+    }))
+}
+
 async fn block_peer(
     Path(id): Path<String>,
     Extension(state): Extension<HbbsApiState>,
@@ -614,6 +769,7 @@ async fn peer_response(pm: &PeerMap, peer: RegisteredPeer) -> PeerResponse {
         status,
         policy: policy_label(status),
         allowed_for_control: allowed_for_status(status),
+        management_policy: management_policy_from_peer(&peer.management_policy),
         registered_ip,
         public_addr: runtime
             .as_ref()
@@ -639,6 +795,58 @@ fn policy_response() -> PolicyResponse {
         blocked_status: 0,
         allowed_status: 1,
     }
+}
+
+fn management_policy_from_peer(value: &Option<String>) -> ManagementPolicy {
+    let Some(value) = value.as_deref() else {
+        return ManagementPolicy::default();
+    };
+    serde_json::from_str::<ManagementPolicy>(value)
+        .map(sanitize_management_policy)
+        .unwrap_or_default()
+}
+
+fn sanitize_management_policy(mut policy: ManagementPolicy) -> ManagementPolicy {
+    policy.options.retain(|key, value| {
+        let Some(normalized) = normalize_management_policy_value(value) else {
+            return false;
+        };
+        *value = normalized;
+        MANAGEMENT_POLICY_KEYS.contains(&key.as_str())
+    });
+    policy
+}
+
+fn normalize_management_policy_value(value: &str) -> Option<String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "y" | "yes" | "true" | "on" | "allow" | "allowed" => Some("Y".to_owned()),
+        "0" | "n" | "no" | "false" | "off" | "deny" | "denied" => Some("N".to_owned()),
+        _ => None,
+    }
+}
+
+fn serialize_management_policy(policy: &ManagementPolicy) -> Result<Option<String>, ApiFailure> {
+    if policy.options.is_empty() {
+        return Ok(None);
+    }
+    serde_json::to_string(policy)
+        .map(Some)
+        .map_err(server_error)
+}
+
+fn validate_client_policy_request(
+    peer: &RegisteredPeer,
+    request: &ClientPolicyRequest,
+) -> Result<(), ApiFailure> {
+    if request.id.trim().is_empty() {
+        return Err(api_error(StatusCode::BAD_REQUEST, "missing peer id"));
+    }
+    let uuid = base64::decode(request.uuid.trim())
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "invalid uuid"))?;
+    if uuid != peer.uuid {
+        return Err(api_error(StatusCode::UNAUTHORIZED, "uuid mismatch"));
+    }
+    Ok(())
 }
 
 fn require_auth(headers: &HeaderMap, token: &Option<String>) -> Result<(), ApiFailure> {
