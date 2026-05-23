@@ -1,7 +1,8 @@
 use async_trait::async_trait;
 use hbb_common::{log, ResultType};
 use sqlx::{
-    sqlite::SqliteConnectOptions, ConnectOptions, Connection, Error as SqlxError, SqliteConnection,
+    sqlite::{SqliteConnectOptions, SqliteRow}, ConnectOptions, Connection, Error as SqlxError,
+    Row, SqliteConnection,
 };
 use std::{ops::DerefMut, str::FromStr};
 //use sqlx::postgres::PgPoolOptions;
@@ -44,6 +45,19 @@ pub struct Peer {
     pub user: Option<Vec<u8>>,
     pub info: String,
     pub status: Option<i64>,
+}
+
+#[derive(Default, Clone)]
+pub struct RegisteredPeer {
+    pub guid: Vec<u8>,
+    pub id: String,
+    pub uuid: Vec<u8>,
+    pub pk: Vec<u8>,
+    pub user: Option<Vec<u8>>,
+    pub info: String,
+    pub status: Option<i64>,
+    pub note: Option<String>,
+    pub created_at: Option<String>,
 }
 
 impl Database {
@@ -90,7 +104,31 @@ impl Database {
         )
         .execute(self.pool.get().await?.deref_mut())
         .await?;
+        self.ensure_peer_management_columns().await;
         Ok(())
+    }
+
+    async fn ensure_peer_management_columns(&self) {
+        let mut conn = match self.pool.get().await {
+            Ok(conn) => conn,
+            Err(err) => {
+                log::error!("db migration connection failed: {}", err);
+                return;
+            }
+        };
+        let conn = conn.deref_mut();
+        sqlx::query("alter table peer add column status tinyint")
+            .execute(&mut *conn)
+            .await
+            .ok();
+        sqlx::query("alter table peer add column note varchar(300)")
+            .execute(&mut *conn)
+            .await
+            .ok();
+        sqlx::query("alter table peer add column created_at datetime not null default(current_timestamp)")
+            .execute(&mut *conn)
+            .await
+            .ok();
     }
 
     pub async fn get_peer(&self, id: &str) -> ResultType<Option<Peer>> {
@@ -141,6 +179,76 @@ impl Database {
         .execute(self.pool.get().await?.deref_mut())
         .await?;
         Ok(())
+    }
+
+    pub async fn list_registered_peers(
+        &self,
+        limit: usize,
+        offset: usize,
+    ) -> ResultType<Vec<RegisteredPeer>> {
+        let mut conn = self.pool.get().await?;
+        let rows = sqlx::query(
+            "select guid, id, uuid, pk, user, status, note, info, datetime(created_at) as created_at
+             from peer
+             order by created_at desc, id asc
+             limit ? offset ?",
+        )
+        .bind(limit as i64)
+        .bind(offset as i64)
+        .fetch_all(conn.deref_mut())
+        .await?;
+        Ok(rows.into_iter().map(registered_peer_from_row).collect())
+    }
+
+    pub async fn get_registered_peer(&self, id: &str) -> ResultType<Option<RegisteredPeer>> {
+        let mut conn = self.pool.get().await?;
+        let row = sqlx::query(
+            "select guid, id, uuid, pk, user, status, note, info, datetime(created_at) as created_at
+             from peer
+             where id = ?",
+        )
+        .bind(id)
+        .fetch_optional(conn.deref_mut())
+        .await?;
+        Ok(row.map(registered_peer_from_row))
+    }
+
+    pub async fn set_peer_status(
+        &self,
+        id: &str,
+        status: Option<i64>,
+        note: Option<&str>,
+    ) -> ResultType<bool> {
+        let mut conn = self.pool.get().await?;
+        let result = if let Some(status) = status {
+            sqlx::query("update peer set status = ?, note = coalesce(?, note) where id = ?")
+                .bind(status)
+                .bind(note)
+                .bind(id)
+                .execute(conn.deref_mut())
+                .await?
+        } else {
+            sqlx::query("update peer set status = null, note = coalesce(?, note) where id = ?")
+                .bind(note)
+                .bind(id)
+                .execute(conn.deref_mut())
+                .await?
+        };
+        Ok(result.rows_affected() > 0)
+    }
+}
+
+fn registered_peer_from_row(row: SqliteRow) -> RegisteredPeer {
+    RegisteredPeer {
+        guid: row.try_get("guid").unwrap_or_default(),
+        id: row.try_get("id").unwrap_or_default(),
+        uuid: row.try_get("uuid").unwrap_or_default(),
+        pk: row.try_get("pk").unwrap_or_default(),
+        user: row.try_get("user").ok(),
+        status: row.try_get("status").ok(),
+        note: row.try_get("note").ok(),
+        info: row.try_get("info").unwrap_or_default(),
+        created_at: row.try_get("created_at").ok(),
     }
 }
 

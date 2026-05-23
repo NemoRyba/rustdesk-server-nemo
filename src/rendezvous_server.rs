@@ -147,6 +147,11 @@ impl RendezvousServer {
         log::info!("local-ip: {:?}", rs.inner.local_ip);
         std::env::set_var("PORT_FOR_API", port.to_string());
         rs.parse_relay_servers(&get_arg("relay-servers"));
+        #[cfg(feature = "nemo-management-api")]
+        {
+            crate::nemo_management::init_from_args();
+            crate::nemo_management::spawn_hbbs_api(rs.pm.clone()).await?;
+        }
         let mut listener = create_tcp_listener(port).await?;
         let mut listener2 = create_tcp_listener(nat_port).await?;
         let mut listener3 = create_tcp_listener(ws_port).await?;
@@ -326,6 +331,19 @@ impl RendezvousServer {
                 Some(rendezvous_message::Union::RegisterPeer(rp)) => {
                     // B registered
                     if !rp.id.is_empty() {
+                        #[cfg(feature = "nemo-management-api")]
+                        {
+                            crate::nemo_management::record_peer_seen(&rp.id, addr).await;
+                            if crate::nemo_management::is_peer_blocked(&self.pm, &rp.id).await {
+                                crate::nemo_management::record_policy_rejection(
+                                    &rp.id,
+                                    addr,
+                                    "peer is blocked",
+                                )
+                                .await;
+                                return Ok(());
+                            }
+                        }
                         log::trace!("New peer registered: {:?} {:?}", &rp.id, &addr);
                         self.update_addr(rp.id, addr, socket).await?;
                         if self.inner.serial > rp.serial {
@@ -345,6 +363,17 @@ impl RendezvousServer {
                     }
                     let id = rk.id;
                     let ip = addr.ip().to_string();
+                    #[cfg(feature = "nemo-management-api")]
+                    if crate::nemo_management::is_peer_blocked(&self.pm, &id).await {
+                        crate::nemo_management::record_register_pk(&id, addr, false).await;
+                        crate::nemo_management::record_policy_rejection(
+                            &id,
+                            addr,
+                            "peer is blocked",
+                        )
+                        .await;
+                        return send_rk_res(socket, addr, TOO_FREQUENT).await;
+                    }
                     if id.len() < 6 {
                         return send_rk_res(socket, addr, UUID_MISMATCH).await;
                     } else if !self.check_ip_blocker(&ip, &id).await {
@@ -414,9 +443,13 @@ impl RendezvousServer {
                             );
                         }
                     }
+                    #[cfg(feature = "nemo-management-api")]
+                    let nemo_id = id.clone();
                     if changed {
                         self.pm.update_pk(id, peer, addr, rk.uuid, rk.pk, ip).await;
                     }
+                    #[cfg(feature = "nemo-management-api")]
+                    crate::nemo_management::record_register_pk(&nemo_id, addr, true).await;
                     let mut msg_out = RendezvousMessage::new();
                     msg_out.set_register_pk_response(RegisterPkResponse {
                         result: register_pk_response::Result::OK.into(),
@@ -503,21 +536,50 @@ impl RendezvousServer {
                     if let Some(sink) = sink.take() {
                         self.tcp_punch.lock().await.insert(try_into_v4(addr), sink);
                     }
+                    #[cfg(feature = "nemo-management-api")]
+                    let nemo_id = rf.id.clone();
+                    #[cfg(feature = "nemo-management-api")]
+                    if !nemo_id.is_empty()
+                        && !crate::nemo_management::is_peer_allowed(&self.pm, &nemo_id).await
+                    {
+                        crate::nemo_management::record_policy_rejection(
+                            &nemo_id,
+                            addr,
+                            "relay target is not allowed by Nemo policy",
+                        )
+                        .await;
+                        return true;
+                    }
+                    #[cfg(feature = "nemo-management-api")]
+                    let mut nemo_forwarded = false;
                     if let Some(peer) = self.pm.get_in_memory(&rf.id).await {
                         let mut msg_out = RendezvousMessage::new();
                         rf.socket_addr = AddrMangle::encode(addr).into();
                         msg_out.set_request_relay(rf);
                         let peer_addr = peer.read().await.socket_addr;
                         self.tx.send(Data::Msg(msg_out.into(), peer_addr)).ok();
+                        #[cfg(feature = "nemo-management-api")]
+                        {
+                            nemo_forwarded = true;
+                        }
+                    }
+                    #[cfg(feature = "nemo-management-api")]
+                    if !nemo_id.is_empty() {
+                        crate::nemo_management::record_relay_request(
+                            &nemo_id,
+                            addr,
+                            nemo_forwarded,
+                        )
+                        .await;
                     }
                     return true;
                 }
                 Some(rendezvous_message::Union::RelayResponse(mut rr)) => {
                     let addr_b = AddrMangle::decode(&rr.socket_addr);
                     rr.socket_addr = Default::default();
-                    let id = rr.id();
+                    let id = rr.id().to_owned();
                     if !id.is_empty() {
-                        let pk = self.get_pk(&rr.version, id.to_owned()).await;
+                        let pk = self.get_pk(&rr.version, id.clone()).await;
                         rr.set_pk(pk);
                     }
                     let mut msg_out = RendezvousMessage::new();
@@ -528,6 +590,15 @@ impl RendezvousServer {
                         } else if rr.relay_server == self.inner.local_ip {
                             rr.relay_server = self.get_relay_server(addr.ip(), addr_b.ip());
                         }
+                    }
+                    #[cfg(feature = "nemo-management-api")]
+                    if !id.is_empty() {
+                        crate::nemo_management::record_relay_response(
+                            &id,
+                            addr,
+                            &rr.relay_server,
+                        )
+                        .await;
                     }
                     msg_out.set_relay_response(rr);
                     allow_err!(self.send_to_tcp_sync(msg_out, addr_b).await);
@@ -627,6 +698,16 @@ impl RendezvousServer {
             &addr_a,
             &addr
         );
+        #[cfg(feature = "nemo-management-api")]
+        {
+            crate::nemo_management::record_punch_response(
+                &phs.id,
+                addr,
+                &phs.relay_server,
+                phs.nat_type.value(),
+            )
+            .await;
+        }
         let mut msg_out = RendezvousMessage::new();
         let mut p = PunchHoleResponse {
             socket_addr: AddrMangle::encode(addr).into(),
@@ -661,6 +742,11 @@ impl RendezvousServer {
             &addr_a,
             &addr
         );
+        #[cfg(feature = "nemo-management-api")]
+        {
+            crate::nemo_management::record_local_addr_response(&la.id, addr, &la.relay_server)
+                .await;
+        }
         let mut msg_out = RendezvousMessage::new();
         let mut p = PunchHoleResponse {
             socket_addr: la.local_addr.clone(),
@@ -689,6 +775,9 @@ impl RendezvousServer {
         let mut ph = ph;
         if !key.is_empty() && ph.licence_key != key {
             log::warn!("Authentication failed from {} for peer {} - invalid key", addr, ph.id);
+            #[cfg(feature = "nemo-management-api")]
+            crate::nemo_management::record_policy_rejection(&ph.id, addr, "invalid server key")
+                .await;
             let mut msg_out = RendezvousMessage::new();
             msg_out.set_punch_hole_response(PunchHoleResponse {
                 failure: punch_hole_response::Failure::LICENSE_MISMATCH.into(),
@@ -697,6 +786,23 @@ impl RendezvousServer {
             return Ok((msg_out, None));
         }
         let id = ph.id;
+        #[cfg(feature = "nemo-management-api")]
+        let nemo_nat_type = ph.nat_type.value();
+        #[cfg(feature = "nemo-management-api")]
+        if !crate::nemo_management::is_peer_allowed(&self.pm, &id).await {
+            crate::nemo_management::record_policy_rejection(
+                &id,
+                addr,
+                "target peer is not allowed by Nemo policy",
+            )
+            .await;
+            let mut msg_out = RendezvousMessage::new();
+            msg_out.set_punch_hole_response(PunchHoleResponse {
+                failure: punch_hole_response::Failure::OFFLINE.into(),
+                ..Default::default()
+            });
+            return Ok((msg_out, None));
+        }
         // punch hole request from A, relay to B,
         // check if in same intranet first,
         // fetch local addrs if in same intranet.
@@ -736,7 +842,13 @@ impl RendezvousServer {
             let peer_is_lan = self.is_lan(peer_addr);
             let is_lan = self.is_lan(addr);
             let mut relay_server = self.get_relay_server(addr.ip(), peer_addr.ip());
+            #[cfg(feature = "nemo-management-api")]
+            let mut forced_relay = false;
             if ALWAYS_USE_RELAY.load(Ordering::SeqCst) || (peer_is_lan ^ is_lan) {
+                #[cfg(feature = "nemo-management-api")]
+                {
+                    forced_relay = true;
+                }
                 if peer_is_lan {
                     // https://github.com/rustdesk/rustdesk-server/issues/24
                     relay_server = self.inner.local_ip.clone()
@@ -752,6 +864,17 @@ impl RendezvousServer {
                     }
                 });
             let socket_addr = AddrMangle::encode(addr).into();
+            #[cfg(feature = "nemo-management-api")]
+            crate::nemo_management::record_connection_negotiation(
+                &id,
+                addr,
+                peer_addr,
+                nemo_nat_type,
+                forced_relay,
+                same_intranet,
+                &relay_server,
+            )
+            .await;
             if same_intranet {
                 log::debug!(
                     "Fetch local addr {:?} {:?} request from {:?}",

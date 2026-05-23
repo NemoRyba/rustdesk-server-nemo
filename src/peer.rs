@@ -22,6 +22,7 @@ pub const IP_CHANGE_DUR: u64 = 180;
 pub const IP_CHANGE_DUR_X2: u64 = IP_CHANGE_DUR * 2;
 pub const DAY_SECONDS: u64 = 3600 * 24;
 pub const IP_BLOCK_DUR: u64 = 60;
+pub const PEER_ONLINE_TIMEOUT_MS: u64 = 30_000;
 
 #[derive(Debug, Default, Serialize, Deserialize, Clone)]
 pub(crate) struct PeerInfo {
@@ -37,7 +38,7 @@ pub(crate) struct Peer {
     pub(crate) pk: Bytes,
     // pub(crate) user: Option<Vec<u8>>,
     pub(crate) info: PeerInfo,
-    // pub(crate) disabled: bool,
+    pub(crate) status: Option<i64>,
     pub(crate) reg_pk: (u32, Instant), // how often register_pk
 }
 
@@ -51,13 +52,22 @@ impl Default for Peer {
             pk: Bytes::new(),
             info: Default::default(),
             // user: None,
-            // disabled: false,
+            status: None,
             reg_pk: (0, get_expired_time()),
         }
     }
 }
 
 pub(crate) type LockPeer = Arc<RwLock<Peer>>;
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct PeerRuntimeSnapshot {
+    pub(crate) public_addr: Option<String>,
+    pub(crate) last_seen_ms_ago: Option<u64>,
+    pub(crate) online: bool,
+    pub(crate) registered_ip: Option<String>,
+    pub(crate) status: Option<i64>,
+}
 
 #[derive(Clone)]
 pub(crate) struct PeerMap {
@@ -144,7 +154,7 @@ impl PeerMap {
                 pk: v.pk.into(),
                 // user: v.user,
                 info: serde_json::from_str::<PeerInfo>(&v.info).unwrap_or_default(),
-                // disabled: v.status == Some(0),
+                status: v.status,
                 ..Default::default()
             };
             let peer = Arc::new(RwLock::new(peer));
@@ -176,5 +186,85 @@ impl PeerMap {
     #[inline]
     pub(crate) async fn is_in_memory(&self, id: &str) -> bool {
         self.map.read().await.contains_key(id)
+    }
+
+    pub(crate) async fn get_registered(
+        &self,
+        id: &str,
+    ) -> ResultType<Option<database::RegisteredPeer>> {
+        self.db.get_registered_peer(id).await
+    }
+
+    pub(crate) async fn list_registered(
+        &self,
+        limit: usize,
+        offset: usize,
+    ) -> ResultType<Vec<database::RegisteredPeer>> {
+        self.db.list_registered_peers(limit, offset).await
+    }
+
+    pub(crate) async fn set_peer_status(
+        &self,
+        id: &str,
+        status: Option<i64>,
+        note: Option<&str>,
+    ) -> ResultType<bool> {
+        let updated = self.db.set_peer_status(id, status, note).await?;
+        if updated {
+            let peer = self.map.read().await.get(id).cloned();
+            if let Some(peer) = peer {
+                peer.write().await.status = status;
+            }
+        }
+        Ok(updated)
+    }
+
+    pub(crate) async fn peer_status(&self, id: &str) -> ResultType<Option<i64>> {
+        if let Some(peer) = self.get_in_memory(id).await {
+            let peer = peer.read().await;
+            if peer.guid.is_empty() {
+                return Ok(peer.status);
+            }
+            return Ok(peer.status);
+        }
+        Ok(self.db.get_peer(id).await?.and_then(|peer| peer.status))
+    }
+
+    pub(crate) async fn is_peer_blocked(&self, id: &str) -> bool {
+        matches!(self.peer_status(id).await, Ok(Some(0)))
+    }
+
+    pub(crate) async fn is_peer_allowed_for_control(&self, id: &str, company_only: bool) -> bool {
+        match self.peer_status(id).await {
+            Ok(Some(0)) => false,
+            Ok(Some(1)) => true,
+            Ok(_) => !company_only,
+            Err(err) => {
+                log::error!("failed to read peer policy for {}: {}", id, err);
+                !company_only
+            }
+        }
+    }
+
+    pub(crate) async fn runtime_snapshot(&self, id: &str) -> Option<PeerRuntimeSnapshot> {
+        let peer = self.get_in_memory(id).await?;
+        let peer = peer.read().await;
+        let elapsed = peer.last_reg_time.elapsed().as_millis() as u64;
+        let public_addr = if peer.socket_addr.port() == 0 {
+            None
+        } else {
+            Some(peer.socket_addr.to_string())
+        };
+        Some(PeerRuntimeSnapshot {
+            public_addr,
+            last_seen_ms_ago: Some(elapsed),
+            online: elapsed < PEER_ONLINE_TIMEOUT_MS,
+            registered_ip: if peer.info.ip.is_empty() {
+                None
+            } else {
+                Some(peer.info.ip.clone())
+            },
+            status: peer.status,
+        })
     }
 }
