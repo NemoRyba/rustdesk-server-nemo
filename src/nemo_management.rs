@@ -479,6 +479,13 @@ pub(crate) fn company_only() -> bool {
     COMPANY_ONLY.load(Ordering::SeqCst)
 }
 
+/// Test-only setter for the process-global company-only flag, so cross-module
+/// tests (e.g. the rendezvous handler tests) can pin it deterministically.
+#[cfg(test)]
+pub(crate) fn set_company_only_for_test(value: bool) {
+    COMPANY_ONLY.store(value, Ordering::SeqCst);
+}
+
 pub(crate) async fn is_peer_blocked(pm: &PeerMap, id: &str) -> bool {
     pm.is_peer_blocked(id).await
 }

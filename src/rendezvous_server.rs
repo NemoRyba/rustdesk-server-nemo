@@ -1549,3 +1549,255 @@ async fn create_tcp_listener(port: i32) -> ResultType<TcpListener> {
     log::debug!("listen on tcp {:?}", s.local_addr());
     Ok(s)
 }
+
+#[cfg(test)]
+mod tests {
+    //! Layer 2 (TDD): protocol-handler tests for the direct-vs-relay decision
+    //! core, `handle_punch_hole_request`. These run fully in-process — no
+    //! sockets — against a temp-DB `PeerMap`, and assert on the returned
+    //! `(RendezvousMessage, Option<SocketAddr>)`.
+    //!
+    //! Peers are pinned with explicit status (`Some(1)`/`Some(0)`) so the
+    //! outcome does not depend on the process-global `COMPANY_ONLY`; the one
+    //! case that inherently does (an unregistered target) sets it explicitly.
+    //! Each test uses its own temp sqlite file under the gitignored `target/`.
+    use super::*;
+    use std::sync::atomic::AtomicU32;
+
+    static DB_COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    struct TempDb(String);
+    impl Drop for TempDb {
+        fn drop(&mut self) {
+            for suffix in ["", "-wal", "-shm", "-journal"] {
+                let _ = std::fs::remove_file(format!("{}{}", self.0, suffix));
+            }
+        }
+    }
+    fn temp_db() -> TempDb {
+        let n = DB_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let _ = std::fs::create_dir_all("target");
+        TempDb(format!("target/nemo_rs_test_{}_{}.sqlite3", std::process::id(), n))
+    }
+
+    /// Build a `RendezvousServer` wired for tests: the given LAN mask, a single
+    /// stub relay server, no signing key. `tx`'s receiver is dropped — the
+    /// handler under test never sends on it.
+    fn test_server(pm: PeerMap, mask: &str) -> RendezvousServer {
+        let (tx, _rx) = mpsc::unbounded_channel::<Data>();
+        let mut rs = RendezvousServer {
+            tcp_punch: Arc::new(Mutex::new(HashMap::new())),
+            pm,
+            tx,
+            relay_servers: Default::default(),
+            relay_servers0: Default::default(),
+            rendezvous_servers: Arc::new(vec![]),
+            inner: Arc::new(Inner {
+                serial: 0,
+                version: "1.0.0-test".to_owned(),
+                software_url: String::new(),
+                mask: Some(mask.parse().expect("valid CIDR")),
+                local_ip: "192.168.0.1".to_owned(),
+                sk: None,
+            }),
+        };
+        rs.parse_relay_servers("198.51.100.50:21117");
+        rs
+    }
+
+    /// Register an in-memory peer (as a live registration would) with a chosen
+    /// public address and status. `fresh = false` leaves the default expired
+    /// `last_reg_time`, modelling a stale/offline peer.
+    async fn register(pm: &PeerMap, id: &str, addr: &str, status: Option<i64>, fresh: bool) {
+        let peer = pm.get_or(id).await;
+        let mut w = peer.write().await;
+        w.socket_addr = addr.parse().expect("valid socket addr");
+        w.status = status;
+        if fresh {
+            w.last_reg_time = Instant::now();
+        }
+    }
+
+    fn punch_request(target_id: &str) -> PunchHoleRequest {
+        PunchHoleRequest {
+            id: target_id.to_owned(),
+            nat_type: NatType::ASYMMETRIC.into(),
+            version: "1.0.0".to_owned(),
+            ..Default::default()
+        }
+    }
+
+    fn failure_of(msg: &RendezvousMessage) -> Option<(punch_hole_response::Failure, String)> {
+        match &msg.union {
+            Some(rendezvous_message::Union::PunchHoleResponse(r)) => {
+                Some((r.failure.enum_value_or_default(), r.other_failure.clone()))
+            }
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn punch_invalid_key_returns_license_mismatch() {
+        run_punch_invalid_key_returns_license_mismatch();
+    }
+    #[tokio::main(flavor = "current_thread")]
+    async fn run_punch_invalid_key_returns_license_mismatch() {
+        let db = temp_db();
+        let pm = PeerMap::new_for_test(&db.0).await.unwrap();
+        let mut rs = test_server(pm, "192.168.0.0/16");
+        let mut ph = punch_request("ws-01");
+        ph.licence_key = "wrong-key".to_owned();
+        let (msg, forwarded) = rs
+            .handle_punch_hole_request("203.0.113.7:55000".parse().unwrap(), ph, "server-key", false)
+            .await
+            .unwrap();
+        assert!(forwarded.is_none());
+        assert_eq!(
+            failure_of(&msg).map(|f| f.0),
+            Some(punch_hole_response::Failure::LICENSE_MISMATCH)
+        );
+    }
+
+    #[test]
+    fn punch_unknown_peer_returns_id_not_exist() {
+        run_punch_unknown_peer_returns_id_not_exist();
+    }
+    #[tokio::main(flavor = "current_thread")]
+    async fn run_punch_unknown_peer_returns_id_not_exist() {
+        crate::nemo_management::set_company_only_for_test(false);
+        let db = temp_db();
+        let pm = PeerMap::new_for_test(&db.0).await.unwrap();
+        let mut rs = test_server(pm, "192.168.0.0/16");
+        let (msg, forwarded) = rs
+            .handle_punch_hole_request("203.0.113.7:55000".parse().unwrap(), punch_request("ghost"), "", false)
+            .await
+            .unwrap();
+        assert!(forwarded.is_none());
+        assert_eq!(
+            failure_of(&msg).map(|f| f.0),
+            Some(punch_hole_response::Failure::ID_NOT_EXIST)
+        );
+    }
+
+    #[test]
+    fn punch_stale_peer_returns_offline() {
+        run_punch_stale_peer_returns_offline();
+    }
+    #[tokio::main(flavor = "current_thread")]
+    async fn run_punch_stale_peer_returns_offline() {
+        let db = temp_db();
+        let pm = PeerMap::new_for_test(&db.0).await.unwrap();
+        // Allowed (status=1) but registration is stale -> OFFLINE with no reason.
+        register(&pm, "ws-01", "198.51.100.9:41000", Some(1), false).await;
+        let mut rs = test_server(pm, "192.168.0.0/16");
+        let (msg, forwarded) = rs
+            .handle_punch_hole_request("203.0.113.7:55000".parse().unwrap(), punch_request("ws-01"), "", false)
+            .await
+            .unwrap();
+        assert!(forwarded.is_none());
+        let (failure, reason) = failure_of(&msg).expect("punch hole response");
+        assert_eq!(failure, punch_hole_response::Failure::OFFLINE);
+        assert!(reason.is_empty(), "stale-offline carries no policy reason");
+    }
+
+    #[test]
+    fn punch_blocked_peer_returns_offline_with_reason() {
+        run_punch_blocked_peer_returns_offline_with_reason();
+    }
+    #[tokio::main(flavor = "current_thread")]
+    async fn run_punch_blocked_peer_returns_offline_with_reason() {
+        let db = temp_db();
+        let pm = PeerMap::new_for_test(&db.0).await.unwrap();
+        register(&pm, "ws-01", "198.51.100.9:41000", Some(0), true).await;
+        let mut rs = test_server(pm, "192.168.0.0/16");
+        let (msg, forwarded) = rs
+            .handle_punch_hole_request("203.0.113.7:55000".parse().unwrap(), punch_request("ws-01"), "", false)
+            .await
+            .unwrap();
+        assert!(forwarded.is_none());
+        let (failure, reason) = failure_of(&msg).expect("punch hole response");
+        assert_eq!(failure, punch_hole_response::Failure::OFFLINE);
+        assert!(reason.contains("not allowed"), "got reason: {reason:?}");
+    }
+
+    #[test]
+    fn punch_wan_to_wan_passes_nat_type_through() {
+        run_punch_wan_to_wan_passes_nat_type_through();
+    }
+    #[tokio::main(flavor = "current_thread")]
+    async fn run_punch_wan_to_wan_passes_nat_type_through() {
+        ALWAYS_USE_RELAY.store(false, Ordering::SeqCst);
+        let db = temp_db();
+        let pm = PeerMap::new_for_test(&db.0).await.unwrap();
+        // Both endpoints are public (outside the LAN mask), different IPs.
+        register(&pm, "ws-01", "198.51.100.9:41000", Some(1), true).await;
+        let mut rs = test_server(pm, "192.168.0.0/16");
+        let (msg, forwarded) = rs
+            .handle_punch_hole_request("203.0.113.7:55000".parse().unwrap(), punch_request("ws-01"), "", false)
+            .await
+            .unwrap();
+        assert!(forwarded.is_some());
+        match msg.union {
+            Some(rendezvous_message::Union::PunchHole(ph_out)) => {
+                // No LAN mismatch and ALWAYS_USE_RELAY off -> nat_type unchanged.
+                assert_eq!(ph_out.nat_type.enum_value_or_default(), NatType::ASYMMETRIC);
+            }
+            other => panic!("expected PunchHole, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn punch_wan_to_lan_forces_relay() {
+        run_punch_wan_to_lan_forces_relay();
+    }
+    #[tokio::main(flavor = "current_thread")]
+    async fn run_punch_wan_to_lan_forces_relay() {
+        // Documents the production reality (roadmap Phase 1.5): a workstation on
+        // the server's LAN, reached by a controller on the WAN, is forced onto
+        // the relay by rewriting the peer's NAT type to SYMMETRIC. When that
+        // forcing is made configurable, this test changes with it.
+        ALWAYS_USE_RELAY.store(false, Ordering::SeqCst);
+        let db = temp_db();
+        let pm = PeerMap::new_for_test(&db.0).await.unwrap();
+        register(&pm, "ws-01", "192.168.0.50:41000", Some(1), true).await;
+        let mut rs = test_server(pm, "192.168.0.0/16");
+        let (msg, forwarded) = rs
+            .handle_punch_hole_request("203.0.113.7:55000".parse().unwrap(), punch_request("ws-01"), "", false)
+            .await
+            .unwrap();
+        assert!(forwarded.is_some());
+        match msg.union {
+            Some(rendezvous_message::Union::PunchHole(ph_out)) => {
+                assert_eq!(
+                    ph_out.nat_type.enum_value_or_default(),
+                    NatType::SYMMETRIC,
+                    "WAN->LAN is forced to relay via SYMMETRIC in the current topology"
+                );
+            }
+            other => panic!("expected PunchHole, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn punch_lan_to_lan_returns_fetch_local_addr() {
+        run_punch_lan_to_lan_returns_fetch_local_addr();
+    }
+    #[tokio::main(flavor = "current_thread")]
+    async fn run_punch_lan_to_lan_returns_fetch_local_addr() {
+        ALWAYS_USE_RELAY.store(false, Ordering::SeqCst);
+        let db = temp_db();
+        let pm = PeerMap::new_for_test(&db.0).await.unwrap();
+        // Both endpoints on the LAN -> same-intranet direct path.
+        register(&pm, "ws-01", "192.168.0.50:41000", Some(1), true).await;
+        let mut rs = test_server(pm, "192.168.0.0/16");
+        let (msg, forwarded) = rs
+            .handle_punch_hole_request("192.168.0.60:55000".parse().unwrap(), punch_request("ws-01"), "", false)
+            .await
+            .unwrap();
+        assert!(forwarded.is_some());
+        assert!(
+            matches!(msg.union, Some(rendezvous_message::Union::FetchLocalAddr(_))),
+            "same-intranet peers should get FetchLocalAddr (direct LAN), not relay"
+        );
+    }
+}

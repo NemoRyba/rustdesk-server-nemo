@@ -264,6 +264,18 @@ impl PeerMap {
         }
     }
 
+    /// Test-only constructor that binds an explicit sqlite path instead of the
+    /// process-global `DB_URL` env var. Parallel `cargo test` threads each need
+    /// their own database; sharing `DB_URL` would race. See the Layer 2 tests in
+    /// `rendezvous_server.rs`.
+    #[cfg(test)]
+    pub(crate) async fn new_for_test(db_path: &str) -> ResultType<Self> {
+        Ok(Self {
+            map: Default::default(),
+            db: database::Database::new(db_path).await?,
+        })
+    }
+
     pub(crate) async fn runtime_snapshot(&self, id: &str) -> Option<PeerRuntimeSnapshot> {
         let peer = self.get_in_memory(id).await?;
         let peer = peer.read().await;
