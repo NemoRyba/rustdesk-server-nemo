@@ -284,36 +284,88 @@ fn registered_peer_from_row(row: SqliteRow) -> RegisteredPeer {
 
 #[cfg(test)]
 mod tests {
+    //! Layer 1 (TDD): deterministic database CRUD roundtrip.
+    //!
+    //! Replaces the old `test_insert`, which raced 10 000 inserts into a fixed
+    //! `test.sqlite3` with no assertions and no cleanup (non-deterministic under
+    //! parallel `cargo test`, and it dirtied the working tree). This exercises
+    //! the real Nemo-relevant columns (`status`, `management_policy`) against a
+    //! self-migrated schema in a per-test temp database that is removed on drop.
+    use super::*;
     use hbb_common::tokio;
-    #[test]
-    fn test_insert() {
-        insert();
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    /// A sqlite file under the gitignored `target/` dir that deletes itself
+    /// (and any sidecar journal/WAL files) when dropped, including on test
+    /// panic. Two deliberate choices:
+    /// - A *relative* path: `SqliteConnectOptions::from_str` mis-parses a
+    ///   Windows absolute path (`C:\...`) as a URL scheme, so an absolute path
+    ///   would fail to open.
+    /// - Under `target/`: sqlx runs sqlite on a background thread and closes the
+    ///   OS file handle slightly after this `Drop` returns, so on Windows the
+    ///   unlink here can lose the race and leave the file behind. Keeping it in
+    ///   the ignored build dir means a stray never dirties the git tree; the
+    ///   unlink still succeeds on Linux/CI where handles close synchronously.
+    struct TempDb(String);
+    impl Drop for TempDb {
+        fn drop(&mut self) {
+            for suffix in ["", "-wal", "-shm", "-journal"] {
+                let _ = std::fs::remove_file(format!("{}{}", self.0, suffix));
+            }
+        }
+    }
+    fn temp_db() -> TempDb {
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let _ = std::fs::create_dir_all("target");
+        TempDb(format!("target/nemo_test_{}_{}.sqlite3", std::process::id(), n))
     }
 
-    #[tokio::main(flavor = "multi_thread")]
-    async fn insert() {
-        let db = super::Database::new("test.sqlite3").await.unwrap();
-        let mut jobs = vec![];
-        for i in 0..10000 {
-            let cloned = db.clone();
-            let id = i.to_string();
-            let a = tokio::spawn(async move {
-                let empty_vec = Vec::new();
-                cloned
-                    .insert_peer(&id, &empty_vec, &empty_vec, "")
-                    .await
-                    .unwrap();
-            });
-            jobs.push(a);
-        }
-        for i in 0..10000 {
-            let cloned = db.clone();
-            let id = i.to_string();
-            let a = tokio::spawn(async move {
-                cloned.get_peer(&id).await.unwrap();
-            });
-            jobs.push(a);
-        }
-        hbb_common::futures::future::join_all(jobs).await;
+    #[test]
+    fn peer_crud_roundtrip() {
+        run_peer_crud_roundtrip();
+    }
+
+    #[tokio::main(flavor = "current_thread")]
+    async fn run_peer_crud_roundtrip() {
+        let temp = temp_db();
+        let db = Database::new(&temp.0).await.unwrap();
+
+        let uuid = vec![1u8, 2, 3, 4];
+        let pk = vec![9u8, 8, 7];
+        db.insert_peer("ws-01", &uuid, &pk, "info-1").await.unwrap();
+
+        // insert -> get roundtrip.
+        let peer = db.get_peer("ws-01").await.unwrap().expect("peer should exist");
+        assert_eq!(peer.id, "ws-01");
+        assert_eq!(peer.uuid, uuid);
+        assert_eq!(peer.pk, pk);
+
+        // Absent peer reads as None, not an error.
+        assert!(db.get_peer("does-not-exist").await.unwrap().is_none());
+
+        // Status change is visible through the registered-peer view.
+        assert!(db
+            .set_peer_status("ws-01", Some(0), Some("blocked by test"))
+            .await
+            .unwrap());
+        let reg = db.get_registered_peer("ws-01").await.unwrap().expect("registered");
+        assert_eq!(reg.status, Some(0));
+        assert_eq!(reg.note.as_deref(), Some("blocked by test"));
+
+        // Management policy roundtrip on the Nemo column.
+        let policy = r#"{"allow_user_override":false,"options":{"nemo-outbound-enabled":"N"}}"#;
+        assert!(db
+            .set_peer_management_policy("ws-01", Some(policy))
+            .await
+            .unwrap());
+        let reg = db.get_registered_peer("ws-01").await.unwrap().expect("registered");
+        assert_eq!(reg.management_policy.as_deref(), Some(policy));
+
+        // Delete removes it; a second delete affects no rows.
+        assert!(db.delete_registered_peer("ws-01").await.unwrap());
+        assert!(db.get_registered_peer("ws-01").await.unwrap().is_none());
+        assert!(!db.delete_registered_peer("ws-01").await.unwrap());
     }
 }

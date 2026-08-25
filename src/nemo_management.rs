@@ -1258,3 +1258,277 @@ fn is_truthy(value: &str) -> bool {
         "1" | "y" | "yes" | "true" | "on"
     )
 }
+
+#[cfg(test)]
+mod tests {
+    //! Layer 1 (TDD): pure-function unit tests for the Nemo policy layer.
+    //!
+    //! These live inline so they can reach the module-private functions without
+    //! widening any visibility. They perform no I/O and touch no sockets/DB; the
+    //! few that depend on the process-global `COMPANY_ONLY` are grouped into a
+    //! single serial test that restores the flag, so the suite stays
+    //! deterministic under `cargo test`'s parallel runner.
+    use super::*;
+
+    // The controller-identity vectors below are a cross-fork CONTRACT: the
+    // client fork formats this exact string in
+    // `rustdesk-client-nemo/src/client.rs::nemo_source_identity_header`, and the
+    // server parses it here. Keep these cases byte-identical to the client-side
+    // tests so a divergence in either fork fails a test rather than silently
+    // breaking controller policy. When the dedicated `NemoSource` protobuf field
+    // lands (roadmap Phase 1.3), convert these into proto round-trip vectors.
+    fn source_field(id: &str, uuid: &[u8]) -> String {
+        format!("{}{}:{}", NEMO_SOURCE_PREFIX, id, base64::encode(uuid))
+    }
+
+    #[test]
+    fn target_allowed_none_or_empty_is_open() {
+        assert!(target_allowed_by_controller_policy(None, "anything"));
+        assert!(target_allowed_by_controller_policy(Some(&String::new()), "anything"));
+        assert!(target_allowed_by_controller_policy(Some(&"   ".to_owned()), "anything"));
+    }
+
+    #[test]
+    fn target_allowed_wildcard_matches_any() {
+        assert!(target_allowed_by_controller_policy(Some(&"*".to_owned()), "ws-01"));
+        assert!(target_allowed_by_controller_policy(Some(&"ws-02, *".to_owned()), "ws-01"));
+    }
+
+    #[test]
+    fn target_allowed_exact_and_separators() {
+        let targets = "ws-01, ws-02; ws-03\tws-04".to_owned();
+        for wanted in ["ws-01", "ws-02", "ws-03", "ws-04"] {
+            assert!(
+                target_allowed_by_controller_policy(Some(&targets), wanted),
+                "expected {wanted} to be allowed"
+            );
+        }
+        assert!(!target_allowed_by_controller_policy(Some(&targets), "ws-99"));
+    }
+
+    #[test]
+    fn target_allowed_trims_entries() {
+        assert!(target_allowed_by_controller_policy(
+            Some(&"   ws-01   ,   ws-02   ".to_owned()),
+            "ws-02"
+        ));
+    }
+
+    #[test]
+    fn source_identity_parses_bare_and_versioned() {
+        let uuid = vec![1u8, 2, 3, 4, 5];
+        // Bare form.
+        let (id, got) = controller_source_identity(&source_field("peer-a", &uuid)).unwrap();
+        assert_eq!(id, "peer-a");
+        assert_eq!(got, uuid);
+        // Embedded after a real version string, as the client actually sends it
+        // in `PunchHoleRequest.version` ("<VERSION> nemo-source-v1:...").
+        let versioned = format!("1.4.6 {}", source_field("peer-a", &uuid));
+        let (id2, got2) = controller_source_identity(&versioned).unwrap();
+        assert_eq!(id2, "peer-a");
+        assert_eq!(got2, uuid);
+    }
+
+    #[test]
+    fn source_identity_stops_at_trailing_whitespace() {
+        // A trailing token after the uuid (e.g. more version data) must not be
+        // folded into the base64 uuid.
+        let uuid = vec![9u8, 8, 7];
+        let field = format!("{} extra-token", source_field("peer-b", &uuid));
+        let (id, got) = controller_source_identity(&field).unwrap();
+        assert_eq!(id, "peer-b");
+        assert_eq!(got, uuid);
+    }
+
+    #[test]
+    fn source_identity_rejects_malformed() {
+        // Missing prefix.
+        assert!(controller_source_identity("1.4.6 no-marker-here").is_none());
+        // Missing uuid part.
+        assert!(controller_source_identity("nemo-source-v1:peer-a").is_none());
+        // Empty id.
+        assert!(controller_source_identity("nemo-source-v1::dXVpZA==").is_none());
+        // Empty uuid.
+        assert!(controller_source_identity("nemo-source-v1:peer-a:").is_none());
+        // Invalid base64 uuid.
+        assert!(controller_source_identity("nemo-source-v1:peer-a:!!!not-base64!!!").is_none());
+    }
+
+    #[test]
+    fn is_truthy_accepts_common_affirmatives() {
+        for v in ["1", "y", "Y", "yes", "YES", "true", "TRUE", "on", "  on  "] {
+            assert!(is_truthy(v), "{v:?} should be truthy");
+        }
+        for v in ["0", "n", "no", "false", "off", "", "  ", "maybe"] {
+            assert!(!is_truthy(v), "{v:?} should be falsy");
+        }
+    }
+
+    #[test]
+    fn management_policy_key_membership() {
+        // Nemo-only keys.
+        assert!(is_management_policy_key("nemo-outbound-enabled"));
+        assert!(is_management_policy_key("nemo-permanent-password"));
+        // Performance key the roadmap pushes via policy.
+        assert!(is_management_policy_key("enable-udp-punch"));
+        // Unknown key.
+        assert!(!is_management_policy_key("totally-bogus-key"));
+    }
+
+    #[test]
+    fn sanitize_value_trims_and_bounds() {
+        // Known key: value is trimmed.
+        assert_eq!(
+            sanitize_management_policy_value("nemo-outbound-enabled", "  Y  ").as_deref(),
+            Some("Y")
+        );
+        // Unknown key: dropped.
+        assert!(sanitize_management_policy_value("totally-bogus-key", "Y").is_none());
+        // Overlong value: dropped.
+        let long = "a".repeat(MAX_MANAGEMENT_POLICY_VALUE_LEN + 1);
+        assert!(sanitize_management_policy_value("nemo-outbound-enabled", &long).is_none());
+        // Exactly at the bound: kept.
+        let at_bound = "a".repeat(MAX_MANAGEMENT_POLICY_VALUE_LEN);
+        assert!(sanitize_management_policy_value("nemo-outbound-enabled", &at_bound).is_some());
+    }
+
+    #[test]
+    fn management_policy_from_peer_handles_missing_and_invalid() {
+        // None -> default (empty options).
+        assert!(management_policy_from_peer(&None).options.is_empty());
+        // Invalid JSON -> default.
+        assert!(management_policy_from_peer(&Some("not json".to_owned()))
+            .options
+            .is_empty());
+    }
+
+    #[test]
+    fn management_policy_from_peer_sanitizes_options() {
+        let json = r#"{
+            "allow_user_override": true,
+            "options": {
+                "nemo-outbound-enabled": "  N  ",
+                "totally-bogus-key": "should-be-dropped"
+            }
+        }"#;
+        let policy = management_policy_from_peer(&Some(json.to_owned()));
+        assert!(policy.allow_user_override);
+        // Unknown key dropped, known key trimmed.
+        assert_eq!(policy.options.get("nemo-outbound-enabled").map(String::as_str), Some("N"));
+        assert!(!policy.options.contains_key("totally-bogus-key"));
+    }
+
+    #[test]
+    fn nat_type_name_maps_known_values() {
+        assert_eq!(nat_type_name(1), "ASYMMETRIC");
+        assert_eq!(nat_type_name(2), "SYMMETRIC");
+        assert_eq!(nat_type_name(0), "UNKNOWN_NAT");
+        assert_eq!(nat_type_name(42), "UNKNOWN_NAT");
+    }
+
+    #[test]
+    fn require_auth_is_open_when_no_token_configured() {
+        let headers = HeaderMap::new();
+        assert!(require_auth(&headers, &None).is_ok());
+    }
+
+    #[test]
+    fn require_auth_accepts_bearer_and_x_nemo_token() {
+        let token = Some("s3cret".to_owned());
+
+        let mut bearer = HeaderMap::new();
+        bearer.insert(AUTHORIZATION, "Bearer s3cret".parse().unwrap());
+        assert!(require_auth(&bearer, &token).is_ok());
+
+        let mut xnemo = HeaderMap::new();
+        xnemo.insert("x-nemo-token", "s3cret".parse().unwrap());
+        assert!(require_auth(&xnemo, &token).is_ok());
+    }
+
+    #[test]
+    fn require_auth_rejects_missing_or_wrong_token() {
+        let token = Some("s3cret".to_owned());
+
+        assert_eq!(
+            require_auth(&HeaderMap::new(), &token).unwrap_err().0,
+            StatusCode::UNAUTHORIZED
+        );
+
+        let mut wrong = HeaderMap::new();
+        wrong.insert(AUTHORIZATION, "Bearer nope".parse().unwrap());
+        assert_eq!(
+            require_auth(&wrong, &token).unwrap_err().0,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[test]
+    fn validate_client_policy_request_matches_uuid() {
+        let peer = RegisteredPeer {
+            uuid: vec![10u8, 20, 30],
+            ..Default::default()
+        };
+        // Matching uuid.
+        let ok = ClientPolicyRequest {
+            id: "peer-a".to_owned(),
+            uuid: base64::encode([10u8, 20, 30]),
+            policy_version: None,
+        };
+        assert!(validate_client_policy_request(&peer, &ok).is_ok());
+        // Empty id.
+        let no_id = ClientPolicyRequest {
+            id: "  ".to_owned(),
+            uuid: base64::encode([10u8, 20, 30]),
+            policy_version: None,
+        };
+        assert_eq!(
+            validate_client_policy_request(&peer, &no_id).unwrap_err().0,
+            StatusCode::BAD_REQUEST
+        );
+        // Bad base64.
+        let bad_b64 = ClientPolicyRequest {
+            id: "peer-a".to_owned(),
+            uuid: "!!!".to_owned(),
+            policy_version: None,
+        };
+        assert_eq!(
+            validate_client_policy_request(&peer, &bad_b64).unwrap_err().0,
+            StatusCode::BAD_REQUEST
+        );
+        // Wrong uuid.
+        let mismatch = ClientPolicyRequest {
+            id: "peer-a".to_owned(),
+            uuid: base64::encode([99u8, 99, 99]),
+            policy_version: None,
+        };
+        assert_eq!(
+            validate_client_policy_request(&peer, &mismatch).unwrap_err().0,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    // Grouped serial test for the functions that read the process-global
+    // COMPANY_ONLY flag. Kept in one test so parallel tests never observe a
+    // half-set global; the original value is restored at the end.
+    #[test]
+    fn policy_label_and_allowed_respect_company_only() {
+        let saved = COMPANY_ONLY.load(Ordering::SeqCst);
+
+        // Explicit statuses are independent of company-only mode.
+        assert_eq!(policy_label(Some(0)), "blocked");
+        assert_eq!(policy_label(Some(1)), "allowed");
+        assert!(!allowed_for_status(Some(0)));
+        assert!(allowed_for_status(Some(1)));
+
+        // Unapproved (NULL status) flips with the global.
+        COMPANY_ONLY.store(false, Ordering::SeqCst);
+        assert_eq!(policy_label(None), "open");
+        assert!(allowed_for_status(None));
+
+        COMPANY_ONLY.store(true, Ordering::SeqCst);
+        assert_eq!(policy_label(None), "unapproved");
+        assert!(!allowed_for_status(None));
+
+        COMPANY_ONLY.store(saved, Ordering::SeqCst);
+    }
+}
