@@ -1,0 +1,43 @@
+name: test
+
+# Runs the Rust unit + integration tests on every push and pull request.
+# The existing build.yaml only fires on release tags and never runs `cargo test`,
+# so this is the gate that keeps the Nemo policy layer (and the rest of hbbs)
+# green as changes land. Kept fast so it can block merges.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [master, main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # sqlx's compile-time `query!` macros read this; the tracked db_v2.sqlite3
+  # fixture carries the schema they check against. Also present in .env, but set
+  # explicitly here so the build does not depend on dotenv discovery.
+  DATABASE_URL: sqlite://./db_v2.sqlite3
+  # Link the system libsodium instead of building the vendored copy from source
+  # (faster and more reliable than sodiumoxide's bundled build).
+  SODIUM_USE_PKG_CONFIG: "1"
+
+jobs:
+  test:
+    name: cargo test (Rust 1.75)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install native deps
+        run: sudo apt-get update && sudo apt-get install -y libsodium-dev
+
+      - name: Install Rust 1.75
+        uses: dtolnay/rust-toolchain@1.75
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run tests
+        run: cargo test --workspace --features nemo-management-api
