@@ -746,6 +746,7 @@ async fn api_login(
     let cfg = integration::ldap_config();
     match integration::authenticate_ldap(&cfg, &username, &password).await {
         Ok(user) => {
+            integration::clear_login_failures(&user.username);
             // ensure_user creates/updates the RBAC entry (seeded with defaults on
             // first login) and returns the current admin flag for the response.
             let (is_admin, _targets) =
@@ -772,10 +773,14 @@ async fn api_login(
         }
         Err(reason) => {
             log::warn!("Nemo login failed for {}: {}", username, reason);
-            // Small fixed delay to blunt online brute force / credential stuffing
-            // (a real LDAP bind runs per attempt). Not a substitute for a fronting
-            // rate-limiter, but raises the cost of high-volume guessing.
-            tokio::time::sleep(std::time::Duration::from_millis(750)).await;
+            // Per-username exponential backoff: slows online brute force / credential
+            // stuffing hard, but never hard-locks (a correct password succeeds
+            // instantly and clears the counter, so real users are never blocked).
+            let failures = integration::note_login_failure(&username);
+            let delay = integration::login_backoff_ms(failures);
+            if delay > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+            }
             Json(LoginResult::err(reason))
         }
     }

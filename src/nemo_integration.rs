@@ -438,6 +438,60 @@ fn prune_sessions(sessions: &mut HashMap<String, Session>) {
 }
 
 // --------------------------------------------------------------------------
+// Login brute-force backoff (per canonical username)
+// --------------------------------------------------------------------------
+//
+// Rather than a hard lockout (which lets an attacker deny a real user by
+// guessing their name), we impose an exponentially growing delay on *failed*
+// logins for a username. A correct password succeeds instantly and clears the
+// counter, so legitimate users are never blocked, while online guessing slows to
+// a crawl.
+
+const LOGIN_FAILURE_WINDOW_SECS: u64 = 900;
+const LOGIN_BACKOFF_BASE_MS: u64 = 250;
+const LOGIN_BACKOFF_MAX_MS: u64 = 30_000;
+
+// username -> (consecutive failures, last failure epoch secs)
+static LOGIN_FAILURES: Lazy<Mutex<HashMap<String, (u32, u64)>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+/// Record a failed login for `username`, returning the number of consecutive
+/// failures within the window (used to compute the backoff).
+pub fn note_login_failure(username: &str) -> u32 {
+    let key = normalize_lookup_username(username);
+    let now = now_secs();
+    let mut map = LOGIN_FAILURES.lock().unwrap();
+    map.retain(|_, (_, last)| now.saturating_sub(*last) < LOGIN_FAILURE_WINDOW_SECS);
+    let entry = map.entry(key).or_insert((0, now));
+    if now.saturating_sub(entry.1) >= LOGIN_FAILURE_WINDOW_SECS {
+        *entry = (0, now);
+    }
+    entry.0 = entry.0.saturating_add(1);
+    entry.1 = now;
+    entry.0
+}
+
+/// Clear the failure counter for `username` after a successful login.
+pub fn clear_login_failures(username: &str) {
+    LOGIN_FAILURES
+        .lock()
+        .unwrap()
+        .remove(&normalize_lookup_username(username));
+}
+
+/// Delay to apply before returning a failed login, given the consecutive
+/// failure count: `250ms * 2^(n-1)`, capped at 30s.
+pub fn login_backoff_ms(failures: u32) -> u64 {
+    if failures == 0 {
+        return 0;
+    }
+    let exp = (failures - 1).min(12); // cap so the shift never overflows
+    LOGIN_BACKOFF_BASE_MS
+        .saturating_mul(1u64 << exp)
+        .min(LOGIN_BACKOFF_MAX_MS)
+}
+
+// --------------------------------------------------------------------------
 // Pure helpers (LDAP filter / principal / username canonicalisation)
 // --------------------------------------------------------------------------
 
@@ -813,6 +867,17 @@ mod tests {
             "2".to_owned(),
         ]);
         assert_eq!(out, vec!["1".to_owned(), "2".to_owned()]);
+    }
+
+    #[test]
+    fn login_backoff_grows_and_caps() {
+        assert_eq!(login_backoff_ms(0), 0);
+        assert_eq!(login_backoff_ms(1), 250);
+        assert_eq!(login_backoff_ms(2), 500);
+        assert_eq!(login_backoff_ms(3), 1000);
+        // Escalates but never exceeds the 30s cap, and never overflows.
+        assert_eq!(login_backoff_ms(100), 30_000);
+        assert!(login_backoff_ms(7) <= 30_000);
     }
 
     #[test]
