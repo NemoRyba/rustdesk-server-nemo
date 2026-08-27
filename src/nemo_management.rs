@@ -88,6 +88,7 @@ const CLIENT_MANAGEMENT_POLICY_KEYS: &[&str] = &[
     "allow-remote-config-modification",
     "allow-numeric-one-time-password",
     "nemo-permanent-password",
+    "nemo-alias",
     OPTION_NEMO_OUTBOUND_ENABLED,
     OPTION_NEMO_OUTBOUND_TARGETS,
     "enable-lan-discovery",
@@ -199,6 +200,17 @@ const CLIENT_MANAGEMENT_POLICY_KEYS: &[&str] = &[
 ];
 
 static COMPANY_ONLY: AtomicBool = AtomicBool::new(false);
+// Transport posture captured when the API starts, so the runtime LDAP-enable
+// guard (put_ldap_config) can refuse to turn LDAP on when credentials would then
+// traverse the network in cleartext.
+static API_TLS_ACTIVE: AtomicBool = AtomicBool::new(false);
+static API_BIND_LOOPBACK: AtomicBool = AtomicBool::new(true);
+static API_ALLOW_INSECURE: AtomicBool = AtomicBool::new(false);
+// Global client policy merged into every peer's managed policy (per-peer options
+// win). Lets the operator push settings — api-server, TLS fallback, etc. — to
+// all Nemo clients at once, including peers that register later.
+static GLOBAL_POLICY: Lazy<std::sync::RwLock<ManagementPolicy>> =
+    Lazy::new(|| std::sync::RwLock::new(load_global_policy()));
 static STATS: Lazy<RwLock<NemoStatsStore>> = Lazy::new(|| RwLock::new(NemoStatsStore::default()));
 
 #[derive(Clone)]
@@ -214,6 +226,30 @@ struct NemoStatsStore {
     totals: NemoTotals,
     peers: HashMap<String, NemoPeerStats>,
     events: VecDeque<NemoEvent>,
+    // Recent connection negotiations the server observed, deduped by
+    // (source_id, target_id). The server sees connection SETUP (punch/relay), so
+    // this is "who connected to whom, over what path, how recently" — the live
+    // admin view. Direct sessions have no server-side teardown signal, so entries
+    // age out by CONNECTION_TTL rather than on true session end.
+    connections: Vec<ConnectionRecord>,
+}
+
+// How long a connection stays in the live view after its last negotiation.
+const CONNECTION_TTL_SECS: u64 = 900;
+const MAX_CONNECTIONS: usize = 2000;
+
+#[derive(Clone)]
+struct ConnectionRecord {
+    source_id: String,
+    target_id: String,
+    source_addr: String,
+    target_addr: String,
+    path: String, // "direct-local" | "direct-punch" | "relay"
+    relay_server: String,
+    nat_type: String,
+    first_seen: std::time::Instant,
+    last_seen: std::time::Instant,
+    negotiations: u64,
 }
 
 #[derive(Clone, Default, Serialize)]
@@ -401,8 +437,31 @@ struct EventsResponse {
 type ApiFailure = (StatusCode, Json<ApiError>);
 type ApiResult<T> = Result<Json<T>, ApiFailure>;
 
+fn company_only_path() -> String {
+    get_arg_or("nemo-company-only-file", "nemo_company_only".to_owned())
+}
+
+fn load_persisted_company_only() -> Option<bool> {
+    std::fs::read_to_string(company_only_path())
+        .ok()
+        .map(|s| is_truthy(s.trim()))
+}
+
+// Nemo hardening (S6): persist the company-only flag so a dashboard toggle
+// survives a server restart (previously it reverted to the CLI default).
+fn persist_company_only(value: bool) {
+    let path = company_only_path();
+    if let Err(e) = std::fs::write(&path, if value { "Y" } else { "N" }) {
+        log::error!("failed to persist company-only flag to {}: {}", path, e);
+    }
+}
+
 pub(crate) fn init_from_args() {
+    // CLI default first, then a persisted dashboard toggle wins if present.
     COMPANY_ONLY.store(is_truthy(&get_arg("nemo-company-only")), Ordering::SeqCst);
+    if let Some(persisted) = load_persisted_company_only() {
+        COMPANY_ONLY.store(persisted, Ordering::SeqCst);
+    }
     log::info!(
         "Nemo company-only policy: {}",
         if company_only() { "enabled" } else { "disabled" }
@@ -457,7 +516,85 @@ pub(crate) async fn spawn_hbbs_api(
         .route("/nemo/api/policy", get(get_policy).put(update_policy))
         .route("/nemo/api/stats", get(get_stats))
         .route("/nemo/api/events", get(get_events))
+        // Nemo integration: LDAP config + per-user RBAC (admin dashboard).
+        .route(
+            "/nemo/api/integration/ldap",
+            get(get_ldap_config).put(put_ldap_config),
+        )
+        .route("/nemo/api/integration/ldap/test", post(test_ldap_login))
+        .route(
+            "/nemo/api/integration/permissions",
+            get(get_permissions).put(put_permissions),
+        )
+        .route(
+            "/nemo/api/global-policy",
+            get(get_global_policy).put(put_global_policy),
+        )
+        .route("/nemo/api/connections", get(get_connections))
+        .route("/nemo/api/connections/cut", post(cut_connection))
+        // RustDesk-client-facing login + server-driven address book.
+        .route("/api/login", post(api_login))
+        .route("/api/logout", post(api_logout))
+        .route("/api/currentUser", post(api_current_user))
+        .route("/api/ab/get", post(api_ab_get))
         .layer(Extension(state));
+
+    // Nemo security: LDAP login credentials and managed secrets must never
+    // cross the network in cleartext. Decide the transport, and refuse to serve
+    // LDAP login over plaintext HTTP on a routable address.
+    let ldap_enabled = crate::nemo_integration::ldap_config().enabled;
+    let cert_path = get_arg("nemo-api-tls-cert");
+    let key_path = get_arg("nemo-api-tls-key");
+    let tls_mode = get_arg("nemo-api-tls"); // "auto" | "off" | "" (auto-decide)
+    let explicit_cert = !cert_path.is_empty() && !key_path.is_empty();
+    let use_tls = if tls_mode == "off" {
+        false
+    } else if explicit_cert || tls_mode == "auto" {
+        true
+    } else {
+        // Default: turn TLS on automatically whenever LDAP login is enabled.
+        ldap_enabled
+    };
+    let allow_insecure = is_truthy(&get_arg("nemo-api-allow-insecure"));
+    API_TLS_ACTIVE.store(use_tls, Ordering::SeqCst);
+    API_BIND_LOOPBACK.store(addr.ip().is_loopback(), Ordering::SeqCst);
+    API_ALLOW_INSECURE.store(allow_insecure, Ordering::SeqCst);
+    if ldap_enabled && !use_tls && !addr.ip().is_loopback() && !allow_insecure {
+        bail!(
+            "Refusing to serve LDAP login over plaintext HTTP on {}. Enable TLS \
+             (--nemo-api-tls auto, or --nemo-api-tls-cert/--nemo-api-tls-key), bind to \
+             loopback for an SSH tunnel, or set --nemo-api-allow-insecure Y to override.",
+            addr
+        );
+    }
+    if ldap_enabled && !use_tls {
+        log::warn!(
+            "Nemo LDAP login is enabled but the API is not using TLS ({}); credentials \
+             are sent in cleartext unless a tunnel protects this bind.",
+            addr
+        );
+    }
+
+    if use_tls {
+        #[cfg(feature = "nemo-tls")]
+        {
+            let config = resolve_rustls(&cert_path, &key_path).await?;
+            log::info!("Nemo management API listening on https://{}", addr);
+            tokio::spawn(async move {
+                if let Err(err) = axum_server::bind_rustls(addr, config)
+                    .serve(app.into_make_service())
+                    .await
+                {
+                    log::error!("Nemo management API (TLS) failed: {}", err);
+                }
+            });
+            return Ok(());
+        }
+        #[cfg(not(feature = "nemo-tls"))]
+        {
+            bail!("TLS was requested for the Nemo API but this build lacks the nemo-tls feature");
+        }
+    }
 
     log::info!("Nemo management API listening on http://{}", addr);
     tokio::spawn(async move {
@@ -471,8 +608,581 @@ pub(crate) async fn spawn_hbbs_api(
     Ok(())
 }
 
+/// Resolve a rustls TLS config for the Nemo API: use the admin-provided PEM
+/// files when both are set, otherwise generate (and persist) a self-signed
+/// certificate. The RustDesk client accepts the self-signed certificate on
+/// first use (it falls back to accepting invalid certs and caches the choice).
+#[cfg(feature = "nemo-tls")]
+async fn resolve_rustls(
+    cert_path: &str,
+    key_path: &str,
+) -> ResultType<axum_server::tls_rustls::RustlsConfig> {
+    use axum_server::tls_rustls::RustlsConfig;
+    if !cert_path.is_empty() && !key_path.is_empty() {
+        return Ok(RustlsConfig::from_pem_file(cert_path, key_path).await?);
+    }
+    let cert_file = get_arg_or("nemo-api-cert-file", "nemo-api-cert.pem".to_owned());
+    let key_file = get_arg_or("nemo-api-key-file", "nemo-api-key.pem".to_owned());
+    if !(std::path::Path::new(&cert_file).exists() && std::path::Path::new(&key_file).exists()) {
+        let mut sans = vec!["localhost".to_owned()];
+        let host = whoami::hostname();
+        if !host.is_empty() && !sans.contains(&host) {
+            sans.push(host);
+        }
+        let cert = rcgen::generate_simple_self_signed(sans)?;
+        std::fs::write(&cert_file, cert.serialize_pem()?)?;
+        std::fs::write(&key_file, cert.serialize_private_key_pem())?;
+        log::info!(
+            "Nemo API generated a self-signed TLS certificate at {} (supply \
+             --nemo-api-tls-cert/--nemo-api-tls-key for a CA-signed certificate).",
+            cert_file
+        );
+    }
+    // The private key is the sole secret protecting the login TLS channel;
+    // restrict it to the server user (0600) so other local accounts cannot read
+    // it and impersonate/MITM the API. Applied on every start (not only when the
+    // key is first generated) so a previously world-readable key gets fixed.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(e) =
+            std::fs::set_permissions(&key_file, std::fs::Permissions::from_mode(0o600))
+        {
+            log::warn!("could not restrict permissions on {}: {}", key_file, e);
+        }
+    }
+    Ok(RustlsConfig::from_pem_file(&cert_file, &key_file).await?)
+}
+
 async fn admin_gui() -> Html<&'static str> {
     Html(include_str!("nemo_admin.html"))
+}
+
+// --------------------------------------------------------------------------
+// Nemo integration: LDAP login, server-driven address book, and per-user RBAC.
+// The `/api/login`, `/api/ab/get`, `/api/logout` routes deliberately live at the
+// root so the RustDesk Sciter client's `api-server` (pointed at this nemo-api)
+// finds them; the `/nemo/api/integration/*` routes are the admin dashboard's.
+// --------------------------------------------------------------------------
+
+use crate::nemo_integration as integration;
+
+fn bearer_token(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+}
+
+fn peer_alias(peer: &RegisteredPeer) -> String {
+    management_policy_from_peer(&peer.management_policy)
+        .options
+        .get("nemo-alias")
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn now_epoch_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default()
+}
+
+// ---- Login / address book (RustDesk-client-compatible) ----
+
+#[derive(Deserialize)]
+struct LoginRequest {
+    #[serde(default)]
+    username: String,
+    #[serde(default)]
+    password: String,
+}
+
+#[derive(Serialize)]
+struct LoginUser {
+    name: String,
+    display_name: String,
+    email: String,
+    note: String,
+    status: i32,
+    is_admin: bool,
+}
+
+#[derive(Serialize)]
+struct LoginResult {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    access_token: Option<String>,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user: Option<LoginUser>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+impl LoginResult {
+    fn err(message: impl Into<String>) -> Self {
+        Self {
+            access_token: None,
+            kind: None,
+            user: None,
+            error: Some(message.into()),
+        }
+    }
+}
+
+async fn api_login(
+    Extension(_state): Extension<HbbsApiState>,
+    Json(req): Json<LoginRequest>,
+) -> Json<LoginResult> {
+    let username = req.username.trim().to_owned();
+    let password = req.password;
+    if username.is_empty() || password.is_empty() {
+        return Json(LoginResult::err("Username and password required"));
+    }
+    let cfg = integration::ldap_config();
+    match integration::authenticate_ldap(&cfg, &username, &password).await {
+        Ok(user) => {
+            // ensure_user creates/updates the RBAC entry (seeded with defaults on
+            // first login) and returns the current admin flag for the response.
+            let (is_admin, _targets) =
+                integration::ensure_user(&user.username, &user.display_name, &user.email);
+            let token = integration::create_session(
+                user.username.clone(),
+                user.display_name.clone(),
+                user.email.clone(),
+            );
+            log::info!("Nemo login succeeded for {}", user.username);
+            Json(LoginResult {
+                access_token: Some(token),
+                kind: Some("access_token".to_owned()),
+                user: Some(LoginUser {
+                    name: user.username,
+                    display_name: user.display_name,
+                    email: user.email,
+                    note: String::new(),
+                    status: 1,
+                    is_admin,
+                }),
+                error: None,
+            })
+        }
+        Err(reason) => {
+            log::warn!("Nemo login failed for {}: {}", username, reason);
+            // Small fixed delay to blunt online brute force / credential stuffing
+            // (a real LDAP bind runs per attempt). Not a substitute for a fronting
+            // rate-limiter, but raises the cost of high-volume guessing.
+            tokio::time::sleep(std::time::Duration::from_millis(750)).await;
+            Json(LoginResult::err(reason))
+        }
+    }
+}
+
+async fn api_logout(headers: HeaderMap) -> Json<serde_json::Value> {
+    if let Some(token) = bearer_token(&headers) {
+        integration::remove_session(&token);
+    }
+    Json(serde_json::json!({}))
+}
+
+// Session restore on client restart: the Sciter client calls this with its
+// stored token; on success it re-populates the account + address book without a
+// re-login. `verifier` is checked by the client's `verify_login`, which is a
+// no-op for custom clients (always true).
+async fn api_current_user(headers: HeaderMap) -> Json<serde_json::Value> {
+    let Some(token) = bearer_token(&headers) else {
+        return Json(serde_json::json!({ "error": "Invalid token" }));
+    };
+    let Some(session) = integration::session_for_token(&token) else {
+        return Json(serde_json::json!({ "error": "Invalid token" }));
+    };
+    let (is_admin, _targets) = integration::effective_permission(&session.username);
+    Json(serde_json::json!({
+        "name": session.username,
+        "display_name": session.display_name,
+        "email": session.email,
+        "note": "",
+        "status": 1,
+        "is_admin": is_admin,
+        "verifier": "",
+    }))
+}
+
+#[derive(Serialize)]
+struct AbPeer {
+    id: String,
+    username: String,
+    hostname: String,
+    platform: String,
+    alias: String,
+    tags: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct AbData {
+    tags: Vec<String>,
+    peers: Vec<AbPeer>,
+}
+
+#[derive(Serialize)]
+struct AbResult {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    updated_at: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    data: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+async fn api_ab_get(
+    Extension(state): Extension<HbbsApiState>,
+    headers: HeaderMap,
+) -> Json<AbResult> {
+    let Some(token) = bearer_token(&headers) else {
+        return Json(AbResult {
+            updated_at: None,
+            data: None,
+            error: Some("Invalid token".to_owned()),
+        });
+    };
+    let Some(session) = integration::session_for_token(&token) else {
+        return Json(AbResult {
+            updated_at: None,
+            data: None,
+            error: Some("Invalid token".to_owned()),
+        });
+    };
+
+    let peers = match state.pm.list_registered(1000, 0).await {
+        Ok(peers) => peers,
+        Err(err) => {
+            return Json(AbResult {
+                updated_at: None,
+                data: None,
+                error: Some(err.to_string()),
+            });
+        }
+    };
+    // Re-resolve permissions from live config (not the login-time snapshot) so
+    // access changes and user removal take effect immediately.
+    let (is_admin, allowed_targets) = integration::effective_permission(&session.username);
+    let mut ab_peers = Vec::new();
+    for peer in peers {
+        if !integration::user_allowed_target(is_admin, &allowed_targets, &peer.id) {
+            continue;
+        }
+        let alias = peer_alias(&peer);
+        ab_peers.push(AbPeer {
+            id: peer.id.clone(),
+            username: String::new(),
+            hostname: String::new(),
+            platform: String::new(),
+            alias,
+            tags: Vec::new(),
+        });
+    }
+    let data = serde_json::to_string(&AbData {
+        tags: Vec::new(),
+        peers: ab_peers,
+    })
+    .unwrap_or_else(|_| "{\"tags\":[],\"peers\":[]}".to_owned());
+    Json(AbResult {
+        updated_at: Some(now_epoch_secs()),
+        data: Some(data),
+        error: None,
+    })
+}
+
+// ---- Dashboard: LDAP config ----
+
+async fn get_ldap_config(
+    Extension(state): Extension<HbbsApiState>,
+    headers: HeaderMap,
+) -> ApiResult<integration::LdapConfigView> {
+    require_auth(&headers, &state.token)?;
+    Ok(Json(integration::ldap_config_view()))
+}
+
+async fn put_ldap_config(
+    Extension(state): Extension<HbbsApiState>,
+    headers: HeaderMap,
+    Json(update): Json<integration::LdapConfigUpdate>,
+) -> ApiResult<integration::LdapConfigView> {
+    require_auth(&headers, &state.token)?;
+    // Fail-closed: refuse to enable LDAP at runtime while the live listener would
+    // carry login credentials in cleartext (non-TLS, routable bind, no override).
+    // The transport is fixed at startup, so enabling here cannot flip it to TLS.
+    if update.enabled == Some(true)
+        && !API_TLS_ACTIVE.load(Ordering::SeqCst)
+        && !API_BIND_LOOPBACK.load(Ordering::SeqCst)
+        && !API_ALLOW_INSECURE.load(Ordering::SeqCst)
+    {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "Refusing to enable LDAP login while the API serves plaintext HTTP on a routable \
+             address. Restart hbbs with --nemo-api-tls auto (or a cert), bind to loopback for \
+             a tunnel, or set --nemo-api-allow-insecure Y.",
+        ));
+    }
+    Ok(Json(integration::update_ldap_config(update)))
+}
+
+#[derive(Deserialize)]
+struct LdapTestRequest {
+    #[serde(default)]
+    username: String,
+    #[serde(default)]
+    password: String,
+}
+
+#[derive(Serialize)]
+struct LdapTestResponse {
+    success: bool,
+    message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    username: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    display_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    email: Option<String>,
+}
+
+async fn test_ldap_login(
+    Extension(state): Extension<HbbsApiState>,
+    headers: HeaderMap,
+    Json(req): Json<LdapTestRequest>,
+) -> ApiResult<LdapTestResponse> {
+    require_auth(&headers, &state.token)?;
+    let cfg = integration::ldap_config();
+    match integration::authenticate_ldap(&cfg, req.username.trim(), &req.password).await {
+        Ok(user) => Ok(Json(LdapTestResponse {
+            success: true,
+            message: format!("Authenticated as {}", user.username),
+            username: Some(user.username),
+            display_name: Some(user.display_name),
+            email: Some(user.email),
+        })),
+        Err(reason) => Ok(Json(LdapTestResponse {
+            success: false,
+            message: reason,
+            username: None,
+            display_name: None,
+            email: None,
+        })),
+    }
+}
+
+// ---- Dashboard: per-user permissions (RBAC) ----
+
+#[derive(Serialize)]
+struct PeerBrief {
+    id: String,
+    alias: String,
+    online: bool,
+}
+
+#[derive(Serialize)]
+struct PermissionsResponse {
+    permissions: HashMap<String, integration::UserPermission>,
+    default_targets: Vec<String>,
+    peers: Vec<PeerBrief>,
+}
+
+async fn get_permissions(
+    Extension(state): Extension<HbbsApiState>,
+    headers: HeaderMap,
+) -> ApiResult<PermissionsResponse> {
+    require_auth(&headers, &state.token)?;
+    let peers = state
+        .pm
+        .list_registered(1000, 0)
+        .await
+        .map_err(server_error)?;
+    let mut briefs = Vec::with_capacity(peers.len());
+    for peer in peers {
+        let online = state
+            .pm
+            .runtime_snapshot(&peer.id)
+            .await
+            .map(|s| s.online)
+            .unwrap_or(false);
+        briefs.push(PeerBrief {
+            alias: peer_alias(&peer),
+            id: peer.id,
+            online,
+        });
+    }
+    Ok(Json(PermissionsResponse {
+        permissions: integration::permissions_snapshot(),
+        default_targets: integration::default_targets(),
+        peers: briefs,
+    }))
+}
+
+async fn put_permissions(
+    Extension(state): Extension<HbbsApiState>,
+    headers: HeaderMap,
+    Json(update): Json<integration::PermissionsUpdate>,
+) -> ApiResult<HashMap<String, integration::UserPermission>> {
+    require_auth(&headers, &state.token)?;
+    Ok(Json(integration::update_permissions(update)))
+}
+
+// ---- Global client policy (pushed to every client) ----
+
+fn global_policy_path() -> String {
+    get_arg_or("nemo-global-policy-file", "nemo_global_policy.json".to_owned())
+}
+
+fn load_global_policy() -> ManagementPolicy {
+    match std::fs::read_to_string(global_policy_path()) {
+        Ok(text) => serde_json::from_str::<ManagementPolicy>(&text)
+            .map(sanitize_management_policy)
+            .unwrap_or_default(),
+        Err(_) => ManagementPolicy::default(),
+    }
+}
+
+fn global_policy() -> ManagementPolicy {
+    GLOBAL_POLICY.read().unwrap().clone()
+}
+
+fn save_global_policy(policy: &ManagementPolicy) {
+    match serde_json::to_string_pretty(policy) {
+        Ok(text) => {
+            let path = global_policy_path();
+            if let Err(e) = std::fs::write(&path, text) {
+                log::error!("failed to persist global policy to {}: {}", path, e);
+            }
+        }
+        Err(e) => log::error!("failed to serialize global policy: {}", e),
+    }
+}
+
+async fn get_global_policy(
+    Extension(state): Extension<HbbsApiState>,
+    headers: HeaderMap,
+) -> ApiResult<ManagementPolicy> {
+    require_auth(&headers, &state.token)?;
+    Ok(Json(global_policy()))
+}
+
+async fn put_global_policy(
+    Extension(state): Extension<HbbsApiState>,
+    headers: HeaderMap,
+    Json(request): Json<ManagementPolicyRequest>,
+) -> ApiResult<ManagementPolicy> {
+    require_auth(&headers, &state.token)?;
+    let policy = sanitize_management_policy(ManagementPolicy {
+        allow_user_override: request.allow_user_override,
+        options: request.options,
+    });
+    *GLOBAL_POLICY.write().unwrap() = policy.clone();
+    save_global_policy(&policy);
+    Ok(Json(policy))
+}
+
+// ---- Live connections (see + cut) ----
+
+#[derive(Serialize)]
+struct ConnectionResponse {
+    source_id: String,
+    target_id: String,
+    source_addr: String,
+    target_addr: String,
+    path: String,
+    relay_server: String,
+    nat_type: String,
+    age_ms: u64,
+    duration_ms: u64,
+    negotiations: u64,
+}
+
+#[derive(Serialize, Default)]
+struct ConnectionTotals {
+    active: usize,
+    direct: usize,
+    relay: usize,
+}
+
+#[derive(Serialize)]
+struct ConnectionsResponse {
+    connections: Vec<ConnectionResponse>,
+    totals: ConnectionTotals,
+}
+
+async fn get_connections(
+    Extension(state): Extension<HbbsApiState>,
+    headers: HeaderMap,
+) -> ApiResult<ConnectionsResponse> {
+    require_auth(&headers, &state.token)?;
+    let store = STATS.read().await;
+    let now = std::time::Instant::now();
+    let mut connections: Vec<ConnectionResponse> = store
+        .connections
+        .iter()
+        .filter(|c| now.duration_since(c.last_seen).as_secs() < CONNECTION_TTL_SECS)
+        .map(|c| ConnectionResponse {
+            source_id: c.source_id.clone(),
+            target_id: c.target_id.clone(),
+            source_addr: c.source_addr.clone(),
+            target_addr: c.target_addr.clone(),
+            path: c.path.clone(),
+            relay_server: c.relay_server.clone(),
+            nat_type: c.nat_type.clone(),
+            age_ms: now.duration_since(c.last_seen).as_millis() as u64,
+            duration_ms: c.last_seen.duration_since(c.first_seen).as_millis() as u64,
+            negotiations: c.negotiations,
+        })
+        .collect();
+    connections.sort_by_key(|c| c.age_ms); // most recent first
+    let direct = connections
+        .iter()
+        .filter(|c| c.path.starts_with("direct"))
+        .count();
+    let relay = connections.iter().filter(|c| c.path == "relay").count();
+    let totals = ConnectionTotals {
+        active: connections.len(),
+        direct,
+        relay,
+    };
+    Ok(Json(ConnectionsResponse {
+        connections,
+        totals,
+    }))
+}
+
+#[derive(Deserialize)]
+struct CutConnectionRequest {
+    target_id: String,
+    #[serde(default)]
+    source_id: Option<String>,
+}
+
+async fn cut_connection(
+    Extension(state): Extension<HbbsApiState>,
+    headers: HeaderMap,
+    Json(req): Json<CutConnectionRequest>,
+) -> ApiResult<PeerPolicyResponse> {
+    require_auth(&headers, &state.token)?;
+    // The reliable server-side lever is to block the target so it stops
+    // negotiating/accepting NEW connections. Active *direct* sessions have no
+    // server-side data path to interrupt (that is the point of a direct
+    // connection); they end when the session closes or the peer re-checks policy.
+    let resp = set_peer_policy(&state.pm, &req.target_id, Some(0)).await?;
+    {
+        let mut store = STATS.write().await;
+        store.connections.retain(|c| c.target_id != req.target_id);
+        let detail = match &req.source_id {
+            Some(s) => format!("blocked target {} (source {}) from dashboard", req.target_id, s),
+            None => format!("blocked target {} from dashboard", req.target_id),
+        };
+        record_event_locked(&mut store, "connection-cut", Some(&req.target_id), None, detail);
+    }
+    Ok(resp)
 }
 
 pub(crate) fn company_only() -> bool {
@@ -617,6 +1327,7 @@ pub(crate) async fn record_register_pk(id: &str, addr: SocketAddr, accepted: boo
 
 pub(crate) async fn record_connection_negotiation(
     id: &str,
+    source_field: &str,
     from_addr: SocketAddr,
     to_addr: SocketAddr,
     nat_type: i32,
@@ -664,6 +1375,83 @@ pub(crate) async fn record_connection_negotiation(
             relay_server
         ),
     );
+    // Live connections view (see-connections). Path priority reflects the fork's
+    // goal: direct is best, relay is the fallback.
+    let path = if forced_relay {
+        "relay"
+    } else if same_intranet {
+        "direct-local"
+    } else {
+        "direct-punch"
+    };
+    let source_id = controller_source_identity(source_field)
+        .map(|(sid, _)| sid)
+        .unwrap_or_default();
+    upsert_connection(
+        &mut store,
+        &source_id,
+        id,
+        from_addr,
+        to_addr,
+        path,
+        relay_server,
+        nat_type_name(nat_type),
+    );
+}
+
+fn upsert_connection(
+    store: &mut NemoStatsStore,
+    source_id: &str,
+    target_id: &str,
+    from_addr: SocketAddr,
+    to_addr: SocketAddr,
+    path: &str,
+    relay_server: &str,
+    nat_type: &str,
+) {
+    let now = std::time::Instant::now();
+    // Drop stale entries and cap the vector so unauthenticated punch traffic
+    // cannot grow it without bound (mirrors the S7 stats/PUNCH_REQS caps).
+    store
+        .connections
+        .retain(|c| now.duration_since(c.last_seen).as_secs() < CONNECTION_TTL_SECS);
+    if let Some(existing) = store
+        .connections
+        .iter_mut()
+        .find(|c| c.source_id == source_id && c.target_id == target_id)
+    {
+        existing.last_seen = now;
+        existing.negotiations += 1;
+        existing.path = path.to_owned();
+        existing.source_addr = from_addr.to_string();
+        existing.target_addr = to_addr.to_string();
+        existing.relay_server = relay_server.to_owned();
+        existing.nat_type = nat_type.to_owned();
+    } else {
+        store.connections.push(ConnectionRecord {
+            source_id: source_id.to_owned(),
+            target_id: target_id.to_owned(),
+            source_addr: from_addr.to_string(),
+            target_addr: to_addr.to_string(),
+            path: path.to_owned(),
+            relay_server: relay_server.to_owned(),
+            nat_type: nat_type.to_owned(),
+            first_seen: now,
+            last_seen: now,
+            negotiations: 1,
+        });
+        if store.connections.len() > MAX_CONNECTIONS {
+            // Remove the oldest by last_seen.
+            if let Some((idx, _)) = store
+                .connections
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, c)| c.last_seen)
+            {
+                store.connections.remove(idx);
+            }
+        }
+    }
 }
 
 pub(crate) async fn record_relay_request(id: &str, addr: SocketAddr, forwarded: bool) {
@@ -832,6 +1620,10 @@ async fn update_peer_management_policy(
         allow_user_override: request.allow_user_override,
         options: request.options,
     });
+    // S4: the dashboard sends back masked secrets; restore the stored plaintext
+    // for any secret left as the mask so it is not clobbered.
+    let existing = state.pm.get_registered(&id).await.map_err(server_error)?;
+    let policy = restore_masked_secrets(policy, &existing.and_then(|p| p.management_policy));
     let serialized = serialize_management_policy(&policy)?;
     let updated = state
         .pm
@@ -866,7 +1658,11 @@ async fn client_policy(
     if let Some(version) = request.policy_version.as_deref() {
         log::trace!("Client {} requested management policy after {}", request.id, version);
     }
-    let mut policy = management_policy_from_peer(&peer.management_policy);
+    // Global defaults first, then the peer's own policy overrides per key.
+    let mut policy = global_policy();
+    let peer_policy = management_policy_from_peer(&peer.management_policy);
+    policy.allow_user_override = policy.allow_user_override || peer_policy.allow_user_override;
+    policy.options.extend(peer_policy.options);
     if matches!(peer.status, Some(0)) {
         policy.allow_user_override = false;
         policy
@@ -952,6 +1748,7 @@ async fn update_policy(
     require_auth(&headers, &state.token)?;
     if let Some(company_only) = request.company_only {
         COMPANY_ONLY.store(company_only, Ordering::SeqCst);
+        persist_company_only(company_only);
         let mut store = STATS.write().await;
         record_event_locked(
             &mut store,
@@ -1077,7 +1874,7 @@ async fn peer_response(pm: &PeerMap, peer: RegisteredPeer) -> PeerResponse {
         status,
         policy: policy_label(status),
         allowed_for_control: allowed_for_status(status),
-        management_policy: management_policy_from_peer(&peer.management_policy),
+        management_policy: mask_secret_policy(management_policy_from_peer(&peer.management_policy)),
         registered_ip,
         public_addr: runtime
             .as_ref()
@@ -1103,6 +1900,54 @@ fn policy_response() -> PolicyResponse {
         blocked_status: 0,
         allowed_status: 1,
     }
+}
+
+// Nemo hardening (S4): policy keys whose values are secrets and must never be
+// echoed in API responses (they were previously returned in plaintext).
+const SECRET_POLICY_KEYS: &[&str] = &[
+    "nemo-permanent-password",
+    "default-connect-password",
+    "proxy-password",
+    "preset-address-book-password",
+];
+const MANAGED_SECRET_MASK: &str = "<managed-secret>";
+
+fn mask_secret_policy(mut policy: ManagementPolicy) -> ManagementPolicy {
+    for key in SECRET_POLICY_KEYS {
+        if let Some(v) = policy.options.get_mut(*key) {
+            if !v.is_empty() {
+                *v = MANAGED_SECRET_MASK.to_owned();
+            }
+        }
+    }
+    policy
+}
+
+// A dashboard round-trip sees the masks, not the plaintext; restore the stored
+// value for any secret left as the mask so saving does not clobber it.
+fn restore_masked_secrets(
+    mut policy: ManagementPolicy,
+    existing: &Option<String>,
+) -> ManagementPolicy {
+    let current = management_policy_from_peer(existing);
+    for key in SECRET_POLICY_KEYS {
+        let is_mask = policy
+            .options
+            .get(*key)
+            .map(|v| v == MANAGED_SECRET_MASK)
+            .unwrap_or(false);
+        if is_mask {
+            match current.options.get(*key) {
+                Some(v) => {
+                    policy.options.insert((*key).to_owned(), v.clone());
+                }
+                None => {
+                    policy.options.remove(*key);
+                }
+            }
+        }
+    }
+    policy
 }
 
 fn management_policy_from_peer(value: &Option<String>) -> ManagementPolicy {
@@ -1175,18 +2020,27 @@ fn require_auth(headers: &HeaderMap, token: &Option<String>) -> Result<(), ApiFa
     let auth = headers
         .get(AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
-        .map(|value| value == bearer)
+        .map(|value| constant_time_eq(value, &bearer))
         .unwrap_or(false);
     let nemo_token = headers
         .get("x-nemo-token")
         .and_then(|value| value.to_str().ok())
-        .map(|value| value == token)
+        .map(|value| constant_time_eq(value, token))
         .unwrap_or(false);
     if auth || nemo_token {
         Ok(())
     } else {
         Err(api_error(StatusCode::UNAUTHORIZED, "unauthorized"))
     }
+}
+
+// Nemo hardening (S3): constant-time token comparison so an attacker cannot
+// recover the token byte-by-byte via response timing. Length is compared first
+// (token length is not sensitive); the content comparison is constant-time.
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    let a = a.as_bytes();
+    let b = b.as_bytes();
+    a.len() == b.len() && sodiumoxide::utils::memcmp(a, b)
 }
 
 fn api_error(status: StatusCode, message: &str) -> ApiFailure {
@@ -1202,7 +2056,30 @@ fn server_error(err: impl std::fmt::Display) -> ApiFailure {
     api_error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string())
 }
 
+// Nemo hardening (S7): bound the per-peer stats map. record_peer_seen runs for
+// every RegisterPeer *before* validation, so unauthenticated UDP with random
+// ids could otherwise grow this map without limit. At the cap, evict the
+// least-recently-active entries down to 3/4 of the cap.
+const MAX_PEER_STATS: usize = 5000;
+
+fn prune_peer_stats(store: &mut NemoStatsStore) {
+    let mut aged: Vec<(String, String)> = store
+        .peers
+        .iter()
+        .map(|(k, v)| (k.clone(), v.last_event_at.clone().unwrap_or_default()))
+        .collect();
+    aged.sort_by(|a, b| a.1.cmp(&b.1));
+    let target = MAX_PEER_STATS * 3 / 4;
+    let remove = store.peers.len().saturating_sub(target);
+    for (id, _) in aged.into_iter().take(remove) {
+        store.peers.remove(&id);
+    }
+}
+
 fn peer_stats_mut<'a>(store: &'a mut NemoStatsStore, id: &str) -> &'a mut NemoPeerStats {
+    if store.peers.len() >= MAX_PEER_STATS && !store.peers.contains_key(id) {
+        prune_peer_stats(store);
+    }
     store.peers.entry(id.to_owned()).or_default()
 }
 
@@ -1512,6 +2389,27 @@ mod tests {
             validate_client_policy_request(&peer, &mismatch).unwrap_err().0,
             StatusCode::UNAUTHORIZED
         );
+    }
+
+    #[test]
+    fn upsert_connection_dedupes_pair_and_classifies_path() {
+        let mut store = NemoStatsStore::default();
+        let a: SocketAddr = "192.168.0.102:4646".parse().unwrap();
+        let b: SocketAddr = "192.168.0.176:43739".parse().unwrap();
+        // First negotiation for the pair.
+        upsert_connection(&mut store, "src1", "tgt1", a, b, "direct-local", "", "ASYMMETRIC");
+        assert_eq!(store.connections.len(), 1);
+        assert_eq!(store.connections[0].negotiations, 1);
+        assert_eq!(store.connections[0].path, "direct-local");
+        // Same pair re-negotiates -> merged, count bumped, path updated.
+        upsert_connection(&mut store, "src1", "tgt1", a, b, "relay", "192.168.0.176:21117", "SYMMETRIC");
+        assert_eq!(store.connections.len(), 1);
+        assert_eq!(store.connections[0].negotiations, 2);
+        assert_eq!(store.connections[0].path, "relay");
+        assert_eq!(store.connections[0].relay_server, "192.168.0.176:21117");
+        // A different pair is a separate row.
+        upsert_connection(&mut store, "src2", "tgt1", a, b, "direct-punch", "", "PORT_RESTRICTED");
+        assert_eq!(store.connections.len(), 2);
     }
 
     // Grouped serial test for the functions that read the process-global

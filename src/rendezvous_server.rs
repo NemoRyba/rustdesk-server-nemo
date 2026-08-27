@@ -893,6 +893,13 @@ impl RendezvousServer {
                     }
                 }
                 if !dup { lock.push(PunchReqEntry { tm: Instant::now(), from_ip, to_ip, to_id: to_id_clone }); }
+                // Nemo hardening (S7): bound the punch-request audit ring so
+                // unauthenticated punch traffic cannot grow it without limit.
+                const MAX_PUNCH_REQS: usize = 10000;
+                if lock.len() > MAX_PUNCH_REQS {
+                    let excess = lock.len() - MAX_PUNCH_REQS;
+                    lock.drain(0..excess);
+                }
             }
 
             let mut msg_out = RendezvousMessage::new();
@@ -924,6 +931,7 @@ impl RendezvousServer {
             #[cfg(feature = "nemo-management-api")]
             crate::nemo_management::record_connection_negotiation(
                 &id,
+                &ph.version,
                 addr,
                 peer_addr,
                 nemo_nat_type,

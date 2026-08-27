@@ -26,6 +26,15 @@ fn main() -> ResultType<()> {
         , --nemo-api=[BOOL(default=N)] 'Enable Nemo management API'
         , --nemo-api-bind=[ADDR(default=127.0.0.1:21120)] 'Sets Nemo management API bind address'
         , --nemo-api-token=[TOKEN] 'Requires Bearer or X-Nemo-Token auth for Nemo management API'
+        , --nemo-api-tls=[MODE] 'Nemo API TLS: auto (self-signed) | off; default on when LDAP login is enabled'
+        , --nemo-api-tls-cert=[FILE] 'PEM certificate for the Nemo API (with --nemo-api-tls-key)'
+        , --nemo-api-tls-key=[FILE] 'PEM private key for the Nemo API (with --nemo-api-tls-cert)'
+        , --nemo-api-cert-file=[FILE] 'Where to persist the auto-generated self-signed certificate'
+        , --nemo-api-key-file=[FILE] 'Where to persist the auto-generated self-signed private key'
+        , --nemo-api-allow-insecure=[BOOL(default=N)] 'Allow LDAP login over plaintext HTTP on a routable bind (NOT recommended)'
+        , --nemo-integration-file=[FILE] 'Path to the Nemo integration config (LDAP + RBAC) JSON file'
+        , --nemo-global-policy-file=[FILE] 'Path to the Nemo global client-policy JSON file'
+        , --nemo-company-only-file=[FILE] 'Path to persist the company-only flag across restarts'
         , --nemo-company-only=[BOOL(default=N)] 'Only allow explicitly allowed peers as remote targets'",
     );
     init_args(&args, "hbbs", "RustDesk ID/Rendezvous Server");
