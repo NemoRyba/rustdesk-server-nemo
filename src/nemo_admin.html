@@ -580,6 +580,21 @@
     .view input[type="text"],
     .view input[type="password"] { padding: 6px 8px; border: 1px solid #d0d0d0; border-radius: 4px; font: inherit; }
     .integration-form code, code { background: #f0f0f0; padding: 1px 4px; border-radius: 3px; font-size: 12px; }
+    /* User-adjustable multi-column form layout (Settings + Integration). The
+       column count comes from --cols (set per-view by the "Columns" switcher and
+       persisted in localStorage). Wide/emphasis rows opt out with .span-all so
+       checkboxes, the certificate block and Save rows keep the full width. */
+    .col-grid { display: grid; grid-template-columns: repeat(var(--cols, 2), minmax(0, 1fr)); gap: 14px 24px; align-items: start; }
+    .col-grid > .span-all { grid-column: 1 / -1; }
+    .col-grid .fld > input, .col-grid .fld > select { width: 100%; }
+    @media (max-width: 760px) { .col-grid { grid-template-columns: 1fr; } }
+    /* Segmented "Columns: 1 2 3" switcher shown in a panel head. */
+    .col-switch { display: inline-flex; align-items: center; gap: 8px; font-size: 12px; color: var(--muted); font-weight: 500; }
+    .col-switch .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; }
+    .col-switch .seg button { min-height: 28px; padding: 3px 12px; border: 0; border-left: 1px solid var(--line); border-radius: 0; background: #fff; color: var(--text); font-size: 12px; line-height: 1; }
+    .col-switch .seg button:first-child { border-left: 0; }
+    .col-switch .seg button:hover { background: #eef3f4; }
+    .col-switch .seg button.active { background: var(--accent); color: #fff; }
     #permsBody td { padding: 6px 10px; vertical-align: top; }
     #permsBody select[multiple] { min-width: 240px; min-height: 68px; font: inherit; }
     #permsBody .perm-admin { text-align: center; }
@@ -616,6 +631,7 @@
       <button class="navbtn" data-view="connections">Connections</button>
       <button class="navbtn" data-view="settings">Settings</button>
       <button class="navbtn" data-view="integration">Integration</button>
+      <button class="navbtn" data-view="acl">ACL</button>
       <button class="navbtn" data-view="log">Log</button>
     </nav>
 
@@ -710,6 +726,13 @@
       <section class="panel">
         <div class="panel-head">
           <h2 class="panel-title">Settings</h2>
+          <div class="col-switch" title="How many columns to lay the settings forms out in.">Columns
+            <span class="seg">
+              <button type="button" data-cols="1">1</button>
+              <button type="button" data-cols="2">2</button>
+              <button type="button" data-cols="3">3</button>
+            </span>
+          </div>
         </div>
         <div class="settings-list" style="padding:10px 16px;">
           <label style="display:flex;gap:10px;align-items:flex-start;cursor:pointer;">
@@ -725,20 +748,20 @@
         <div class="panel-head">
           <h2 class="panel-title">Global client defaults</h2>
         </div>
-        <div style="padding:12px 16px;display:flex;flex-direction:column;gap:12px;max-width:640px;">
-          <div style="font-size:12px;opacity:0.7;line-height:1.4;">Pushed to every TBFDesk client (including ones that register later) via signed managed policy. A per-peer policy overrides these.</div>
+        <div class="col-grid" style="padding:14px 16px;">
+          <div class="span-all" style="font-size:12px;opacity:0.7;line-height:1.4;">Pushed to every TBFDesk client (including ones that register later) via signed managed policy. A per-peer policy overrides these.</div>
           <div class="fld">
             <label for="gpApiServer" title="Clients use this for login and the address book. Point it at this server's HTTPS API.">API server (api-server)</label>
             <input id="gpApiServer" type="text" placeholder="https://192.168.0.176:21120">
           </div>
-          <label style="display:flex;gap:10px;align-items:flex-start;cursor:pointer;">
+          <label class="span-all" style="display:flex;gap:10px;align-items:flex-start;cursor:pointer;">
             <input id="gpInsecureTls" type="checkbox" style="margin-top:3px;">
             <span>
               <span style="font-weight:600;color:#d4380d;">Allow insecure TLS fallback (temporary)</span>
               <span style="display:block;font-size:12px;opacity:0.75;margin-top:3px;line-height:1.4;">Lets clients accept the server's self-signed certificate (trust-on-first-use). <b>Weakens client TLS</b> and is only a stopgap until a CA-signed certificate is installed — see the TODO. Leave off once you deploy a trusted cert.</span>
             </span>
           </label>
-          <div style="display:flex;gap:10px;align-items:center;">
+          <div class="span-all" style="display:flex;gap:10px;align-items:center;">
             <button id="gpSave" class="primary">Save global defaults</button>
             <span id="gpSaveMsg" style="font-size:12px;opacity:0.8;"></span>
           </div>
@@ -751,9 +774,16 @@
         <section class="panel">
           <div class="panel-head">
             <h2 class="panel-title">LDAP / Active Directory login</h2>
+            <div class="col-switch" title="How many columns to lay these settings out in.">Columns
+              <span class="seg">
+                <button type="button" data-cols="1">1</button>
+                <button type="button" data-cols="2">2</button>
+                <button type="button" data-cols="3">3</button>
+              </span>
+            </div>
           </div>
-          <div class="integration-form" style="padding:12px 16px;display:flex;flex-direction:column;gap:12px;max-width:640px;">
-            <label style="display:flex;gap:10px;align-items:flex-start;cursor:pointer;">
+          <div class="integration-form col-grid" style="padding:14px 16px;">
+            <label class="span-all" style="display:flex;gap:10px;align-items:flex-start;cursor:pointer;">
               <input id="ldapEnabled" type="checkbox" style="margin-top:3px;">
               <span>
                 <span style="font-weight:600;">Enable LDAP login</span>
@@ -784,14 +814,14 @@
               <label for="ldapFilter" title="LDAP filter for locating the user. Placeholders: {username} (raw input), {raw_username} (without domain), {upn} (raw@domain).">User search filter</label>
               <input id="ldapFilter" type="text">
             </div>
-            <label style="display:flex;gap:10px;align-items:flex-start;cursor:pointer;">
+            <label class="span-all" style="display:flex;gap:10px;align-items:flex-start;cursor:pointer;">
               <input id="ldapTlsVerify" type="checkbox" style="margin-top:3px;">
               <span>
                 <span style="font-weight:600;">Verify TLS certificate (recommended)</span>
                 <span style="display:block;font-size:12px;opacity:0.7;margin-top:3px;line-height:1.4;">On by default. With verification off, an attacker on the network can impersonate your domain controller and log in as any user without a password. Only turn this off for a known internal CA you cannot add to the server's trust store — and accept the MITM risk. The server URL must use <code>ldaps://</code>.</span>
               </span>
             </label>
-            <div class="fld">
+            <div class="fld span-all">
               <label title="Fetch the directory's TLS certificate and pin it, so you can keep verification ON and trust exactly that certificate — the secure way to accept a self-signed DC cert.">Directory certificate (pin a self-signed DC cert)</label>
               <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
                 <button id="ldapFetchCert" type="button">Fetch &amp; pin certificate</button>
@@ -800,7 +830,7 @@
               </div>
               <span style="display:block;font-size:12px;opacity:0.7;margin-top:3px;line-height:1.4;">Fetches the cert from the server URL above so you can review its fingerprint and pin it. With a cert pinned you can keep <b>Verify TLS certificate ON</b> and it trusts exactly that certificate — far safer than turning verification off (which accepts any cert and is MITM-able).</span>
             </div>
-            <div style="display:flex;gap:10px;align-items:center;">
+            <div class="span-all" style="display:flex;gap:10px;align-items:center;">
               <button id="ldapSave" class="primary">Save LDAP settings</button>
               <span id="ldapSaveMsg" style="font-size:12px;opacity:0.8;"></span>
             </div>
@@ -824,51 +854,82 @@
 
         <section class="panel">
           <div class="panel-head">
-            <h2 class="panel-title">Access control <small class="mini-stats"><b id="mUsers">0</b> users</small></h2>
+            <h2 class="panel-title">Directory users — select who may use TBFDesk</h2>
           </div>
           <div style="padding:12px 16px;display:flex;flex-direction:column;gap:12px;">
-            <label style="display:flex;gap:10px;align-items:flex-start;cursor:pointer;max-width:680px;">
-              <input id="requireLogin" type="checkbox" style="margin-top:3px;">
-              <span>
-                <span style="font-weight:600;">Require login to use TBFDesk</span>
-                <span style="display:block;font-size:12px;opacity:0.7;margin-top:3px;line-height:1.4;">When on, a client cannot be used until an <b>enabled</b> user logs in, and that user's policy replaces the device policy. Only users ticked <b>Enabled</b> below may sign in.</span>
-              </span>
-            </label>
-            <label style="display:flex;gap:10px;align-items:flex-start;cursor:pointer;max-width:680px;">
-              <input id="defaultAllowAll" type="checkbox" style="margin-top:3px;">
-              <span>
-                <span style="font-weight:600;">New users see all peers by default</span>
-                <span style="display:block;font-size:12px;opacity:0.7;margin-top:3px;line-height:1.4;">Seeds a newly-seen user's allowed targets with "all peers". They still must be Enabled to sign in.</span>
-              </span>
-            </label>
-            <div style="font-size:12px;opacity:0.75;line-height:1.4;max-width:760px;"><b>Allowlist:</b> tick <b>Enabled</b> to let a directory user use TBFDesk. Set which computers they may reach in <b>Allowed targets</b>, and what they can do in <b>Policy</b> (e.g. give a user view-only, no file transfer).</div>
+            <div style="font-size:12px;opacity:0.75;line-height:1.4;max-width:900px;">Search your Windows domain and tick the users allowed to sign in to TBFDesk. Enabling a user adds them to the <b>ACL</b> tab, where you set which computers they may reach and their per-user policy. Only enabled users can log in (with <b>Require login</b> on). Browsing the directory needs a read-only <b>service account</b> — set a Bind DN + password in the LDAP settings above and Save first.</div>
+            <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;">
+              <input id="ldapUserQuery" type="text" placeholder="search name or username (blank = list all)" style="flex:1;min-width:240px;">
+              <button id="ldapUserSearch" class="primary">Search directory</button>
+              <span id="ldapUsersMsg" style="font-size:12px;opacity:0.8;"></span>
+            </div>
             <div class="table-wrap">
               <table>
                 <thead>
                   <tr>
-                    <th title="Allowlist gate: only enabled users may sign in and use TBFDesk.">Enabled</th>
-                    <th title="The directory account (canonical sAMAccountName / UPN).">User</th>
+                    <th title="Tick to allow this user to sign in to TBFDesk.">Allowed</th>
+                    <th title="The directory account (canonical sAMAccountName).">User</th>
                     <th title="Display name from the directory.">Name</th>
-                    <th title="Admins may connect to every peer regardless of the target list.">Admin</th>
-                    <th title="The computers this user may see and connect to. 'All peers (*)' = unrestricted.">Allowed targets</th>
-                    <th title="Per-user session permissions (view-only, file transfer, etc.).">Policy</th>
+                    <th title="Email from the directory.">Email</th>
                     <th></th>
                   </tr>
                 </thead>
-                <tbody id="permsBody"></tbody>
+                <tbody id="ldapUsersBody"></tbody>
               </table>
-              <div id="permsEmpty" class="empty">No users yet. Users appear here after their first login attempt, or add one below.</div>
-            </div>
-            <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
-              <input id="addUserName" type="text" placeholder="add username (pre-authorise before first login)" style="min-width:280px;">
-              <button id="addUser">Add user</button>
-              <span style="flex:1;"></span>
-              <button id="permsSave" class="primary">Save access control</button>
-              <span id="permsSaveMsg" style="font-size:12px;opacity:0.8;"></span>
+              <div id="ldapUsersEmpty" class="empty">Search the directory to list users. Set a service account in the LDAP settings above if this reports one is required.</div>
             </div>
           </div>
         </section>
       </main>
+    </div>
+
+    <div id="view-acl" class="view" hidden>
+      <section class="panel">
+        <div class="panel-head">
+          <h2 class="panel-title">Access control <small class="mini-stats"><b id="mUsers">0</b> users</small></h2>
+        </div>
+        <div style="padding:12px 16px;display:flex;flex-direction:column;gap:12px;">
+            <label style="display:flex;gap:10px;align-items:flex-start;cursor:pointer;max-width:760px;">
+              <input id="requireLogin" type="checkbox" style="margin-top:3px;">
+              <span>
+                <span style="font-weight:600;">Require login to use TBFDesk</span>
+                <span style="display:block;font-size:12px;opacity:0.7;margin-top:3px;line-height:1.4;">When on, a client cannot be used until an <b>enabled</b> user logs in, and that user's policy replaces the device policy. Only users ticked <b>Allowed</b> here (or in the Integration directory picker) may sign in.</span>
+              </span>
+            </label>
+            <label style="display:flex;gap:10px;align-items:flex-start;cursor:pointer;max-width:760px;">
+              <input id="defaultAllowAll" type="checkbox" style="margin-top:3px;">
+              <span>
+                <span style="font-weight:600;">New users see all peers by default</span>
+                <span style="display:block;font-size:12px;opacity:0.7;margin-top:3px;line-height:1.4;">Seeds a newly-enabled user's allowed targets with "all peers". They still must be Enabled to sign in.</span>
+              </span>
+            </label>
+          <div style="font-size:12px;opacity:0.75;line-height:1.4;max-width:900px;">Add users in <b>Integration → Directory users</b>. Here you set which computers each may reach in <b>Allowed targets</b>, and what they can do in <b>Policy</b> (e.g. view-only, no file transfer). Untick <b>Enabled</b> to revoke access without deleting the row.</div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th title="Allowlist gate: only enabled users may sign in and use TBFDesk.">Enabled</th>
+                  <th title="The directory account (canonical sAMAccountName / UPN).">User</th>
+                  <th title="Display name from the directory.">Name</th>
+                  <th title="Admins may connect to every peer regardless of the target list.">Admin</th>
+                  <th title="The computers this user may see and connect to. 'All peers (*)' = unrestricted.">Allowed targets</th>
+                  <th title="Per-user session permissions (view-only, file transfer, etc.).">Policy</th>
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody id="permsBody"></tbody>
+            </table>
+            <div id="permsEmpty" class="empty">No users yet. Add them in Integration → Directory users, or type one below.</div>
+          </div>
+          <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
+            <input id="addUserName" type="text" placeholder="add username manually (sAMAccountName)" style="min-width:280px;">
+            <button id="addUser">Add user</button>
+            <span style="flex:1;"></span>
+            <button id="permsSave" class="primary">Save access control</button>
+            <span id="permsSaveMsg" style="font-size:12px;opacity:0.8;"></span>
+          </div>
+        </div>
+      </section>
     </div>
 
     <div id="view-log" class="view" hidden>
@@ -965,6 +1026,7 @@
         document.querySelectorAll(".navbtn").forEach((b) => b.classList.toggle("active", b === btn));
         document.querySelectorAll(".view").forEach((v) => { v.hidden = v.id !== "view-" + view; });
         if (view === "integration") loadIntegration();
+        if (view === "acl") loadIntegration();
         if (view === "settings") refreshGlobalPolicy();
         if (view === "connections") { loadConnections(); startConnTimer(); } else { stopConnTimer(); }
       });
@@ -975,10 +1037,33 @@
     $("ldapTest").addEventListener("click", testLdap);
     $("ldapFetchCert").addEventListener("click", fetchCert);
     $("ldapClearCert").addEventListener("click", clearCert);
+    $("ldapUserSearch").addEventListener("click", searchDirectory);
+    $("ldapUserQuery").addEventListener("keydown", (e) => { if (e.key === "Enter") searchDirectory(); });
     $("gpSave").addEventListener("click", saveGlobalPolicy);
     $("permsSave").addEventListener("click", savePermissions);
     $("addUser").addEventListener("click", addUserRow);
     $("addUserName").addEventListener("keydown", (e) => { if (e.key === "Enter") addUserRow(); });
+    // Nemo: per-view adjustable column layout (Settings + Integration). The
+    // "Columns" switcher sets --cols on its own .view, which the .col-grid forms
+    // inside inherit; each view remembers its 1/2/3 choice in localStorage.
+    function nemoApplyColumns(view, n) {
+      if (!view) return;
+      n = Math.min(3, Math.max(1, parseInt(n, 10) || 2));
+      view.style.setProperty("--cols", n);
+      view.querySelectorAll(".col-switch .seg button").forEach((b) => {
+        b.classList.toggle("active", parseInt(b.dataset.cols, 10) === n);
+      });
+      try { localStorage.setItem("nemoCols:" + view.id, n); } catch (e) {}
+    }
+    document.querySelectorAll(".col-switch .seg button").forEach((b) => {
+      b.addEventListener("click", () => nemoApplyColumns(b.closest(".view"), b.dataset.cols));
+    });
+    document.querySelectorAll(".view").forEach((view) => {
+      if (!view.querySelector(".col-switch")) return;
+      let n = 2;
+      try { n = parseInt(localStorage.getItem("nemoCols:" + view.id), 10) || 2; } catch (e) {}
+      nemoApplyColumns(view, n);
+    });
     // Nemo: clicking empty, non-interactive space clears the selected peer.
     // Row clicks stopPropagation, so they never reach here; keep the selection
     // when clicking inside the detail side panel or any interactive control.
@@ -1371,6 +1456,77 @@
         renderPerms();
       } catch (err) {
         setMsg("ldapSaveMsg", err.message, false);
+      }
+    }
+
+    // ---- Integration: directory user picker ----
+    async function searchDirectory() {
+      const q = $("ldapUserQuery").value.trim();
+      setMsg("ldapUsersMsg", "Searching…", true);
+      try {
+        const res = await api("/nemo/api/integration/ldap/users", {
+          method: "POST",
+          body: JSON.stringify({ query: q, limit: 300 })
+        });
+        if (!res.success) {
+          setMsg("ldapUsersMsg", res.message || "search failed", false);
+          renderDirectoryUsers([]);
+          return;
+        }
+        setMsg("ldapUsersMsg", res.users.length + " user(s) found", true);
+        renderDirectoryUsers(res.users);
+      } catch (err) {
+        setMsg("ldapUsersMsg", err.message, false);
+        renderDirectoryUsers([]);
+      }
+    }
+
+    function dirCell(text) {
+      const td = document.createElement("td");
+      td.textContent = text || "";
+      return td;
+    }
+
+    function renderDirectoryUsers(users) {
+      const body = $("ldapUsersBody");
+      body.innerHTML = "";
+      $("ldapUsersEmpty").style.display = users.length ? "none" : "";
+      for (const u of users) {
+        const tr = document.createElement("tr");
+        const cell = document.createElement("td");
+        const cb = document.createElement("input");
+        cb.type = "checkbox";
+        cb.checked = !!u.enabled;
+        cb.addEventListener("change", () => toggleDirectoryUser(u, cb));
+        cell.appendChild(cb);
+        tr.appendChild(cell);
+        tr.appendChild(dirCell(u.username));
+        tr.appendChild(dirCell(u.display_name));
+        tr.appendChild(dirCell(u.email));
+        const status = document.createElement("td");
+        status.style.fontSize = "12px";
+        status.style.opacity = "0.7";
+        status.textContent = u.enabled ? "allowed" : (u.in_acl ? "disabled" : "");
+        tr.appendChild(status);
+        body.appendChild(tr);
+      }
+    }
+
+    async function toggleDirectoryUser(u, cb) {
+      const enabled = cb.checked;
+      try {
+        await api("/nemo/api/integration/ldap/users/set", {
+          method: "POST",
+          body: JSON.stringify({ username: u.username, enabled: enabled, display_name: u.display_name || "", email: u.email || "" })
+        });
+        u.enabled = enabled;
+        u.in_acl = true;
+        const row = cb.closest("tr");
+        if (row) row.lastChild.textContent = enabled ? "allowed" : "disabled";
+        setMsg("ldapUsersMsg", (enabled ? "Enabled " : "Disabled ") + u.username + " — see the ACL tab for targets/policy", true);
+      } catch (err) {
+        cb.checked = !enabled; // revert on failure
+        setMsg("ldapUsersMsg", err.message, false);
       }
     }
 

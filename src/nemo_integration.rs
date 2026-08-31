@@ -400,28 +400,60 @@ fn normalize_targets(targets: Vec<String>) -> Vec<String> {
     out
 }
 
-/// Ensure a user record exists after a successful LDAP bind, updating profile
-/// fields and stamping `last_login`. A brand-new user is recorded as **disabled**
-/// (so it shows up in the dashboard allowlist for an admin to enable) with the
-/// `default_targets`. Returns `(enabled, is_admin, allowed_targets)`.
-pub fn ensure_user(username: &str, display_name: &str, email: &str) -> (bool, bool, Vec<String>) {
+/// Record a successful LDAP login for an **already-allowlisted** user: refresh
+/// profile fields and stamp `last_login`. Deliberately does NOT create a record
+/// for an unknown user — the allowlist is curated by the admin via the Integration
+/// directory picker, so a login attempt by a non-selected account must never add
+/// them to it. Returns `(exists, enabled, is_admin)`; an unknown user is
+/// `(false, false, false)` and will be refused by the login gate.
+pub fn record_login(username: &str, display_name: &str, email: &str) -> (bool, bool, bool) {
+    let key = normalize_lookup_username(username);
+    let mut cfg = CONFIG.lock().unwrap();
+    match cfg.permissions.get_mut(&key) {
+        Some(entry) => {
+            if !display_name.is_empty() {
+                entry.display_name = display_name.to_owned();
+            }
+            if !email.is_empty() {
+                entry.email = email.to_owned();
+            }
+            entry.last_login = now_iso8601();
+            let result = (true, entry.enabled, entry.is_admin);
+            persist(&cfg);
+            result
+        }
+        None => (false, false, false),
+    }
+}
+
+/// Upsert an allowlist entry for a directory user and set its enabled flag (used
+/// by the Integration directory picker). A brand-new entry is seeded with the
+/// `default_targets`; `is_admin`, targets and per-user policy are left to the ACL
+/// tab. Returns the resulting permission.
+pub fn set_user_enabled(
+    username: &str,
+    enabled: bool,
+    display_name: &str,
+    email: &str,
+) -> UserPermission {
+    let key = normalize_lookup_username(username);
     let mut cfg = CONFIG.lock().unwrap();
     let defaults = cfg.default_targets.clone();
     let entry = cfg
         .permissions
-        .entry(username.to_owned())
+        .entry(key)
         .or_insert_with(|| UserPermission {
             allowed_targets: defaults,
             ..UserPermission::default()
         });
+    entry.enabled = enabled;
     if !display_name.is_empty() {
         entry.display_name = display_name.to_owned();
     }
     if !email.is_empty() {
         entry.email = email.to_owned();
     }
-    entry.last_login = now_iso8601();
-    let result = (entry.enabled, entry.is_admin, entry.allowed_targets.clone());
+    let result = entry.clone();
     persist(&cfg);
     result
 }
@@ -886,6 +918,139 @@ pub struct LdapUser {
     pub dn: String,
 }
 
+/// Build the TLS connector for LDAPS: trust a pinned cert if provided (verify
+/// against exactly that certificate — safe for a self-signed DC), or accept any
+/// certificate when verification is explicitly disabled. Shared by the login and
+/// directory-search paths so both honour the same pinning/verification posture.
+#[cfg(feature = "nemo-ldap")]
+fn build_ldap_connector(cfg: &LdapConfig) -> Result<native_tls::TlsConnector, String> {
+    let mut builder = native_tls::TlsConnector::builder();
+    if !cfg.tls_verify {
+        builder.danger_accept_invalid_certs(true);
+        builder.danger_accept_invalid_hostnames(true);
+    }
+    let ca = cfg.ca_cert.trim();
+    if !ca.is_empty() {
+        let cert = native_tls::Certificate::from_pem(ca.as_bytes())
+            .map_err(|e| format!("pinned certificate is invalid: {}", e))?;
+        builder.add_root_certificate(cert);
+    }
+    builder
+        .build()
+        .map_err(|e| format!("TLS setup failed: {}", e))
+}
+
+/// A directory user returned by the Integration picker's search.
+#[derive(Clone, Debug, Serialize)]
+pub struct DirectoryUser {
+    /// Canonical (case-folded) username used as the RBAC/allowlist key.
+    pub username: String,
+    pub display_name: String,
+    pub email: String,
+}
+
+/// Search the directory for users matching `query` (empty = list users), using
+/// the configured service account. Returns up to `limit` results. Requires a
+/// service `bind_dn`/`bind_password` — a directory listing cannot be done with a
+/// per-user direct bind. Used by the Integration "select LDAP users" picker.
+#[cfg(feature = "nemo-ldap")]
+pub async fn search_ldap_users(
+    cfg: &LdapConfig,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<DirectoryUser>, String> {
+    use ldap3::{LdapConnAsync, LdapConnSettings, Scope, SearchEntry};
+
+    if !cfg.enabled {
+        return Err("LDAP integration is disabled".to_owned());
+    }
+    let url = cfg.server_url.trim();
+    if url.is_empty() {
+        return Err("LDAP server URL is not configured".to_owned());
+    }
+    if !url.to_ascii_lowercase().starts_with("ldaps://") {
+        return Err("LDAP must use ldaps:// (LDAP over TLS, port 636).".to_owned());
+    }
+    if cfg.bind_dn.trim().is_empty() {
+        return Err(
+            "Browsing the directory needs a read-only service account. Set a Bind DN + \
+             password in the LDAP settings above, Save, then search."
+                .to_owned(),
+        );
+    }
+    let base = cfg.base_dn.trim();
+    if base.is_empty() {
+        return Err("base DN is not configured".to_owned());
+    }
+
+    let connector = build_ldap_connector(cfg)?;
+    let settings = LdapConnSettings::new().set_connector(connector);
+    let (conn, mut ldap) = LdapConnAsync::with_settings(settings, cfg.server_url.trim())
+        .await
+        .map_err(|e| format!("connect failed: {}", e))?;
+    ldap3::drive!(conn);
+    ldap.simple_bind(cfg.bind_dn.trim(), &cfg.bind_password)
+        .await
+        .map_err(|e| format!("service bind failed: {}", e))?
+        .success()
+        .map_err(|e| format!("service bind rejected: {}", e))?;
+
+    let filter = directory_search_filter(query);
+    let attr_list = vec!["sAMAccountName", "userPrincipalName", "displayName", "mail"];
+    let search = ldap
+        .search(base, Scope::Subtree, &filter, attr_list)
+        .await
+        .map_err(|e| format!("directory search failed: {}", e))?
+        .success();
+    let _ = ldap.unbind().await;
+    let (entries, _res) = search.map_err(|e| format!("directory search rejected: {}", e))?;
+
+    let mut users: Vec<DirectoryUser> = Vec::new();
+    for entry in entries.into_iter() {
+        let se = SearchEntry::construct(entry);
+        let username = canonical_username(&se.attrs, "");
+        if username.is_empty() {
+            continue;
+        }
+        users.push(DirectoryUser {
+            username,
+            display_name: first_attr(&se.attrs, "displayName"),
+            email: first_attr(&se.attrs, "mail"),
+        });
+    }
+    users.sort_by(|a, b| a.username.cmp(&b.username));
+    users.dedup_by(|a, b| a.username == b.username);
+    users.truncate(limit);
+    Ok(users)
+}
+
+/// Build a directory search filter for people (not computer accounts). With a
+/// query, substring-match it (escaped) across the common name attributes.
+#[cfg(feature = "nemo-ldap")]
+fn directory_search_filter(query: &str) -> String {
+    let q = query.trim();
+    if q.is_empty() {
+        "(&(objectCategory=person)(objectClass=user))".to_owned()
+    } else {
+        let e = escape_filter(q);
+        format!(
+            "(&(objectCategory=person)(objectClass=user)(|(sAMAccountName=*{e}*)\
+             (displayName=*{e}*)(mail=*{e}*)(userPrincipalName=*{e}*)))",
+            e = e
+        )
+    }
+}
+
+/// Stub when the `nemo-ldap` feature is disabled at build time.
+#[cfg(not(feature = "nemo-ldap"))]
+pub async fn search_ldap_users(
+    _cfg: &LdapConfig,
+    _query: &str,
+    _limit: usize,
+) -> Result<Vec<DirectoryUser>, String> {
+    Err("LDAP support was not compiled in (build with --features nemo-ldap)".to_owned())
+}
+
 /// Authenticate `username`/`password` against the configured directory.
 /// Returns `Ok(LdapUser)` on success, `Err(reason)` otherwise.
 #[cfg(feature = "nemo-ldap")]
@@ -925,25 +1090,9 @@ pub async fn authenticate_ldap(
         );
     }
 
-    // Build the TLS connector: trust a pinned cert if provided (verify against
-    // exactly that certificate — safe for a self-signed DC), or accept anything
-    // when verification is explicitly disabled.
-    let connector = {
-        let mut builder = native_tls::TlsConnector::builder();
-        if !cfg.tls_verify {
-            builder.danger_accept_invalid_certs(true);
-            builder.danger_accept_invalid_hostnames(true);
-        }
-        let ca = cfg.ca_cert.trim();
-        if !ca.is_empty() {
-            let cert = native_tls::Certificate::from_pem(ca.as_bytes())
-                .map_err(|e| format!("pinned certificate is invalid: {}", e))?;
-            builder.add_root_certificate(cert);
-        }
-        builder
-            .build()
-            .map_err(|e| format!("TLS setup failed: {}", e))?
-    };
+    // Build the TLS connector (pinned-cert / verification posture is shared with
+    // the directory-search path).
+    let connector = build_ldap_connector(cfg)?;
     let make_settings = || LdapConnSettings::new().set_connector(connector.clone());
 
     let mut dn = String::new();

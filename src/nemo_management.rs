@@ -214,6 +214,11 @@ static API_ALLOW_INSECURE: AtomicBool = AtomicBool::new(false);
 static GLOBAL_POLICY: Lazy<std::sync::RwLock<ManagementPolicy>> =
     Lazy::new(|| std::sync::RwLock::new(load_global_policy()));
 static STATS: Lazy<RwLock<NemoStatsStore>> = Lazy::new(|| RwLock::new(NemoStatsStore::default()));
+// Client-reported hostnames (peer id -> hostname), so the address book can show
+// "which computer is this ID". Reported by each peer's management poll (below),
+// persisted so labels survive a restart before the next poll re-reports them.
+static PEER_HOSTNAMES: Lazy<std::sync::RwLock<HashMap<String, String>>> =
+    Lazy::new(|| std::sync::RwLock::new(load_peer_hostnames()));
 
 #[derive(Clone)]
 struct HbbsApiState {
@@ -346,6 +351,10 @@ struct ClientPolicyRequest {
     /// policy (identity-based policy).
     #[serde(default)]
     access_token: Option<String>,
+    /// The peer's own hostname, so the server can label the address book with
+    /// "which computer is this ID".
+    #[serde(default)]
+    hostname: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -462,6 +471,53 @@ fn persist_company_only(value: bool) {
     }
 }
 
+fn peer_hostnames_path() -> String {
+    get_arg_or("nemo-peer-hostnames-file", "nemo_peer_hostnames.json".to_owned())
+}
+
+fn load_peer_hostnames() -> HashMap<String, String> {
+    std::fs::read_to_string(peer_hostnames_path())
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+// Record a peer's self-reported hostname (from its management poll). Only writes
+// to disk when the value actually changes, so the 30s poll cadence doesn't churn
+// the file.
+fn record_peer_hostname(id: &str, hostname: &str) {
+    let hostname = hostname.trim();
+    if id.is_empty() || hostname.is_empty() {
+        return;
+    }
+    {
+        let map = PEER_HOSTNAMES.read().unwrap();
+        if map.get(id).map(|h| h == hostname).unwrap_or(false) {
+            return;
+        }
+    }
+    let snapshot = {
+        let mut map = PEER_HOSTNAMES.write().unwrap();
+        map.insert(id.to_owned(), hostname.to_owned());
+        map.clone()
+    };
+    if let Ok(json) = serde_json::to_string(&snapshot) {
+        let path = peer_hostnames_path();
+        if let Err(e) = std::fs::write(&path, json) {
+            log::warn!("failed to persist peer hostnames to {}: {}", path, e);
+        }
+    }
+}
+
+fn peer_hostname(id: &str) -> String {
+    PEER_HOSTNAMES
+        .read()
+        .unwrap()
+        .get(id)
+        .cloned()
+        .unwrap_or_default()
+}
+
 pub(crate) fn init_from_args() {
     // CLI default first, then a persisted dashboard toggle wins if present.
     COMPANY_ONLY.store(is_truthy(&get_arg("nemo-company-only")), Ordering::SeqCst);
@@ -529,6 +585,8 @@ pub(crate) async fn spawn_hbbs_api(
         )
         .route("/nemo/api/integration/ldap/test", post(test_ldap_login))
         .route("/nemo/api/integration/ldap/fetch-cert", post(fetch_ldap_cert))
+        .route("/nemo/api/integration/ldap/users", post(list_ldap_users))
+        .route("/nemo/api/integration/ldap/users/set", post(set_ldap_user))
         .route(
             "/nemo/api/integration/permissions",
             get(get_permissions).put(put_permissions),
@@ -754,10 +812,12 @@ async fn api_login(
     match integration::authenticate_ldap(&cfg, &username, &password).await {
         Ok(user) => {
             integration::clear_login_failures(&user.username);
-            // Record the user (a brand-new one lands disabled so it shows up in
-            // the dashboard allowlist) and gate on the allowlist.
-            let (enabled, is_admin, _targets) =
-                integration::ensure_user(&user.username, &user.display_name, &user.email);
+            // Update the profile/last-login of an ALREADY-allowlisted user. A user
+            // the admin has not added via the directory picker is NOT auto-created
+            // (the allowlist stays exactly the set the admin selected), so an
+            // unknown account comes back not-enabled and is refused below.
+            let (_exists, enabled, is_admin) =
+                integration::record_login(&user.username, &user.display_name, &user.email);
             // The allowlist gate applies once mandatory login is turned on. Until
             // then login is open (any authenticated directory user), so enabling
             // require-login is what activates the "only these users" allowlist.
@@ -896,10 +956,11 @@ async fn api_ab_get(
             continue;
         }
         let alias = peer_alias(&peer);
+        let hostname = peer_hostname(&peer.id);
         ab_peers.push(AbPeer {
             id: peer.id.clone(),
             username: String::new(),
-            hostname: String::new(),
+            hostname,
             platform: String::new(),
             alias,
             tags: Vec::new(),
@@ -1051,6 +1112,112 @@ async fn fetch_ldap_cert(
             cert: None,
         },
     }))
+}
+
+// ---- Dashboard: LDAP directory picker (select users to allow) ----
+
+#[derive(Deserialize)]
+struct LdapUsersRequest {
+    #[serde(default)]
+    query: String,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Serialize)]
+struct DirectoryUserView {
+    username: String,
+    display_name: String,
+    email: String,
+    /// Whether this directory user is enabled to use TBFDesk.
+    enabled: bool,
+    is_admin: bool,
+    /// Whether the user already has an allowlist entry (vs. never selected).
+    in_acl: bool,
+}
+
+#[derive(Serialize)]
+struct LdapUsersResponse {
+    success: bool,
+    message: String,
+    users: Vec<DirectoryUserView>,
+}
+
+// Search the directory (service-account bind) and annotate each hit with its
+// current allowlist state so the admin can enable/disable at a glance.
+async fn list_ldap_users(
+    Extension(state): Extension<HbbsApiState>,
+    headers: HeaderMap,
+    Json(req): Json<LdapUsersRequest>,
+) -> ApiResult<LdapUsersResponse> {
+    require_auth(&headers, &state.token)?;
+    let cfg = integration::ldap_config();
+    let limit = req.limit.unwrap_or(200).clamp(1, 1000);
+    match integration::search_ldap_users(&cfg, req.query.trim(), limit).await {
+        Ok(found) => {
+            let perms = integration::permissions_snapshot();
+            let users = found
+                .into_iter()
+                .map(|u| {
+                    let p = perms.get(&u.username);
+                    DirectoryUserView {
+                        enabled: p.map(|x| x.enabled).unwrap_or(false),
+                        is_admin: p.map(|x| x.is_admin).unwrap_or(false),
+                        in_acl: p.is_some(),
+                        username: u.username,
+                        display_name: u.display_name,
+                        email: u.email,
+                    }
+                })
+                .collect();
+            Ok(Json(LdapUsersResponse {
+                success: true,
+                message: String::new(),
+                users,
+            }))
+        }
+        Err(reason) => Ok(Json(LdapUsersResponse {
+            success: false,
+            message: reason,
+            users: Vec::new(),
+        })),
+    }
+}
+
+#[derive(Deserialize)]
+struct SetLdapUserRequest {
+    username: String,
+    enabled: bool,
+    #[serde(default)]
+    display_name: String,
+    #[serde(default)]
+    email: String,
+}
+
+// Enable/disable a directory user for TBFDesk (upserts the allowlist entry).
+async fn set_ldap_user(
+    Extension(state): Extension<HbbsApiState>,
+    headers: HeaderMap,
+    Json(req): Json<SetLdapUserRequest>,
+) -> ApiResult<serde_json::Value> {
+    require_auth(&headers, &state.token)?;
+    let username = req.username.trim();
+    if username.is_empty() {
+        return Ok(Json(
+            serde_json::json!({ "success": false, "message": "username required" }),
+        ));
+    }
+    let perm = integration::set_user_enabled(
+        username,
+        req.enabled,
+        req.display_name.trim(),
+        req.email.trim(),
+    );
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "username": username,
+        "enabled": perm.enabled,
+    })))
 }
 
 // ---- Dashboard: per-user permissions (RBAC) ----
@@ -1371,17 +1538,17 @@ async fn controller_policy_rejection(
     }
     let source = match pm.get_registered(source_id).await {
         Ok(Some(source)) => source,
-        Ok(None) => return Some("controller is not registered by Nemo policy".to_owned()),
+        Ok(None) => return Some("controller is not registered by TBF policy".to_owned()),
         Err(err) => {
             log::error!("failed to verify controller {}: {}", source_id, err);
             return Some("controller policy could not be verified".to_owned());
         }
     };
     if source_uuid.is_empty() || source.uuid.as_slice() != source_uuid {
-        return Some("controller identity rejected by Nemo policy".to_owned());
+        return Some("controller identity rejected by TBF policy".to_owned());
     }
     if matches!(source.status, Some(0)) {
-        return Some("controller is blocked by Nemo policy".to_owned());
+        return Some("controller is blocked by TBF policy".to_owned());
     }
     let policy = management_policy_from_peer(&source.management_policy);
     if policy
@@ -1390,11 +1557,11 @@ async fn controller_policy_rejection(
         .map(|value| value == "N")
         .unwrap_or(false)
     {
-        return Some("outgoing connections are disabled by Nemo policy".to_owned());
+        return Some("outgoing connections are disabled by TBF policy".to_owned());
     }
     if !target_allowed_by_controller_policy(policy.options.get(OPTION_NEMO_OUTBOUND_TARGETS), target_id)
     {
-        return Some("target is not allowed by Nemo policy".to_owned());
+        return Some("target is not allowed by TBF policy".to_owned());
     }
     None
 }
@@ -1783,6 +1950,8 @@ async fn client_policy(
         .map_err(server_error)?
         .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "peer not found"))?;
     validate_client_policy_request(&peer, &request)?;
+    // Learn this peer's hostname from its own poll so the address book can show it.
+    record_peer_hostname(&request.id, request.hostname.as_deref().unwrap_or(""));
     if let Some(version) = request.policy_version.as_deref() {
         log::trace!("Client {} requested management policy after {}", request.id, version);
     }

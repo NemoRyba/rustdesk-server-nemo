@@ -552,11 +552,11 @@ impl RendezvousServer {
                         crate::nemo_management::record_policy_rejection(
                             &nemo_id,
                             addr,
-                            "relay target is not allowed by Nemo policy",
+                            "relay target is not allowed by TBF policy",
                         )
                         .await;
                         let mut rr = RelayResponse {
-                            refuse_reason: "relay target is not allowed by Nemo policy".to_owned(),
+                            refuse_reason: "relay target is not allowed by TBF policy".to_owned(),
                             ..Default::default()
                         };
                         rr.set_id(nemo_id);
@@ -832,13 +832,13 @@ impl RendezvousServer {
             crate::nemo_management::record_policy_rejection(
                 &id,
                 addr,
-                "target peer is not allowed by Nemo policy",
+                "target peer is not allowed by TBF policy",
             )
             .await;
             let mut msg_out = RendezvousMessage::new();
             msg_out.set_punch_hole_response(PunchHoleResponse {
                 failure: punch_hole_response::Failure::OFFLINE.into(),
-                other_failure: "target peer is not allowed by Nemo policy".to_owned(),
+                other_failure: "target peer is not allowed by TBF policy".to_owned(),
                 ..Default::default()
             });
             return Ok((msg_out, None));
