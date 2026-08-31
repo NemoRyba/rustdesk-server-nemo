@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Nemo Admin</title>
+  <title>TBFDesk Admin</title>
   <style>
     :root {
       color-scheme: light;
@@ -583,6 +583,11 @@
     #permsBody td { padding: 6px 10px; vertical-align: top; }
     #permsBody select[multiple] { min-width: 240px; min-height: 68px; font: inherit; }
     #permsBody .perm-admin { text-align: center; }
+    .user-policy-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 6px 18px; }
+    .user-policy-grid .policy-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+    .user-policy-grid .policy-row label { font-size: 12px; }
+    .user-policy-grid .policy-row select, .user-policy-grid .policy-row input { font: inherit; padding: 2px 6px; max-width: 130px; }
+    .perm-policy { white-space: nowrap; }
     .msg-ok { color: #2e9e5b; }
     .msg-err { color: #d4380d; }
     .conn-path { font-size: 12px; font-weight: 700; padding: 1px 8px; border-radius: 4px; color: #fff; }
@@ -595,7 +600,7 @@
     <header class="topbar">
       <div class="brand">
         <div class="mark" aria-hidden="true"></div>
-        <h1>Nemo Admin</h1>
+        <h1>TBFDesk Admin</h1>
       </div>
       <div class="top-actions">
         <span class="status"><span id="healthDot" class="dot"></span><span id="healthText">Idle</span></span>
@@ -823,27 +828,37 @@
             <h2 class="panel-title">Access control <small class="mini-stats"><b id="mUsers">0</b> users</small></h2>
           </div>
           <div style="padding:12px 16px;display:flex;flex-direction:column;gap:12px;">
-            <label style="display:flex;gap:10px;align-items:flex-start;cursor:pointer;max-width:640px;">
+            <label style="display:flex;gap:10px;align-items:flex-start;cursor:pointer;max-width:680px;">
+              <input id="requireLogin" type="checkbox" style="margin-top:3px;">
+              <span>
+                <span style="font-weight:600;">Require login to use TBFDesk</span>
+                <span style="display:block;font-size:12px;opacity:0.7;margin-top:3px;line-height:1.4;">When on, a client cannot be used until an <b>enabled</b> user logs in, and that user's policy replaces the device policy. Only users ticked <b>Enabled</b> below may sign in.</span>
+              </span>
+            </label>
+            <label style="display:flex;gap:10px;align-items:flex-start;cursor:pointer;max-width:680px;">
               <input id="defaultAllowAll" type="checkbox" style="margin-top:3px;">
               <span>
                 <span style="font-weight:600;">New users see all peers by default</span>
-                <span style="display:block;font-size:12px;opacity:0.7;margin-top:3px;line-height:1.4;">When off, a user who logs in for the first time sees an empty address book until you grant them targets below.</span>
+                <span style="display:block;font-size:12px;opacity:0.7;margin-top:3px;line-height:1.4;">Seeds a newly-seen user's allowed targets with "all peers". They still must be Enabled to sign in.</span>
               </span>
             </label>
+            <div style="font-size:12px;opacity:0.75;line-height:1.4;max-width:760px;"><b>Allowlist:</b> tick <b>Enabled</b> to let a directory user use TBFDesk. Set which computers they may reach in <b>Allowed targets</b>, and what they can do in <b>Policy</b> (e.g. give a user view-only, no file transfer).</div>
             <div class="table-wrap">
               <table>
                 <thead>
                   <tr>
+                    <th title="Allowlist gate: only enabled users may sign in and use TBFDesk.">Enabled</th>
                     <th title="The directory account (canonical sAMAccountName / UPN).">User</th>
                     <th title="Display name from the directory.">Name</th>
-                    <th title="Admins see and can connect to every peer regardless of the target list.">Admin</th>
-                    <th title="The peers this user may see in their address book and connect to. Select 'All peers (*)' for unrestricted access.">Allowed targets</th>
+                    <th title="Admins may connect to every peer regardless of the target list.">Admin</th>
+                    <th title="The computers this user may see and connect to. 'All peers (*)' = unrestricted.">Allowed targets</th>
+                    <th title="Per-user session permissions (view-only, file transfer, etc.).">Policy</th>
                     <th></th>
                   </tr>
                 </thead>
                 <tbody id="permsBody"></tbody>
               </table>
-              <div id="permsEmpty" class="empty">No users yet. Users appear here after their first login, or add one below.</div>
+              <div id="permsEmpty" class="empty">No users yet. Users appear here after their first login attempt, or add one below.</div>
             </div>
             <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
               <input id="addUserName" type="text" placeholder="add username (pre-authorise before first login)" style="min-width:280px;">
@@ -1338,7 +1353,7 @@
     }
 
     // ---- Integration view: LDAP config + per-user RBAC ----
-    const integ = { ldap: null, perms: {}, defaultTargets: [], peers: [], globalPolicy: { allow_user_override: false, options: {} } };
+    const integ = { ldap: null, perms: {}, defaultTargets: [], peers: [], requireLogin: false, selectedPolicyUser: null, globalPolicy: { allow_user_override: false, options: {} } };
 
     async function loadIntegration() {
       try {
@@ -1350,6 +1365,8 @@
         integ.ldap = ldap;
         integ.perms = perms.permissions || {};
         integ.defaultTargets = perms.default_targets || [];
+        integ.requireLogin = !!perms.require_login;
+        integ.selectedPolicyUser = null;
         integ.peers = perms.peers || [];
         integ.globalPolicy = gp && gp.options ? gp : { allow_user_override: false, options: {} };
         renderLdapForm();
@@ -1518,11 +1535,27 @@
       return wildcard + opts + extra;
     }
 
+    // Per-user session-permission policy (a focused subset of the device options).
+    const userPolicyOptions = [
+      ["view_only", "View only", "select", [["","Local"],["Y","Yes"],["N","No"]]],
+      ["enable-keyboard", "Keyboard & mouse", "bool"],
+      ["enable-clipboard", "Clipboard", "bool"],
+      ["enable-file-transfer", "File transfer", "bool"],
+      ["enable-audio", "Audio", "bool"],
+      ["enable-remote-restart", "Remote restart", "bool"],
+      ["enable-record-session", "Session recording", "bool"],
+      ["enable-block-input", "Block local input", "bool"],
+      ["enable-privacy-mode", "Privacy mode", "bool"],
+      ["image_quality", "Image quality", "select", [["","Local"],["best","Best"],["balanced","Balanced"],["low","Reaction time"]]],
+      ["nemo-permanent-password", "Incoming access password", "password"],
+    ];
+
     function renderPerms() {
       const body = $("permsBody");
       const names = Object.keys(integ.perms).sort();
       $("mUsers").textContent = names.length;
       $("defaultAllowAll").checked = (integ.defaultTargets || []).includes("*");
+      $("requireLogin").checked = !!integ.requireLogin;
       if (!names.length) {
         body.innerHTML = "";
         $("permsEmpty").style.display = "";
@@ -1531,19 +1564,42 @@
       $("permsEmpty").style.display = "none";
       body.innerHTML = names.map((name) => {
         const u = integ.perms[name] || {};
-        return `<tr data-user="${escapeHtml(name)}">
+        const isOpen = integ.selectedPolicyUser === name;
+        const npol = (u.policy && u.policy.options) ? Object.keys(u.policy.options).length : 0;
+        let row = `<tr data-user="${escapeHtml(name)}">
+          <td style="text-align:center"><input type="checkbox" class="perm-enabled" ${u.enabled ? "checked" : ""} title="Allow this user to sign in"></td>
           <td><code>${escapeHtml(name)}</code></td>
           <td>${escapeHtml(u.display_name || "")}</td>
           <td class="perm-admin"><input type="checkbox" class="perm-admin-cb" ${u.is_admin ? "checked" : ""}></td>
           <td><select multiple class="perm-targets">${targetOptionsHtml(u.allowed_targets)}</select></td>
+          <td><button class="perm-policy${isOpen ? ' primary' : ''}" title="Edit this user's session permissions">Policy${npol ? ` (${npol})` : ''} ${isOpen ? '▲' : '▾'}</button></td>
           <td><button class="perm-remove danger" title="Remove this user">✕</button></td>
         </tr>`;
+        if (isOpen) {
+          const opts = (u.policy && u.policy.options) || {};
+          const controls = userPolicyOptions.map((o) => policyControl(o, opts[o[0]] || "")).join("");
+          row += `<tr class="policy-editor-row"><td colspan="7" style="background:#fafafa;padding:6px 14px 12px;">
+            <div id="userPolicyPanel">
+              <div style="font-size:12px;opacity:0.7;margin-bottom:8px;">Session permissions for <code>${escapeHtml(name)}</code> — blank = client default. Applied (replacing the device policy) when this user is logged in.</div>
+              <div class="user-policy-grid">${controls}</div>
+            </div></td></tr>`;
+        }
+        return row;
       }).join("");
+      body.querySelectorAll(".perm-policy").forEach((btn) => {
+        btn.addEventListener("click", (e) => {
+          collectPerms();
+          const name = e.target.closest("tr").dataset.user;
+          integ.selectedPolicyUser = (integ.selectedPolicyUser === name) ? null : name;
+          renderPerms();
+        });
+      });
       body.querySelectorAll(".perm-remove").forEach((btn) => {
         btn.addEventListener("click", (e) => {
           collectPerms();
           const name = e.target.closest("tr").dataset.user;
           delete integ.perms[name];
+          if (integ.selectedPolicyUser === name) integ.selectedPolicyUser = null;
           renderPerms();
         });
       });
@@ -1553,21 +1609,35 @@
       $("permsBody").querySelectorAll("tr[data-user]").forEach((tr) => {
         const name = tr.dataset.user;
         const u = integ.perms[name] || {};
+        u.enabled = tr.querySelector(".perm-enabled").checked;
         u.is_admin = tr.querySelector(".perm-admin-cb").checked;
         u.allowed_targets = Array.from(tr.querySelector(".perm-targets").selectedOptions).map((o) => o.value);
         integ.perms[name] = u;
       });
+      // Read the currently-open policy editor into that user's policy.
+      if (integ.selectedPolicyUser && integ.perms[integ.selectedPolicyUser]) {
+        const opts = {};
+        document.querySelectorAll("#userPolicyPanel [data-policy-key]").forEach((el) => {
+          const v = el.value;
+          if (v !== "" && v !== undefined && v !== null) opts[el.dataset.policyKey] = v;
+        });
+        const u = integ.perms[integ.selectedPolicyUser];
+        u.policy = u.policy || { allow_user_override: false, options: {} };
+        u.policy.options = opts;
+      }
     }
 
     async function savePermissions() {
       collectPerms();
       const body = {
         permissions: integ.perms,
-        default_targets: $("defaultAllowAll").checked ? ["*"] : []
+        default_targets: $("defaultAllowAll").checked ? ["*"] : [],
+        require_login: $("requireLogin").checked
       };
       try {
         integ.perms = await api("/nemo/api/integration/permissions", { method: "PUT", body: JSON.stringify(body) });
         integ.defaultTargets = body.default_targets;
+        integ.requireLogin = body.require_login;
         renderPerms();
         setMsg("permsSaveMsg", "Saved.", true);
       } catch (err) {
@@ -1580,7 +1650,8 @@
       if (!name) return;
       collectPerms();
       if (!integ.perms[name]) {
-        integ.perms[name] = { is_admin: false, allowed_targets: [], display_name: "", email: "", last_login: "" };
+        // Manually-added users are enabled by default (the admin is granting them).
+        integ.perms[name] = { enabled: true, is_admin: false, allowed_targets: [], policy: { allow_user_override: false, options: {} }, display_name: "", email: "", last_login: "" };
       }
       $("addUserName").value = "";
       renderPerms();

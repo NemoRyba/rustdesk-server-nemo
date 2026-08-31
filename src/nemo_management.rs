@@ -89,6 +89,8 @@ const CLIENT_MANAGEMENT_POLICY_KEYS: &[&str] = &[
     "allow-numeric-one-time-password",
     "nemo-permanent-password",
     "nemo-alias",
+    "nemo-require-login",
+    "nemo-logged-in-user",
     OPTION_NEMO_OUTBOUND_ENABLED,
     OPTION_NEMO_OUTBOUND_TARGETS,
     "enable-lan-discovery",
@@ -340,6 +342,10 @@ struct ClientPolicyRequest {
     uuid: String,
     #[serde(default)]
     policy_version: Option<String>,
+    /// The logged-in user's session token, so the server can deliver that user's
+    /// policy (identity-based policy).
+    #[serde(default)]
+    access_token: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -748,10 +754,19 @@ async fn api_login(
     match integration::authenticate_ldap(&cfg, &username, &password).await {
         Ok(user) => {
             integration::clear_login_failures(&user.username);
-            // ensure_user creates/updates the RBAC entry (seeded with defaults on
-            // first login) and returns the current admin flag for the response.
-            let (is_admin, _targets) =
+            // Record the user (a brand-new one lands disabled so it shows up in
+            // the dashboard allowlist) and gate on the allowlist.
+            let (enabled, is_admin, _targets) =
                 integration::ensure_user(&user.username, &user.display_name, &user.email);
+            // The allowlist gate applies once mandatory login is turned on. Until
+            // then login is open (any authenticated directory user), so enabling
+            // require-login is what activates the "only these users" allowlist.
+            if integration::require_login() && !enabled {
+                log::warn!("Nemo login refused (not on allowlist): {}", user.username);
+                return Json(LoginResult::err(
+                    "Your account is not authorized to use TBFDesk. Contact your administrator.",
+                ));
+            }
             let token = integration::create_session(
                 user.username.clone(),
                 user.display_name.clone(),
@@ -1051,6 +1066,7 @@ struct PeerBrief {
 struct PermissionsResponse {
     permissions: HashMap<String, integration::UserPermission>,
     default_targets: Vec<String>,
+    require_login: bool,
     peers: Vec<PeerBrief>,
 }
 
@@ -1081,6 +1097,7 @@ async fn get_permissions(
     Ok(Json(PermissionsResponse {
         permissions: integration::permissions_snapshot(),
         default_targets: integration::default_targets(),
+        require_login: integration::require_login(),
         peers: briefs,
     }))
 }
@@ -1721,11 +1738,44 @@ async fn client_policy(
     if let Some(version) = request.policy_version.as_deref() {
         log::trace!("Client {} requested management policy after {}", request.id, version);
     }
-    // Global defaults first, then the peer's own policy overrides per key.
+    // Global (infrastructure) defaults first — api-server, TLS fallback, etc.
     let mut policy = global_policy();
-    let peer_policy = management_policy_from_peer(&peer.management_policy);
-    policy.allow_user_override = policy.allow_user_override || peer_policy.allow_user_override;
-    policy.options.extend(peer_policy.options);
+
+    // Identity-based policy: resolve the logged-in, enabled user from the token.
+    let user = request
+        .access_token
+        .as_deref()
+        .and_then(integration::session_for_token)
+        .filter(|s| integration::user_is_enabled(&s.username));
+    let require_login = integration::require_login();
+
+    match user {
+        Some(session) => {
+            // A logged-in user's policy REPLACES the device policy: start from the
+            // infrastructure globals and apply the user's settings only.
+            let up = integration::user_policy(&session.username);
+            policy.allow_user_override = policy.allow_user_override || up.allow_user_override;
+            policy.options.extend(up.options);
+            policy
+                .options
+                .insert("nemo-logged-in-user".to_owned(), session.username.clone());
+        }
+        None => {
+            // No logged-in user: use the per-device policy so a controlled host
+            // (e.g. an office computer nobody signs into) keeps its incoming
+            // config — permanent password, incoming permissions — and stays
+            // connectable. If login is required, also flag the client to block
+            // *outgoing* use until a user logs in (harmless on a pure host).
+            let peer_policy = management_policy_from_peer(&peer.management_policy);
+            policy.allow_user_override = policy.allow_user_override || peer_policy.allow_user_override;
+            policy.options.extend(peer_policy.options);
+            if require_login {
+                policy
+                    .options
+                    .insert("nemo-require-login".to_owned(), "Y".to_owned());
+            }
+        }
+    }
     if matches!(peer.status, Some(0)) {
         policy.allow_user_override = false;
         policy
@@ -2420,6 +2470,7 @@ mod tests {
             id: "peer-a".to_owned(),
             uuid: base64::encode([10u8, 20, 30]),
             policy_version: None,
+            access_token: None,
         };
         assert!(validate_client_policy_request(&peer, &ok).is_ok());
         // Empty id.
@@ -2427,6 +2478,7 @@ mod tests {
             id: "  ".to_owned(),
             uuid: base64::encode([10u8, 20, 30]),
             policy_version: None,
+            access_token: None,
         };
         assert_eq!(
             validate_client_policy_request(&peer, &no_id).unwrap_err().0,
@@ -2437,6 +2489,7 @@ mod tests {
             id: "peer-a".to_owned(),
             uuid: "!!!".to_owned(),
             policy_version: None,
+            access_token: None,
         };
         assert_eq!(
             validate_client_policy_request(&peer, &bad_b64).unwrap_err().0,
@@ -2447,6 +2500,7 @@ mod tests {
             id: "peer-a".to_owned(),
             uuid: base64::encode([99u8, 99, 99]),
             policy_version: None,
+            access_token: None,
         };
         assert_eq!(
             validate_client_policy_request(&peer, &mismatch).unwrap_err().0,

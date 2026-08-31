@@ -96,20 +96,54 @@ impl Default for LdapConfig {
     }
 }
 
-/// Per-user RBAC entry. `allowed_targets` is a list of peer IDs the user may see
-/// in their address book / connect to; the wildcard `*` means "all peers".
+/// A user's management policy (session settings) — same shape as the per-device
+/// managed policy, but keyed to the LDAP identity. Applied to whatever client the
+/// user logs into (replacing the device policy).
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct UserManagedPolicy {
+    #[serde(default)]
+    pub allow_user_override: bool,
+    #[serde(default)]
+    pub options: HashMap<String, String>,
+}
+
+/// Per-user entry: whether the user may use the software at all (`enabled`, the
+/// allowlist gate), which peers they may connect to (`allowed_targets`, enforced
+/// at connection), their session `policy`, and admin flag.
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct UserPermission {
+    /// Allowlist gate: false = this LDAP user is NOT allowed to use the software
+    /// (login refused). New auto-created users default to disabled so an admin
+    /// explicitly picks who gets access.
+    #[serde(default)]
+    pub enabled: bool,
     #[serde(default)]
     pub is_admin: bool,
     #[serde(default)]
     pub allowed_targets: Vec<String>,
+    /// Session permissions applied to the client this user logs into.
+    #[serde(default)]
+    pub policy: UserManagedPolicy,
     #[serde(default)]
     pub display_name: String,
     #[serde(default)]
     pub email: String,
     #[serde(default)]
     pub last_login: String,
+}
+
+impl Default for UserPermission {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            is_admin: false,
+            allowed_targets: Vec::new(),
+            policy: UserManagedPolicy::default(),
+            display_name: String::new(),
+            email: String::new(),
+            last_login: String::new(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -124,6 +158,10 @@ pub struct IntegrationConfig {
     /// access. Set to `["*"]` for allow-all-by-default.
     #[serde(default)]
     pub default_targets: Vec<String>,
+    /// When true, clients must have a logged-in (enabled) user before they can be
+    /// used at all, and the logged-in user's policy replaces the device policy.
+    #[serde(default)]
+    pub require_login: bool,
 }
 
 impl Default for IntegrationConfig {
@@ -132,6 +170,7 @@ impl Default for IntegrationConfig {
             ldap: LdapConfig::default(),
             permissions: HashMap::new(),
             default_targets: Vec::new(),
+            require_login: false,
         }
     }
 }
@@ -318,9 +357,12 @@ pub struct PermissionsUpdate {
     pub permissions: HashMap<String, UserPermission>,
     #[serde(default)]
     pub default_targets: Option<Vec<String>>,
+    #[serde(default)]
+    pub require_login: Option<bool>,
 }
 
-/// Replace the RBAC map (and optionally the default targets), persist, return it.
+/// Replace the RBAC map (and optionally the default targets / require-login),
+/// persist, return it.
 pub fn update_permissions(update: PermissionsUpdate) -> HashMap<String, UserPermission> {
     let mut cfg = CONFIG.lock().unwrap();
     // Normalise keys to canonical lower-case so lookups at login match.
@@ -334,6 +376,9 @@ pub fn update_permissions(update: PermissionsUpdate) -> HashMap<String, UserPerm
         .collect();
     if let Some(targets) = update.default_targets {
         cfg.default_targets = normalize_targets(targets);
+    }
+    if let Some(require) = update.require_login {
+        cfg.require_login = require;
     }
     let snapshot = cfg.permissions.clone();
     persist(&cfg);
@@ -355,21 +400,19 @@ fn normalize_targets(targets: Vec<String>) -> Vec<String> {
     out
 }
 
-/// Ensure a user record exists after a successful login, updating profile fields
-/// and stamping `last_login`. New users inherit `default_targets`. Returns the
-/// effective (is_admin, allowed_targets) for this user.
-pub fn ensure_user(username: &str, display_name: &str, email: &str) -> (bool, Vec<String>) {
+/// Ensure a user record exists after a successful LDAP bind, updating profile
+/// fields and stamping `last_login`. A brand-new user is recorded as **disabled**
+/// (so it shows up in the dashboard allowlist for an admin to enable) with the
+/// `default_targets`. Returns `(enabled, is_admin, allowed_targets)`.
+pub fn ensure_user(username: &str, display_name: &str, email: &str) -> (bool, bool, Vec<String>) {
     let mut cfg = CONFIG.lock().unwrap();
     let defaults = cfg.default_targets.clone();
     let entry = cfg
         .permissions
         .entry(username.to_owned())
         .or_insert_with(|| UserPermission {
-            is_admin: false,
             allowed_targets: defaults,
-            display_name: String::new(),
-            email: String::new(),
-            last_login: String::new(),
+            ..UserPermission::default()
         });
     if !display_name.is_empty() {
         entry.display_name = display_name.to_owned();
@@ -378,9 +421,38 @@ pub fn ensure_user(username: &str, display_name: &str, email: &str) -> (bool, Ve
         entry.email = email.to_owned();
     }
     entry.last_login = now_iso8601();
-    let result = (entry.is_admin, entry.allowed_targets.clone());
+    let result = (entry.enabled, entry.is_admin, entry.allowed_targets.clone());
     persist(&cfg);
     result
+}
+
+/// Whether clients must have a logged-in, enabled user to be used at all.
+pub fn require_login() -> bool {
+    CONFIG.lock().unwrap().require_login
+}
+
+/// The session policy configured for a user (empty if the user has none).
+pub fn user_policy(username: &str) -> UserManagedPolicy {
+    let key = normalize_lookup_username(username);
+    CONFIG
+        .lock()
+        .unwrap()
+        .permissions
+        .get(&key)
+        .map(|p| p.policy.clone())
+        .unwrap_or_default()
+}
+
+/// Whether a user is on the allowlist (enabled to use the software).
+pub fn user_is_enabled(username: &str) -> bool {
+    let key = normalize_lookup_username(username);
+    CONFIG
+        .lock()
+        .unwrap()
+        .permissions
+        .get(&key)
+        .map(|p| p.enabled)
+        .unwrap_or(false)
 }
 
 /// Whether a user (with the given effective permissions) may see/connect to a
