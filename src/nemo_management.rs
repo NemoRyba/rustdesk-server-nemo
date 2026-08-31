@@ -1298,17 +1298,65 @@ fn target_allowed_by_controller_policy(targets: Option<&String>, target_id: &str
         .any(|target| target == "*" || target == target_id)
 }
 
-fn controller_source_identity(source_field: &str) -> Option<(String, Vec<u8>)> {
+// Parse the smuggled controller identity: `nemo-source-v1:<id>:<b64 uuid>[:<user
+// token>]`. The optional trailing token is the logged-in user's session token,
+// used to enforce the per-user connection ACL / require-login at the punch.
+fn controller_source_identity(source_field: &str) -> Option<(String, Vec<u8>, Option<String>)> {
     let start = source_field.find(NEMO_SOURCE_PREFIX)? + NEMO_SOURCE_PREFIX.len();
-    let payload = &source_field[start..];
-    let mut parts = payload.splitn(2, ':');
+    // The source marker is a single whitespace-free token.
+    let payload = source_field[start..].split_whitespace().next()?;
+    let mut parts = payload.splitn(3, ':');
     let source_id = parts.next()?.trim();
-    let source_uuid = parts.next()?.split_whitespace().next()?.trim();
+    let source_uuid = parts.next()?.trim();
+    let token = parts
+        .next()
+        .map(|t| t.trim().to_owned())
+        .filter(|t| !t.is_empty());
     if source_id.is_empty() || source_uuid.is_empty() {
         return None;
     }
     let source_uuid = base64::decode(source_uuid).ok()?;
-    Some((source_id.to_owned(), source_uuid))
+    Some((source_id.to_owned(), source_uuid, token))
+}
+
+// Per-user connection ACL + require-login, enforced at the punch. `token` is the
+// controller's logged-in user session token (if any).
+fn nemo_user_connection_rejection(token: Option<&str>, target_id: &str) -> Option<String> {
+    let user = token
+        .and_then(integration::session_for_token)
+        .filter(|s| integration::user_is_enabled(&s.username));
+    match user {
+        Some(session) => {
+            let (is_admin, allowed) = integration::effective_permission(&session.username);
+            if integration::user_allowed_target(is_admin, &allowed, target_id) {
+                None
+            } else {
+                Some("you are not permitted to connect to this computer".to_owned())
+            }
+        }
+        None => {
+            if integration::require_login() {
+                Some("log in to TBFDesk to connect".to_owned())
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// User-level connection check from the smuggled source field. Returns
+/// `Some((source_id, reason))` when the connection must be refused.
+pub(crate) fn nemo_user_rejection_from_field(
+    source_field: &str,
+    target_id: &str,
+) -> Option<(String, String)> {
+    // Parse best-effort: a controller with no source marker still gets the
+    // require-login gate (token = None) so it cannot bypass mandatory login.
+    let parsed = controller_source_identity(source_field);
+    let token = parsed.as_ref().and_then(|(_, _, t)| t.clone());
+    let source_id = parsed.map(|(id, _, _)| id).unwrap_or_default();
+    let reason = nemo_user_connection_rejection(token.as_deref(), target_id)?;
+    Some((source_id, reason))
 }
 
 async fn controller_policy_rejection(
@@ -1356,7 +1404,7 @@ pub(crate) async fn controller_policy_rejection_from_field(
     source_field: &str,
     target_id: &str,
 ) -> Option<(String, String)> {
-    let (source_id, source_uuid) = controller_source_identity(source_field)?;
+    let (source_id, source_uuid, _token) = controller_source_identity(source_field)?;
     let reason = controller_policy_rejection(pm, &source_id, &source_uuid, target_id).await?;
     Some((source_id, reason))
 }
@@ -1465,7 +1513,7 @@ pub(crate) async fn record_connection_negotiation(
         "direct-punch"
     };
     let source_id = controller_source_identity(source_field)
-        .map(|(sid, _)| sid)
+        .map(|(sid, _, _)| sid)
         .unwrap_or_default();
     upsert_connection(
         &mut store,
@@ -2315,13 +2363,13 @@ mod tests {
     fn source_identity_parses_bare_and_versioned() {
         let uuid = vec![1u8, 2, 3, 4, 5];
         // Bare form.
-        let (id, got) = controller_source_identity(&source_field("peer-a", &uuid)).unwrap();
+        let (id, got, _) = controller_source_identity(&source_field("peer-a", &uuid)).unwrap();
         assert_eq!(id, "peer-a");
         assert_eq!(got, uuid);
         // Embedded after a real version string, as the client actually sends it
         // in `PunchHoleRequest.version` ("<VERSION> nemo-source-v1:...").
         let versioned = format!("1.4.6 {}", source_field("peer-a", &uuid));
-        let (id2, got2) = controller_source_identity(&versioned).unwrap();
+        let (id2, got2, _) = controller_source_identity(&versioned).unwrap();
         assert_eq!(id2, "peer-a");
         assert_eq!(got2, uuid);
     }
@@ -2332,9 +2380,24 @@ mod tests {
         // folded into the base64 uuid.
         let uuid = vec![9u8, 8, 7];
         let field = format!("{} extra-token", source_field("peer-b", &uuid));
-        let (id, got) = controller_source_identity(&field).unwrap();
+        let (id, got, _) = controller_source_identity(&field).unwrap();
         assert_eq!(id, "peer-b");
         assert_eq!(got, uuid);
+    }
+
+    #[test]
+    fn source_identity_parses_optional_user_token() {
+        let uuid = vec![1u8, 2, 3];
+        // With a trailing user token.
+        let field = format!("1.4.6 {}:tok-abc123", source_field("peer-a", &uuid));
+        let (id, got, token) = controller_source_identity(&field).unwrap();
+        assert_eq!(id, "peer-a");
+        assert_eq!(got, uuid);
+        assert_eq!(token.as_deref(), Some("tok-abc123"));
+        // Without a token the third element is None (backward compatible).
+        let (_, _, none_token) =
+            controller_source_identity(&source_field("peer-a", &uuid)).unwrap();
+        assert!(none_token.is_none());
     }
 
     #[test]

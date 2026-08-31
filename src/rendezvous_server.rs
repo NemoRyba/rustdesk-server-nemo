@@ -860,6 +860,21 @@ impl RendezvousServer {
             });
             return Ok((msg_out, None));
         }
+        // Nemo per-user connection ACL + require-login (enforced from the token
+        // smuggled in the source field).
+        #[cfg(feature = "nemo-management-api")]
+        if let Some((controller_id, reason)) =
+            crate::nemo_management::nemo_user_rejection_from_field(&ph.version, &id)
+        {
+            crate::nemo_management::record_policy_rejection(&controller_id, addr, &reason).await;
+            let mut msg_out = RendezvousMessage::new();
+            msg_out.set_punch_hole_response(PunchHoleResponse {
+                failure: punch_hole_response::Failure::OFFLINE.into(),
+                other_failure: reason,
+                ..Default::default()
+            });
+            return Ok((msg_out, None));
+        }
         // punch hole request from A, relay to B,
         // check if in same intranet first,
         // fetch local addrs if in same intranet.
