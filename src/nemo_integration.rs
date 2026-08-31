@@ -64,6 +64,12 @@ pub struct LdapConfig {
     /// understand the MITM risk.
     #[serde(default = "default_true")]
     pub tls_verify: bool,
+    /// PEM certificate(s) to trust for the directory's TLS, in addition to the
+    /// system roots. Lets an admin pin a self-signed DC certificate so TLS
+    /// verification passes against exactly that cert (much safer than turning
+    /// verification off, which accepts any certificate).
+    #[serde(default)]
+    pub ca_cert: String,
 }
 
 fn default_user_search_filter() -> String {
@@ -85,6 +91,7 @@ impl Default for LdapConfig {
             bind_password: String::new(),
             user_search_filter: default_user_search_filter(),
             tls_verify: true,
+            ca_cert: String::new(),
         }
     }
 }
@@ -190,6 +197,10 @@ pub struct LdapConfigView {
     pub bind_password_set: bool,
     pub user_search_filter: String,
     pub tls_verify: bool,
+    /// `true` if a certificate is pinned for the directory TLS.
+    pub ca_cert_set: bool,
+    /// SHA-256 fingerprint of the pinned certificate (empty if none / unparsable).
+    pub ca_cert_fingerprint: String,
 }
 
 impl From<&LdapConfig> for LdapConfigView {
@@ -203,6 +214,8 @@ impl From<&LdapConfig> for LdapConfigView {
             bind_password_set: !c.bind_password.is_empty(),
             user_search_filter: c.user_search_filter.clone(),
             tls_verify: c.tls_verify,
+            ca_cert_set: !c.ca_cert.trim().is_empty(),
+            ca_cert_fingerprint: pem_fingerprint(&c.ca_cert),
         }
     }
 }
@@ -219,6 +232,7 @@ pub struct LdapConfigUpdate {
     pub bind_password: Option<String>,
     pub user_search_filter: Option<String>,
     pub tls_verify: Option<bool>,
+    pub ca_cert: Option<String>,
 }
 
 pub fn ldap_config_view() -> LdapConfigView {
@@ -265,6 +279,9 @@ pub fn update_ldap_config(update: LdapConfigUpdate) -> LdapConfigView {
     }
     if let Some(v) = update.tls_verify {
         ldap.tls_verify = v;
+    }
+    if let Some(v) = update.ca_cert {
+        ldap.ca_cert = v.trim().to_owned();
     }
     let view = LdapConfigView::from(&*ldap);
     persist(&cfg);
@@ -600,6 +617,103 @@ fn now_iso8601() -> String {
 }
 
 // --------------------------------------------------------------------------
+// Certificate helpers (pin / fetch the directory's TLS certificate)
+// --------------------------------------------------------------------------
+
+/// Parse the first CERTIFICATE block out of a PEM blob into DER bytes.
+fn pem_to_der(pem: &str) -> Option<Vec<u8>> {
+    const BEGIN: &str = "-----BEGIN CERTIFICATE-----";
+    const END: &str = "-----END CERTIFICATE-----";
+    let start = pem.find(BEGIN)? + BEGIN.len();
+    let rest = &pem[start..];
+    let end = rest.find(END)?;
+    let b64: String = rest[..end].split_whitespace().collect();
+    base64::decode(b64).ok()
+}
+
+fn der_to_pem(der: &[u8]) -> String {
+    let b64 = base64::encode(der);
+    let mut out = String::from("-----BEGIN CERTIFICATE-----\n");
+    for chunk in b64.as_bytes().chunks(64) {
+        out.push_str(std::str::from_utf8(chunk).unwrap_or(""));
+        out.push('\n');
+    }
+    out.push_str("-----END CERTIFICATE-----\n");
+    out
+}
+
+fn cert_fingerprint(der: &[u8]) -> String {
+    let digest = sodiumoxide::crypto::hash::sha256::hash(der);
+    digest
+        .0
+        .iter()
+        .map(|b| format!("{:02X}", b))
+        .collect::<Vec<_>>()
+        .join(":")
+}
+
+/// SHA-256 fingerprint of the first cert in a PEM blob (empty if none/invalid).
+pub fn pem_fingerprint(pem: &str) -> String {
+    match pem_to_der(pem) {
+        Some(der) => cert_fingerprint(&der),
+        None => String::new(),
+    }
+}
+
+/// Split `ldaps://host:port` (or `ldap://…`) into (host, port).
+fn ldap_host_port(url: &str) -> Result<(String, u16), String> {
+    let u = url.trim();
+    let (default_port, rest) = if let Some(r) = u.strip_prefix("ldaps://") {
+        (636u16, r)
+    } else if let Some(r) = u.strip_prefix("ldap://") {
+        (389u16, r)
+    } else {
+        return Err("URL must start with ldaps:// or ldap://".to_owned());
+    };
+    let hostport = rest.split('/').next().unwrap_or(rest);
+    match hostport.rsplit_once(':') {
+        Some((h, p)) => {
+            let port = p.parse::<u16>().map_err(|_| "invalid port".to_owned())?;
+            Ok((h.to_owned(), port))
+        }
+        None => Ok((hostport.to_owned(), default_port)),
+    }
+}
+
+/// Connect to the directory's TLS port (accepting any cert) and return its
+/// certificate as PEM plus the SHA-256 fingerprint, so an admin can review and
+/// pin it. Blocking — call from a blocking context.
+#[cfg(feature = "nemo-ldap")]
+pub fn fetch_server_cert(server_url: &str) -> Result<(String, String), String> {
+    let (host, port) = ldap_host_port(server_url)?;
+    let connector = native_tls::TlsConnector::builder()
+        .danger_accept_invalid_certs(true)
+        .danger_accept_invalid_hostnames(true)
+        .build()
+        .map_err(|e| format!("TLS setup failed: {}", e))?;
+    let tcp = std::net::TcpStream::connect((host.as_str(), port))
+        .map_err(|e| format!("connect failed: {}", e))?;
+    tcp.set_read_timeout(Some(std::time::Duration::from_secs(8))).ok();
+    tcp.set_write_timeout(Some(std::time::Duration::from_secs(8))).ok();
+    let stream = connector
+        .connect(&host, tcp)
+        .map_err(|e| format!("TLS handshake failed: {}", e))?;
+    let cert = stream
+        .peer_certificate()
+        .map_err(|e| format!("could not read certificate: {}", e))?
+        .ok_or_else(|| "server presented no certificate".to_owned())?;
+    let der = cert
+        .to_der()
+        .map_err(|e| format!("certificate encode failed: {}", e))?;
+    Ok((der_to_pem(&der), cert_fingerprint(&der)))
+}
+
+#[cfg(not(feature = "nemo-ldap"))]
+pub fn fetch_server_cert(_server_url: &str) -> Result<(String, String), String> {
+    Err("LDAP support was not compiled in".to_owned())
+}
+
+// --------------------------------------------------------------------------
 // LDAP authentication
 // --------------------------------------------------------------------------
 
@@ -653,7 +767,26 @@ pub async fn authenticate_ldap(
         );
     }
 
-    let make_settings = || LdapConnSettings::new().set_no_tls_verify(!cfg.tls_verify);
+    // Build the TLS connector: trust a pinned cert if provided (verify against
+    // exactly that certificate — safe for a self-signed DC), or accept anything
+    // when verification is explicitly disabled.
+    let connector = {
+        let mut builder = native_tls::TlsConnector::builder();
+        if !cfg.tls_verify {
+            builder.danger_accept_invalid_certs(true);
+            builder.danger_accept_invalid_hostnames(true);
+        }
+        let ca = cfg.ca_cert.trim();
+        if !ca.is_empty() {
+            let cert = native_tls::Certificate::from_pem(ca.as_bytes())
+                .map_err(|e| format!("pinned certificate is invalid: {}", e))?;
+            builder.add_root_certificate(cert);
+        }
+        builder
+            .build()
+            .map_err(|e| format!("TLS setup failed: {}", e))?
+    };
+    let make_settings = || LdapConnSettings::new().set_connector(connector.clone());
 
     let mut dn = String::new();
     let mut attrs: HashMap<String, Vec<String>> = HashMap::new();

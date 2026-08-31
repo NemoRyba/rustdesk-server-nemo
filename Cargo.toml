@@ -20,7 +20,7 @@ nemo-management-api = []
 # LDAP (Windows-domain) login for the Nemo integration layer. Pulls in the
 # `ldap3` crate; disable with `--no-default-features` if it can't build on a
 # given target.
-nemo-ldap = ["ldap3"]
+nemo-ldap = ["ldap3", "native-tls"]
 # TLS termination for the Nemo management/login API so client credentials are
 # never sent in cleartext. Pulls in `axum-server` (rustls) and `rcgen` for
 # auto-generated self-signed certificates.
@@ -70,6 +70,9 @@ flate2 = "1.0"
 # ClientHello ("connection reset by peer"), whereas native TLS negotiates with
 # them cleanly. On Linux this needs libssl-dev + pkg-config at build time.
 ldap3 = { version = "0.11", optional = true }
+# Direct handle on the native-tls types (ldap3 already pulls this transitively)
+# so we can pin/trust the DC's self-signed certificate and fetch it for review.
+native-tls = { version = "0.2", optional = true }
 # TLS-terminating HTTP server + self-signed certificate generation for the Nemo
 # management/login API (encrypts client credentials in transit).
 axum-server = { version = "0.4", features = ["tls-rustls"], optional = true }

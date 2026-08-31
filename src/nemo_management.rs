@@ -522,6 +522,7 @@ pub(crate) async fn spawn_hbbs_api(
             get(get_ldap_config).put(put_ldap_config),
         )
         .route("/nemo/api/integration/ldap/test", post(test_ldap_login))
+        .route("/nemo/api/integration/ldap/fetch-cert", post(fetch_ldap_cert))
         .route(
             "/nemo/api/integration/permissions",
             get(get_permissions).put(put_permissions),
@@ -978,6 +979,56 @@ async fn test_ldap_login(
             email: None,
         })),
     }
+}
+
+#[derive(Serialize)]
+struct FetchCertResponse {
+    success: bool,
+    message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pem: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fingerprint: Option<String>,
+}
+
+// Connect to the configured directory and return its TLS certificate so the
+// admin can review the fingerprint and pin it (Trust) — the secure alternative
+// to disabling verification.
+async fn fetch_ldap_cert(
+    Extension(state): Extension<HbbsApiState>,
+    headers: HeaderMap,
+) -> ApiResult<FetchCertResponse> {
+    require_auth(&headers, &state.token)?;
+    let url = integration::ldap_config().server_url;
+    if url.trim().is_empty() {
+        return Ok(Json(FetchCertResponse {
+            success: false,
+            message: "Set and save the server URL first".to_owned(),
+            pem: None,
+            fingerprint: None,
+        }));
+    }
+    let result = tokio::task::spawn_blocking(move || integration::fetch_server_cert(&url)).await;
+    Ok(Json(match result {
+        Ok(Ok((pem, fp))) => FetchCertResponse {
+            success: true,
+            message: format!("Fetched certificate — SHA-256 {}", fp),
+            pem: Some(pem),
+            fingerprint: Some(fp),
+        },
+        Ok(Err(e)) => FetchCertResponse {
+            success: false,
+            message: e,
+            pem: None,
+            fingerprint: None,
+        },
+        Err(e) => FetchCertResponse {
+            success: false,
+            message: format!("fetch task failed: {}", e),
+            pem: None,
+            fingerprint: None,
+        },
+    }))
 }
 
 // ---- Dashboard: per-user permissions (RBAC) ----

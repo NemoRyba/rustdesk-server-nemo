@@ -763,6 +763,15 @@
                 <span style="display:block;font-size:12px;opacity:0.7;margin-top:3px;line-height:1.4;">On by default. With verification off, an attacker on the network can impersonate your domain controller and log in as any user without a password. Only turn this off for a known internal CA you cannot add to the server's trust store — and accept the MITM risk. The server URL must use <code>ldaps://</code>.</span>
               </span>
             </label>
+            <div class="fld">
+              <label title="Fetch the directory's TLS certificate and pin it, so you can keep verification ON and trust exactly that certificate — the secure way to accept a self-signed DC cert.">Directory certificate (pin a self-signed DC cert)</label>
+              <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
+                <button id="ldapFetchCert" type="button">Fetch &amp; pin certificate</button>
+                <button id="ldapClearCert" type="button">Clear</button>
+                <span id="ldapCertStatus" style="font-size:12px;"></span>
+              </div>
+              <span style="display:block;font-size:12px;opacity:0.7;margin-top:3px;line-height:1.4;">Fetches the cert from the server URL above so you can review its fingerprint and pin it. With a cert pinned you can keep <b>Verify TLS certificate ON</b> and it trusts exactly that certificate — far safer than turning verification off (which accepts any cert and is MITM-able).</span>
+            </div>
             <div style="display:flex;gap:10px;align-items:center;">
               <button id="ldapSave" class="primary">Save LDAP settings</button>
               <span id="ldapSaveMsg" style="font-size:12px;opacity:0.8;"></span>
@@ -949,6 +958,8 @@
     $("connAutoRefresh").addEventListener("change", startConnTimer);
     $("ldapSave").addEventListener("click", saveLdap);
     $("ldapTest").addEventListener("click", testLdap);
+    $("ldapFetchCert").addEventListener("click", fetchCert);
+    $("ldapClearCert").addEventListener("click", clearCert);
     $("gpSave").addEventListener("click", saveGlobalPolicy);
     $("permsSave").addEventListener("click", savePermissions);
     $("addUser").addEventListener("click", addUserRow);
@@ -1392,6 +1403,52 @@
       $("ldapBindPw").placeholder = c.bind_password_set ? "(unchanged — leave blank to keep)" : "";
       $("ldapFilter").value = c.user_search_filter || "";
       $("ldapTlsVerify").checked = !!c.tls_verify;
+      integ.ldapCaCert = null; // no pending change
+      renderCertStatus();
+    }
+
+    function renderCertStatus() {
+      const c = integ.ldap || {};
+      const el = $("ldapCertStatus");
+      if (integ.ldapCaCert === "") {
+        el.textContent = "will be cleared on Save";
+        el.className = "msg-err";
+      } else if (integ.ldapCaCert) {
+        el.textContent = "fetched — click Save to pin";
+        el.className = "msg-ok";
+      } else if (c.ca_cert_set) {
+        el.textContent = "pinned  SHA-256 " + (c.ca_cert_fingerprint || "");
+        el.className = "msg-ok";
+      } else {
+        el.textContent = "none pinned";
+        el.className = "";
+      }
+    }
+
+    async function fetchCert() {
+      setMsg("ldapCertStatus", "Fetching…");
+      // Fetch uses the SAVED server URL — save first if the field changed.
+      const typed = $("ldapServerUrl").value.trim();
+      if (typed && integ.ldap && typed !== integ.ldap.server_url) {
+        await saveLdap();
+      }
+      try {
+        const res = await api("/nemo/api/integration/ldap/fetch-cert", { method: "POST", body: JSON.stringify({}) });
+        if (res.success) {
+          integ.ldapCaCert = res.pem;
+          $("ldapCertStatus").textContent = "fetched  SHA-256 " + res.fingerprint + " — click Save to pin";
+          $("ldapCertStatus").className = "msg-ok";
+        } else {
+          setMsg("ldapCertStatus", "✗ " + res.message, false);
+        }
+      } catch (err) {
+        setMsg("ldapCertStatus", "✗ " + err.message, false);
+      }
+    }
+
+    function clearCert() {
+      integ.ldapCaCert = "";
+      renderCertStatus();
     }
 
     async function saveLdap() {
@@ -1406,6 +1463,7 @@
       };
       const pw = $("ldapBindPw").value;
       if (pw) body.bind_password = pw;
+      if (integ.ldapCaCert !== null && integ.ldapCaCert !== undefined) body.ca_cert = integ.ldapCaCert;
       try {
         integ.ldap = await api("/nemo/api/integration/ldap", { method: "PUT", body: JSON.stringify(body) });
         renderLdapForm();
