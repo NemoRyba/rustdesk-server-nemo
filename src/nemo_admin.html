@@ -721,10 +721,33 @@
           </label>
         </div>
       </section>
+      <section class="panel">
+        <div class="panel-head">
+          <h2 class="panel-title">Global client defaults</h2>
+        </div>
+        <div style="padding:12px 16px;display:flex;flex-direction:column;gap:12px;max-width:640px;">
+          <div style="font-size:12px;opacity:0.7;line-height:1.4;">Pushed to every TBFDesk client (including ones that register later) via signed managed policy. A per-peer policy overrides these.</div>
+          <div class="fld">
+            <label for="gpApiServer" title="Clients use this for login and the address book. Point it at this server's HTTPS API.">API server (api-server)</label>
+            <input id="gpApiServer" type="text" placeholder="https://192.168.0.176:21120">
+          </div>
+          <label style="display:flex;gap:10px;align-items:flex-start;cursor:pointer;">
+            <input id="gpInsecureTls" type="checkbox" style="margin-top:3px;">
+            <span>
+              <span style="font-weight:600;color:#d4380d;">Allow insecure TLS fallback (temporary)</span>
+              <span style="display:block;font-size:12px;opacity:0.75;margin-top:3px;line-height:1.4;">Lets clients accept the server's self-signed certificate (trust-on-first-use). <b>Weakens client TLS</b> and is only a stopgap until a CA-signed certificate is installed — see the TODO. Leave off once you deploy a trusted cert.</span>
+            </span>
+          </label>
+          <div style="display:flex;gap:10px;align-items:center;">
+            <button id="gpSave" class="primary">Save global defaults</button>
+            <span id="gpSaveMsg" style="font-size:12px;opacity:0.8;"></span>
+          </div>
+        </div>
+      </section>
     </div>
 
     <div id="view-integration" class="view" hidden>
-      <main>
+      <main style="flex-direction: column; align-items: stretch;">
         <section class="panel">
           <div class="panel-head">
             <h2 class="panel-title">LDAP / Active Directory login</h2>
@@ -796,30 +819,6 @@
               <button id="ldapTest">Test login</button>
             </div>
             <div id="ldapTestMsg" style="font-size:13px;"></div>
-          </div>
-        </section>
-
-        <section class="panel">
-          <div class="panel-head">
-            <h2 class="panel-title">Global client defaults</h2>
-          </div>
-          <div style="padding:12px 16px;display:flex;flex-direction:column;gap:12px;max-width:640px;">
-            <div style="font-size:12px;opacity:0.7;line-height:1.4;">Pushed to every Nemo client (including ones that register later) via signed managed policy. A per-peer policy overrides these.</div>
-            <div class="fld">
-              <label for="gpApiServer" title="Clients use this for login and the address book. Point it at this server's HTTPS API.">API server (api-server)</label>
-              <input id="gpApiServer" type="text" placeholder="https://192.168.0.176:21120">
-            </div>
-            <label style="display:flex;gap:10px;align-items:flex-start;cursor:pointer;">
-              <input id="gpInsecureTls" type="checkbox" style="margin-top:3px;">
-              <span>
-                <span style="font-weight:600;color:#d4380d;">Allow insecure TLS fallback (temporary)</span>
-                <span style="display:block;font-size:12px;opacity:0.75;margin-top:3px;line-height:1.4;">Lets clients accept the server's self-signed certificate (trust-on-first-use). <b>Weakens client TLS</b> and is only a stopgap until a CA-signed certificate is installed — see the TODO. Leave off once you deploy a trusted cert.</span>
-              </span>
-            </label>
-            <div style="display:flex;gap:10px;align-items:center;">
-              <button id="gpSave" class="primary">Save global defaults</button>
-              <span id="gpSaveMsg" style="font-size:12px;opacity:0.8;"></span>
-            </div>
           </div>
         </section>
 
@@ -966,6 +965,7 @@
         document.querySelectorAll(".navbtn").forEach((b) => b.classList.toggle("active", b === btn));
         document.querySelectorAll(".view").forEach((v) => { v.hidden = v.id !== "view-" + view; });
         if (view === "integration") loadIntegration();
+        if (view === "settings") refreshGlobalPolicy();
         if (view === "connections") { loadConnections(); startConnTimer(); } else { stopConnTimer(); }
       });
     });
@@ -1357,10 +1357,9 @@
 
     async function loadIntegration() {
       try {
-        const [ldap, perms, gp] = await Promise.all([
+        const [ldap, perms] = await Promise.all([
           api("/nemo/api/integration/ldap"),
-          api("/nemo/api/integration/permissions"),
-          api("/nemo/api/global-policy")
+          api("/nemo/api/integration/permissions")
         ]);
         integ.ldap = ldap;
         integ.perms = perms.permissions || {};
@@ -1368,12 +1367,21 @@
         integ.requireLogin = !!perms.require_login;
         integ.selectedPolicyUser = null;
         integ.peers = perms.peers || [];
-        integ.globalPolicy = gp && gp.options ? gp : { allow_user_override: false, options: {} };
         renderLdapForm();
         renderPerms();
-        renderGlobalPolicy();
       } catch (err) {
         setMsg("ldapSaveMsg", err.message, false);
+      }
+    }
+
+    // Global client defaults now live under the Settings tab.
+    async function refreshGlobalPolicy() {
+      try {
+        const gp = await api("/nemo/api/global-policy");
+        integ.globalPolicy = gp && gp.options ? gp : { allow_user_override: false, options: {} };
+        renderGlobalPolicy();
+      } catch (err) {
+        setMsg("gpSaveMsg", err.message, false);
       }
     }
 
