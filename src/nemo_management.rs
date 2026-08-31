@@ -988,7 +988,7 @@ struct FetchCertResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pem: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    fingerprint: Option<String>,
+    cert: Option<integration::CertSummary>,
 }
 
 // Connect to the configured directory and return its TLS certificate so the
@@ -1005,28 +1005,35 @@ async fn fetch_ldap_cert(
             success: false,
             message: "Set and save the server URL first".to_owned(),
             pem: None,
-            fingerprint: None,
+            cert: None,
         }));
     }
     let result = tokio::task::spawn_blocking(move || integration::fetch_server_cert(&url)).await;
     Ok(Json(match result {
-        Ok(Ok((pem, fp))) => FetchCertResponse {
+        Ok(Ok((pem, cert))) => FetchCertResponse {
             success: true,
-            message: format!("Fetched certificate — SHA-256 {}", fp),
+            message: format!(
+                "Fetched {} — review it, then Save to pin",
+                if cert.self_signed {
+                    "a self-signed certificate"
+                } else {
+                    "the certificate"
+                }
+            ),
             pem: Some(pem),
-            fingerprint: Some(fp),
+            cert: Some(cert),
         },
         Ok(Err(e)) => FetchCertResponse {
             success: false,
             message: e,
             pem: None,
-            fingerprint: None,
+            cert: None,
         },
         Err(e) => FetchCertResponse {
             success: false,
             message: format!("fetch task failed: {}", e),
             pem: None,
-            fingerprint: None,
+            cert: None,
         },
     }))
 }

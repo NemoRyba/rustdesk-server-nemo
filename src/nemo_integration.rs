@@ -201,6 +201,10 @@ pub struct LdapConfigView {
     pub ca_cert_set: bool,
     /// SHA-256 fingerprint of the pinned certificate (empty if none / unparsable).
     pub ca_cert_fingerprint: String,
+    /// Subject DN of the pinned certificate (e.g. `CN=dc`).
+    pub ca_cert_subject: String,
+    /// SAN domains of the pinned certificate (e.g. `dc`, `dc.tbfgmbh.local`).
+    pub ca_cert_sans: Vec<String>,
 }
 
 impl From<&LdapConfig> for LdapConfigView {
@@ -216,6 +220,14 @@ impl From<&LdapConfig> for LdapConfigView {
             tls_verify: c.tls_verify,
             ca_cert_set: !c.ca_cert.trim().is_empty(),
             ca_cert_fingerprint: pem_fingerprint(&c.ca_cert),
+            ca_cert_subject: {
+                let (subject, _) = pem_cert_summary(&c.ca_cert);
+                subject
+            },
+            ca_cert_sans: {
+                let (_, sans) = pem_cert_summary(&c.ca_cert);
+                sans
+            },
         }
     }
 }
@@ -660,6 +672,76 @@ pub fn pem_fingerprint(pem: &str) -> String {
     }
 }
 
+/// Human-readable summary of an X.509 certificate.
+#[derive(Clone, Debug, Serialize, Default)]
+pub struct CertSummary {
+    pub subject: String,
+    pub issuer: String,
+    pub sans: Vec<String>,
+    pub not_before: String,
+    pub not_after: String,
+    pub self_signed: bool,
+    pub fingerprint: String,
+}
+
+#[cfg(feature = "nemo-ldap")]
+fn fmt_ip(b: &[u8]) -> String {
+    match b.len() {
+        4 => format!("{}.{}.{}.{}", b[0], b[1], b[2], b[3]),
+        16 => (0..16)
+            .step_by(2)
+            .map(|i| format!("{:02x}{:02x}", b[i], b[i + 1]))
+            .collect::<Vec<_>>()
+            .join(":"),
+        _ => String::new(),
+    }
+}
+
+/// Parse a DER certificate into a display summary (subject / issuer / SAN
+/// domains / validity). Returns None if the parser is not compiled in or the
+/// certificate cannot be parsed.
+#[cfg(feature = "nemo-ldap")]
+fn parse_cert_der(der: &[u8]) -> Option<CertSummary> {
+    use x509_parser::prelude::*;
+    let (_, cert) = X509Certificate::from_der(der).ok()?;
+    let subject = cert.subject().to_string();
+    let issuer = cert.issuer().to_string();
+    let mut sans = Vec::new();
+    for ext in cert.extensions() {
+        if let ParsedExtension::SubjectAlternativeName(san) = ext.parsed_extension() {
+            for gn in &san.general_names {
+                match gn {
+                    GeneralName::DNSName(d) => sans.push(d.to_string()),
+                    GeneralName::IPAddress(ip) => sans.push(fmt_ip(ip)),
+                    _ => {}
+                }
+            }
+        }
+    }
+    Some(CertSummary {
+        self_signed: subject == issuer,
+        subject,
+        issuer,
+        sans,
+        not_before: cert.validity().not_before.to_string(),
+        not_after: cert.validity().not_after.to_string(),
+        fingerprint: cert_fingerprint(der),
+    })
+}
+
+#[cfg(not(feature = "nemo-ldap"))]
+fn parse_cert_der(_der: &[u8]) -> Option<CertSummary> {
+    None
+}
+
+/// Subject + SAN domains of the first cert in a PEM blob (for config views).
+pub fn pem_cert_summary(pem: &str) -> (String, Vec<String>) {
+    match pem_to_der(pem).and_then(|der| parse_cert_der(&der)) {
+        Some(s) => (s.subject, s.sans),
+        None => (String::new(), Vec::new()),
+    }
+}
+
 /// Split `ldaps://host:port` (or `ldap://…`) into (host, port).
 fn ldap_host_port(url: &str) -> Result<(String, u16), String> {
     let u = url.trim();
@@ -684,7 +766,7 @@ fn ldap_host_port(url: &str) -> Result<(String, u16), String> {
 /// certificate as PEM plus the SHA-256 fingerprint, so an admin can review and
 /// pin it. Blocking — call from a blocking context.
 #[cfg(feature = "nemo-ldap")]
-pub fn fetch_server_cert(server_url: &str) -> Result<(String, String), String> {
+pub fn fetch_server_cert(server_url: &str) -> Result<(String, CertSummary), String> {
     let (host, port) = ldap_host_port(server_url)?;
     let connector = native_tls::TlsConnector::builder()
         .danger_accept_invalid_certs(true)
@@ -705,11 +787,15 @@ pub fn fetch_server_cert(server_url: &str) -> Result<(String, String), String> {
     let der = cert
         .to_der()
         .map_err(|e| format!("certificate encode failed: {}", e))?;
-    Ok((der_to_pem(&der), cert_fingerprint(&der)))
+    let summary = parse_cert_der(&der).unwrap_or(CertSummary {
+        fingerprint: cert_fingerprint(&der),
+        ..Default::default()
+    });
+    Ok((der_to_pem(&der), summary))
 }
 
 #[cfg(not(feature = "nemo-ldap"))]
-pub fn fetch_server_cert(_server_url: &str) -> Result<(String, String), String> {
+pub fn fetch_server_cert(_server_url: &str) -> Result<(String, CertSummary), String> {
     Err("LDAP support was not compiled in".to_owned())
 }
 

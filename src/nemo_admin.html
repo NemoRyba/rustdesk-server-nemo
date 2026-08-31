@@ -1404,30 +1404,42 @@
       $("ldapFilter").value = c.user_search_filter || "";
       $("ldapTlsVerify").checked = !!c.tls_verify;
       integ.ldapCaCert = null; // no pending change
+      integ.ldapCaCertInfo = null;
       renderCertStatus();
+    }
+
+    function certDetailsHtml(info, label) {
+      if (!info) return "";
+      const sans = (info.sans && info.sans.length) ? info.sans.join(", ") : "—";
+      const validity = (info.not_before || info.not_after) ? `${escapeHtml(info.not_before || "?")} → ${escapeHtml(info.not_after || "?")}` : "";
+      return `<div style="margin-top:4px;font-size:12px;line-height:1.5;">
+        <div><b>${escapeHtml(label)}</b>${info.self_signed ? ' <span class="msg-err">(self-signed)</span>' : ''}</div>
+        <div>Subject: <code>${escapeHtml(info.subject || "?")}</code></div>
+        <div>Issuer: <code>${escapeHtml(info.issuer || "?")}</code></div>
+        <div>Domains (SAN): <code>${escapeHtml(sans)}</code></div>
+        ${validity ? `<div>Valid: ${validity}</div>` : ''}
+        <div>SHA-256: <code style="font-size:11px;">${escapeHtml(info.fingerprint || "")}</code></div>
+      </div>`;
     }
 
     function renderCertStatus() {
       const c = integ.ldap || {};
       const el = $("ldapCertStatus");
       if (integ.ldapCaCert === "") {
-        el.textContent = "will be cleared on Save";
-        el.className = "msg-err";
-      } else if (integ.ldapCaCert) {
-        el.textContent = "fetched — click Save to pin";
-        el.className = "msg-ok";
+        el.innerHTML = '<span class="msg-err">will be cleared on Save</span>';
+      } else if (integ.ldapCaCert && integ.ldapCaCertInfo) {
+        el.innerHTML = '<span class="msg-ok">fetched — click Save to pin</span>' + certDetailsHtml(integ.ldapCaCertInfo, "Certificate to pin");
       } else if (c.ca_cert_set) {
-        el.textContent = "pinned  SHA-256 " + (c.ca_cert_fingerprint || "");
-        el.className = "msg-ok";
+        const info = { subject: c.ca_cert_subject, issuer: "", sans: c.ca_cert_sans, fingerprint: c.ca_cert_fingerprint, self_signed: false };
+        el.innerHTML = '<span class="msg-ok">pinned ✓ (verification trusts exactly this certificate)</span>' + certDetailsHtml(info, "Pinned certificate");
       } else {
-        el.textContent = "none pinned";
-        el.className = "";
+        el.innerHTML = '<span style="opacity:0.6">none pinned — with "Verify TLS" on, a self-signed directory cert is rejected until you fetch &amp; save it</span>';
       }
     }
 
     async function fetchCert() {
-      setMsg("ldapCertStatus", "Fetching…");
-      // Fetch uses the SAVED server URL — save first if the field changed.
+      $("ldapCertStatus").innerHTML = "Fetching…";
+      // Fetch uses the SAVED server URL — save the URL first if the field changed.
       const typed = $("ldapServerUrl").value.trim();
       if (typed && integ.ldap && typed !== integ.ldap.server_url) {
         await saveLdap();
@@ -1435,10 +1447,12 @@
       try {
         const res = await api("/nemo/api/integration/ldap/fetch-cert", { method: "POST", body: JSON.stringify({}) });
         if (res.success) {
-          integ.ldapCaCert = res.pem;
-          $("ldapCertStatus").textContent = "fetched  SHA-256 " + res.fingerprint + " — click Save to pin";
-          $("ldapCertStatus").className = "msg-ok";
+          integ.ldapCaCert = res.pem;         // pending — NOT trusted until Save
+          integ.ldapCaCertInfo = res.cert;
+          renderCertStatus();
         } else {
+          integ.ldapCaCert = null;
+          integ.ldapCaCertInfo = null;
           setMsg("ldapCertStatus", "✗ " + res.message, false);
         }
       } catch (err) {
@@ -1448,6 +1462,7 @@
 
     function clearCert() {
       integ.ldapCaCert = "";
+      integ.ldapCaCertInfo = null;
       renderCertStatus();
     }
 
