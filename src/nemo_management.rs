@@ -13,11 +13,11 @@ use axum::{
 use hbb_common::{bail, config::keys, log, tokio, ResultType};
 use once_cell::sync::Lazy;
 use serde_derive::{Deserialize, Serialize};
-use sodiumoxide::crypto::sign;
+use sodiumoxide::crypto::{box_, sealedbox, sign};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     net::SocketAddr,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use tokio::sync::RwLock;
 
@@ -87,9 +87,11 @@ const CLIENT_MANAGEMENT_POLICY_KEYS: &[&str] = &[
     "enable-perm-change-in-accept-window",
     "allow-remote-config-modification",
     "allow-numeric-one-time-password",
+    "one-way-file-transfer",
     "nemo-permanent-password",
     "nemo-alias",
     "nemo-require-login",
+    "nemo-require-encrypted-session",
     "nemo-logged-in-user",
     OPTION_NEMO_OUTBOUND_ENABLED,
     OPTION_NEMO_OUTBOUND_TARGETS,
@@ -202,12 +204,66 @@ const CLIENT_MANAGEMENT_POLICY_KEYS: &[&str] = &[
 ];
 
 static COMPANY_ONLY: AtomicBool = AtomicBool::new(false);
+// Admin-configurable number of recent connection negotiations retained for the
+// live "Connections" view (retained by COUNT, no time cutoff). Loaded from disk
+// at startup so a dashboard change survives a restart.
+static CONN_HISTORY_LIMIT: AtomicUsize = AtomicUsize::new(DEFAULT_CONN_HISTORY_LIMIT);
+// Admin-configurable number of recent server events (logins, connection setups,
+// policy changes) retained for the Log view. Persisted so it survives a restart.
+static LOG_HISTORY_LIMIT: AtomicUsize = AtomicUsize::new(DEFAULT_LOG_HISTORY_LIMIT);
 // Transport posture captured when the API starts, so the runtime LDAP-enable
 // guard (put_ldap_config) can refuse to turn LDAP on when credentials would then
 // traverse the network in cleartext.
 static API_TLS_ACTIVE: AtomicBool = AtomicBool::new(false);
 static API_BIND_LOOPBACK: AtomicBool = AtomicBool::new(true);
 static API_ALLOW_INSECURE: AtomicBool = AtomicBool::new(false);
+// Summary of the certificate the API is actually serving, captured at TLS setup
+// so the client login screen can show "what am I connecting to and why does my
+// OS distrust it". Purely informational: a client reads it over the same (maybe
+// self-signed) TLS, so it is a diagnostic aid, NOT an authenticated pin — the
+// credential is protected by the Ed25519-signed sealed login, not by this.
+static API_CERT_INFO: Lazy<std::sync::RwLock<Option<TlsCertInfo>>> =
+    Lazy::new(|| std::sync::RwLock::new(None));
+
+// What the login screen shows about the API's serving certificate.
+#[derive(Clone, Debug, Serialize, Default)]
+struct TlsCertInfo {
+    tls: bool,           // is the API served over TLS at all
+    mode: String,        // "self-signed" | "provided" | "off"
+    subject: String,
+    issuer: String,
+    self_signed: bool,
+    sans: Vec<String>,
+    not_before: String,
+    not_after: String,
+    fingerprint: String, // SHA-256, uppercase colon-separated (matches openssl)
+    server_host: String, // hostname the self-signed SANs were built from
+    pem: String,         // the serving certificate in PEM, so a client can save/pin it
+}
+
+// Parse the PEM the API is serving and stash a client-facing summary. Best
+// effort: on any parse failure we still record tls=true + mode so the login
+// screen can explain the situation rather than showing nothing.
+fn set_api_cert_info(pem: &str, provided: bool) {
+    let mode = if provided { "provided" } else { "self-signed" };
+    let mut info = TlsCertInfo {
+        tls: true,
+        mode: mode.to_owned(),
+        server_host: whoami::hostname(),
+        pem: pem.to_owned(),
+        ..Default::default()
+    };
+    if let Some(s) = crate::nemo_integration::pem_cert_full_summary(pem) {
+        info.subject = s.subject;
+        info.issuer = s.issuer;
+        info.self_signed = s.self_signed;
+        info.sans = s.sans;
+        info.not_before = s.not_before;
+        info.not_after = s.not_after;
+        info.fingerprint = s.fingerprint;
+    }
+    *API_CERT_INFO.write().unwrap() = Some(info);
+}
 // Global client policy merged into every peer's managed policy (per-peer options
 // win). Lets the operator push settings — api-server, TLS fallback, etc. — to
 // all Nemo clients at once, including peers that register later.
@@ -226,6 +282,13 @@ struct HbbsApiState {
     token: Option<String>,
     server_public_key: String,
     server_secret_key: Option<sign::SecretKey>,
+    // S-B: ephemeral X25519 keypair (per API run) for sealing the client login
+    // credential. The public half is published (signed) via /api/login-key; the
+    // client seals {username,password,ts} to it so the domain password is
+    // confidential regardless of TLS. Regenerated each restart — clients fetch the
+    // current key per login, so there is no staleness.
+    login_enc_pk: box_::PublicKey,
+    login_enc_sk: box_::SecretKey,
 }
 
 #[derive(Default)]
@@ -241,9 +304,14 @@ struct NemoStatsStore {
     connections: Vec<ConnectionRecord>,
 }
 
-// How long a connection stays in the live view after its last negotiation.
-const CONNECTION_TTL_SECS: u64 = 900;
-const MAX_CONNECTIONS: usize = 2000;
+// Connection history is retained by COUNT (the most-recent N negotiations), not
+// by age. The size is admin-configurable at runtime (persisted, see
+// CONN_HISTORY_LIMIT) with this default, and hard-capped so unauthenticated
+// punch traffic cannot exhaust memory.
+const DEFAULT_CONN_HISTORY_LIMIT: usize = 420;
+const MAX_CONN_HISTORY_LIMIT: usize = 100_000;
+const DEFAULT_LOG_HISTORY_LIMIT: usize = 500;
+const MAX_LOG_HISTORY_LIMIT: usize = 100_000;
 
 #[derive(Clone)]
 struct ConnectionRecord {
@@ -323,6 +391,10 @@ struct EventsQuery {
 #[derive(Deserialize)]
 struct PolicyRequest {
     company_only: Option<bool>,
+    #[serde(default)]
+    connection_history_limit: Option<usize>,
+    #[serde(default)]
+    log_history_limit: Option<usize>,
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -412,6 +484,8 @@ struct PolicyResponse {
     company_only: bool,
     blocked_status: i64,
     allowed_status: i64,
+    connection_history_limit: usize,
+    log_history_limit: usize,
 }
 
 #[derive(Serialize)]
@@ -471,6 +545,50 @@ fn persist_company_only(value: bool) {
     }
 }
 
+fn conn_history_limit_path() -> String {
+    get_arg_or(
+        "nemo-conn-history-file",
+        "nemo_conn_history_limit".to_owned(),
+    )
+}
+
+fn load_persisted_conn_history_limit() -> Option<usize> {
+    std::fs::read_to_string(conn_history_limit_path())
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .map(|n| n.clamp(1, MAX_CONN_HISTORY_LIMIT))
+}
+
+// Persist the connection-history size so a dashboard change survives a restart.
+fn persist_conn_history_limit(value: usize) {
+    let path = conn_history_limit_path();
+    if let Err(e) = std::fs::write(&path, value.to_string()) {
+        log::error!("failed to persist connection-history limit to {}: {}", path, e);
+    }
+}
+
+fn log_history_limit_path() -> String {
+    get_arg_or("nemo-log-history-file", "nemo_log_history_limit".to_owned())
+}
+
+fn load_persisted_log_history_limit() -> Option<usize> {
+    std::fs::read_to_string(log_history_limit_path())
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .map(|n| n.clamp(1, MAX_LOG_HISTORY_LIMIT))
+}
+
+fn persist_log_history_limit(value: usize) {
+    let path = log_history_limit_path();
+    if let Err(e) = std::fs::write(&path, value.to_string()) {
+        log::error!("failed to persist log-history limit to {}: {}", path, e);
+    }
+}
+
+fn log_history_limit() -> usize {
+    LOG_HISTORY_LIMIT.load(Ordering::SeqCst)
+}
+
 fn peer_hostnames_path() -> String {
     get_arg_or("nemo-peer-hostnames-file", "nemo_peer_hostnames.json".to_owned())
 }
@@ -524,9 +642,16 @@ pub(crate) fn init_from_args() {
     if let Some(persisted) = load_persisted_company_only() {
         COMPANY_ONLY.store(persisted, Ordering::SeqCst);
     }
+    if let Some(limit) = load_persisted_conn_history_limit() {
+        CONN_HISTORY_LIMIT.store(limit, Ordering::SeqCst);
+    }
+    if let Some(limit) = load_persisted_log_history_limit() {
+        LOG_HISTORY_LIMIT.store(limit, Ordering::SeqCst);
+    }
     log::info!(
-        "Nemo company-only policy: {}",
-        if company_only() { "enabled" } else { "disabled" }
+        "Nemo company-only policy: {}; connection history size: {}",
+        if company_only() { "enabled" } else { "disabled" },
+        conn_history_limit(),
     );
 }
 
@@ -552,11 +677,14 @@ pub(crate) async fn spawn_hbbs_api(
         );
     }
 
+    let (login_enc_pk, login_enc_sk) = box_::gen_keypair();
     let state = HbbsApiState {
         pm,
         token,
         server_public_key,
         server_secret_key,
+        login_enc_pk,
+        login_enc_sk,
     };
     let app = Router::new()
         .route("/nemo", get(admin_gui))
@@ -592,12 +720,22 @@ pub(crate) async fn spawn_hbbs_api(
             get(get_permissions).put(put_permissions),
         )
         .route(
+            "/nemo/api/policies",
+            get(get_policies).put(put_policies),
+        )
+        .route("/nemo/api/policies/device", post(set_device_policy_route))
+        .route(
             "/nemo/api/global-policy",
             get(get_global_policy).put(put_global_policy),
         )
         .route("/nemo/api/connections", get(get_connections))
         .route("/nemo/api/connections/cut", post(cut_connection))
         // RustDesk-client-facing login + server-driven address book.
+        .route("/api/login-key", get(api_login_key).post(api_login_key))
+        .route(
+            "/api/tls-cert-info",
+            get(api_tls_cert_info).post(api_tls_cert_info),
+        )
         .route("/api/login", post(api_login))
         .route("/api/logout", post(api_logout))
         .route("/api/currentUser", post(api_current_user))
@@ -684,6 +822,9 @@ async fn resolve_rustls(
 ) -> ResultType<axum_server::tls_rustls::RustlsConfig> {
     use axum_server::tls_rustls::RustlsConfig;
     if !cert_path.is_empty() && !key_path.is_empty() {
+        if let Ok(pem) = std::fs::read_to_string(cert_path) {
+            set_api_cert_info(&pem, true);
+        }
         return Ok(RustlsConfig::from_pem_file(cert_path, key_path).await?);
     }
     let cert_file = get_arg_or("nemo-api-cert-file", "nemo-api-cert.pem".to_owned());
@@ -716,7 +857,22 @@ async fn resolve_rustls(
             log::warn!("could not restrict permissions on {}: {}", key_file, e);
         }
     }
+    if let Ok(pem) = std::fs::read_to_string(&cert_file) {
+        set_api_cert_info(&pem, false);
+    }
     Ok(RustlsConfig::from_pem_file(&cert_file, &key_file).await?)
+}
+
+// Client-facing: what certificate is the login screen looking at, and why might
+// the OS distrust it. Read over the same TLS, so it is a diagnostic — not proof
+// (the credential is protected by the signed sealed login, not by this).
+async fn api_tls_cert_info() -> Json<TlsCertInfo> {
+    let info = API_CERT_INFO.read().unwrap().clone();
+    Json(info.unwrap_or(TlsCertInfo {
+        tls: API_TLS_ACTIVE.load(Ordering::SeqCst),
+        mode: "off".to_owned(),
+        ..Default::default()
+    }))
 }
 
 async fn admin_gui() -> Html<&'static str> {
@@ -764,6 +920,37 @@ struct LoginRequest {
     username: String,
     #[serde(default)]
     password: String,
+    /// S-B: optional sealed credential — base64 of a NaCl sealedbox of
+    /// `{"username","password","ts"}` to the server's login-encryption key
+    /// (from /api/login-key). When present it supersedes the plaintext fields, so
+    /// the domain password is confidential regardless of TLS.
+    #[serde(default)]
+    sealed: Option<String>,
+    /// The TBFDesk ID of the client the user is signing in from (for logging).
+    #[serde(default)]
+    id: String,
+    /// The client's device uuid (for logging / auditing which machine signed in).
+    #[serde(default)]
+    uuid: String,
+}
+
+#[derive(Serialize)]
+struct LoginKeyResponse {
+    /// base64 of the server's X25519 login-encryption public key (raw; dev use).
+    key: String,
+    /// base64 of the Ed25519-signed (ATTACHED) key bytes. The client verifies this
+    /// with the management public key it already trusts and uses the recovered key,
+    /// so the login-encryption key is authenticated. Empty with no signing key.
+    signed_key: String,
+}
+
+// S-B: sealed login payload the client encrypts to `login_enc_pk`.
+#[derive(Deserialize)]
+struct SealedLogin {
+    username: String,
+    password: String,
+    #[serde(default)]
+    ts: u64,
 }
 
 #[derive(Serialize)]
@@ -799,12 +986,55 @@ impl LoginResult {
     }
 }
 
+// S-B: publish the server's login-encryption public key, signed by the server's
+// Ed25519 key so the client can verify it against the management public key it
+// already trusts before sealing the credential to it.
+async fn api_login_key(Extension(state): Extension<HbbsApiState>) -> Json<LoginKeyResponse> {
+    let pk_bytes: &[u8] = state.login_enc_pk.as_ref();
+    let key = base64::encode(pk_bytes);
+    let signed_key = match &state.server_secret_key {
+        Some(sk) => base64::encode(sign::sign(pk_bytes, sk)),
+        None => String::new(),
+    };
+    Json(LoginKeyResponse { key, signed_key })
+}
+
+// S-B: open a sealed login credential to (username, password). Fails closed on any
+// decode/parse/replay error.
+fn decode_sealed_login(state: &HbbsApiState, sealed_b64: &str) -> Result<(String, String), String> {
+    let ciphertext =
+        base64::decode(sealed_b64.trim()).map_err(|_| "invalid sealed credential".to_owned())?;
+    let plain = sealedbox::open(&ciphertext, &state.login_enc_pk, &state.login_enc_sk)
+        .map_err(|_| "sealed credential could not be opened (stale login key? re-fetch /api/login-key)".to_owned())?;
+    let s: SealedLogin =
+        serde_json::from_slice(&plain).map_err(|_| "invalid sealed credential payload".to_owned())?;
+    // Replay guard: reject stale timestamps (allow modest clock skew). ts==0 skips
+    // the check (older clients) but still gets confidentiality.
+    if s.ts != 0 {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if now.saturating_sub(s.ts) > 300 || s.ts.saturating_sub(now) > 60 {
+            return Err("sealed credential expired; please retry".to_owned());
+        }
+    }
+    Ok((s.username.trim().to_owned(), s.password))
+}
+
 async fn api_login(
-    Extension(_state): Extension<HbbsApiState>,
+    Extension(state): Extension<HbbsApiState>,
     Json(req): Json<LoginRequest>,
 ) -> Json<LoginResult> {
-    let username = req.username.trim().to_owned();
-    let password = req.password;
+    // S-B: prefer a sealed credential (confidential regardless of TLS); fall back
+    // to plaintext fields for backward compatibility.
+    let (username, password) = match &req.sealed {
+        Some(sealed) if !sealed.trim().is_empty() => match decode_sealed_login(&state, sealed) {
+            Ok(v) => v,
+            Err(e) => return Json(LoginResult::err(e)),
+        },
+        _ => (req.username.trim().to_owned(), req.password.clone()),
+    };
     if username.is_empty() || password.is_empty() {
         return Json(LoginResult::err("Username and password required"));
     }
@@ -832,7 +1062,14 @@ async fn api_login(
                 user.display_name.clone(),
                 user.email.clone(),
             );
-            log::info!("Nemo login succeeded for {}", user.username);
+            log::info!(
+                "Nemo login OK: user='{}' name='{}' admin={} from client id={} uuid={}",
+                user.username,
+                user.display_name,
+                is_admin,
+                if req.id.trim().is_empty() { "?" } else { req.id.trim() },
+                if req.uuid.trim().is_empty() { "?" } else { req.uuid.trim() },
+            );
             Json(LoginResult {
                 access_token: Some(token),
                 kind: Some("access_token".to_owned()),
@@ -1234,6 +1471,7 @@ struct PermissionsResponse {
     permissions: HashMap<String, integration::UserPermission>,
     default_targets: Vec<String>,
     require_login: bool,
+    default_policy_name: Option<String>,
     peers: Vec<PeerBrief>,
 }
 
@@ -1265,6 +1503,7 @@ async fn get_permissions(
         permissions: integration::permissions_snapshot(),
         default_targets: integration::default_targets(),
         require_login: integration::require_login(),
+        default_policy_name: integration::default_policy_name(),
         peers: briefs,
     }))
 }
@@ -1276,6 +1515,66 @@ async fn put_permissions(
 ) -> ApiResult<HashMap<String, integration::UserPermission>> {
     require_auth(&headers, &state.token)?;
     Ok(Json(integration::update_permissions(update)))
+}
+
+// ---- Named policies (reusable templates assignable to users + devices) ----
+
+#[derive(Serialize)]
+struct PoliciesResponse {
+    policies: HashMap<String, integration::UserManagedPolicy>,
+    device_policies: HashMap<String, String>,
+}
+
+#[derive(Deserialize)]
+struct PoliciesUpdate {
+    #[serde(default)]
+    policies: HashMap<String, integration::UserManagedPolicy>,
+}
+
+#[derive(Deserialize)]
+struct DevicePolicyUpdate {
+    peer_id: String,
+    #[serde(default)]
+    policy_name: Option<String>,
+}
+
+fn policies_response() -> PoliciesResponse {
+    PoliciesResponse {
+        policies: integration::list_policies(),
+        device_policies: integration::list_device_policies(),
+    }
+}
+
+async fn get_policies(
+    Extension(state): Extension<HbbsApiState>,
+    headers: HeaderMap,
+) -> ApiResult<PoliciesResponse> {
+    require_auth(&headers, &state.token)?;
+    Ok(Json(policies_response()))
+}
+
+// Full replace of the named-policy DEFINITIONS. Device assignments and users'
+// policy_name references are left intact (dangling references fall back).
+async fn put_policies(
+    Extension(state): Extension<HbbsApiState>,
+    headers: HeaderMap,
+    Json(update): Json<PoliciesUpdate>,
+) -> ApiResult<PoliciesResponse> {
+    require_auth(&headers, &state.token)?;
+    integration::set_policies(update.policies);
+    Ok(Json(policies_response()))
+}
+
+// Set or clear ONE device -> named-policy assignment (from the Peers tab), so the
+// per-peer assignment never clobbers the whole map or the policy definitions.
+async fn set_device_policy_route(
+    Extension(state): Extension<HbbsApiState>,
+    headers: HeaderMap,
+    Json(update): Json<DevicePolicyUpdate>,
+) -> ApiResult<PoliciesResponse> {
+    require_auth(&headers, &state.token)?;
+    integration::set_device_policy(update.peer_id.trim(), update.policy_name.as_deref());
+    Ok(Json(policies_response()))
 }
 
 // ---- Global client policy (pushed to every client) ----
@@ -1371,7 +1670,6 @@ async fn get_connections(
     let mut connections: Vec<ConnectionResponse> = store
         .connections
         .iter()
-        .filter(|c| now.duration_since(c.last_seen).as_secs() < CONNECTION_TTL_SECS)
         .map(|c| ConnectionResponse {
             source_id: c.source_id.clone(),
             target_id: c.target_id.clone(),
@@ -1436,6 +1734,15 @@ pub(crate) fn company_only() -> bool {
     COMPANY_ONLY.load(Ordering::SeqCst)
 }
 
+fn conn_history_limit() -> usize {
+    CONN_HISTORY_LIMIT.load(Ordering::SeqCst)
+}
+
+#[cfg(test)]
+pub(crate) fn set_conn_history_limit_for_test(value: usize) {
+    CONN_HISTORY_LIMIT.store(value, Ordering::SeqCst);
+}
+
 /// Test-only setter for the process-global company-only flag, so cross-module
 /// tests (e.g. the rendezvous handler tests) can pin it deterministically.
 #[cfg(test)]
@@ -1445,6 +1752,24 @@ pub(crate) fn set_company_only_for_test(value: bool) {
 
 pub(crate) async fn is_peer_blocked(pm: &PeerMap, id: &str) -> bool {
     pm.is_peer_blocked(id).await
+}
+
+// Every currently-blocked TBFDesk ID, pushed to clients (#2) so a controlled
+// machine can reject incoming connections from a blocked source even if that
+// source bypasses the server. (Small deployments: a per-poll scan is fine; add a
+// bump-on-change cache if the peer table ever grows large.)
+async fn list_blocked_ids(pm: &PeerMap) -> Vec<String> {
+    match pm.list_registered(100_000, 0).await {
+        Ok(peers) => peers
+            .into_iter()
+            .filter(|p| matches!(p.status, Some(0)))
+            .map(|p| p.id)
+            .collect(),
+        Err(e) => {
+            log::error!("list_blocked_ids failed: {}", e);
+            Vec::new()
+        }
+    }
 }
 
 pub(crate) async fn is_peer_allowed(pm: &PeerMap, id: &str) -> bool {
@@ -1630,6 +1955,24 @@ pub(crate) async fn record_connection_negotiation(
     same_intranet: bool,
     relay_server: &str,
 ) {
+    // Verbose audit line: the server sees connection SETUP (punch/relay) even for
+    // direct sessions, so this records who connected to which machine, over what
+    // path — visible in the server log regardless of whether the session is direct.
+    log::info!(
+        "Nemo connect: target={} source='{}' from={} to={} nat={} path={}",
+        id,
+        source_field,
+        from_addr,
+        to_addr,
+        nat_type_name(nat_type),
+        if forced_relay {
+            "relay"
+        } else if same_intranet {
+            "direct-local"
+        } else {
+            "direct-punch"
+        },
+    );
     let mut store = STATS.write().await;
     store.totals.direct_attempts += 1;
     if forced_relay {
@@ -1705,11 +2048,6 @@ fn upsert_connection(
     nat_type: &str,
 ) {
     let now = std::time::Instant::now();
-    // Drop stale entries and cap the vector so unauthenticated punch traffic
-    // cannot grow it without bound (mirrors the S7 stats/PUNCH_REQS caps).
-    store
-        .connections
-        .retain(|c| now.duration_since(c.last_seen).as_secs() < CONNECTION_TTL_SECS);
     if let Some(existing) = store
         .connections
         .iter_mut()
@@ -1735,15 +2073,20 @@ fn upsert_connection(
             last_seen: now,
             negotiations: 1,
         });
-        if store.connections.len() > MAX_CONNECTIONS {
-            // Remove the oldest by last_seen.
-            if let Some((idx, _)) = store
+        // Retain only the most-recent N (configurable, no time cutoff); trim in a
+        // loop so a lowered limit takes effect promptly. Oldest by last_seen goes.
+        let limit = conn_history_limit();
+        while store.connections.len() > limit {
+            match store
                 .connections
                 .iter()
                 .enumerate()
                 .min_by_key(|(_, c)| c.last_seen)
             {
-                store.connections.remove(idx);
+                Some((idx, _)) => {
+                    store.connections.remove(idx);
+                }
+                None => break,
             }
         }
     }
@@ -1986,12 +2329,41 @@ async fn client_policy(
             let peer_policy = management_policy_from_peer(&peer.management_policy);
             policy.allow_user_override = policy.allow_user_override || peer_policy.allow_user_override;
             policy.options.extend(peer_policy.options);
-            if require_login {
-                policy
-                    .options
-                    .insert("nemo-require-login".to_owned(), "Y".to_owned());
+            // A named policy assigned to this device wins over its inline policy.
+            if let Some(dp) = integration::device_policy(&peer.id) {
+                policy.allow_user_override = policy.allow_user_override || dp.allow_user_override;
+                policy.options.extend(dp.options);
             }
         }
+    }
+    // Always report the current require-login state, on BOTH the logged-in and
+    // no-user paths, so the client's login gate is reliable. The client only gates
+    // when NOT signed in, so sending Y to a signed-in client is harmless; but if we
+    // omit it while signed in (as before), the client clears its persisted flag and
+    // the gate fails to re-trigger after logoff until the next poll. The stale-heal
+    // still keys on `nemo-logged-in-user` (server_saw_user), not on this flag.
+    if require_login {
+        policy
+            .options
+            .insert("nemo-require-login".to_owned(), "Y".to_owned());
+    } else {
+        policy.options.remove("nemo-require-login");
+    }
+    // #3-push: current address-book/access version. The client compares it to the
+    // last value it saw and re-fetches its address book when it changes, so ACL
+    // edits reach a logged-in client on its next signed poll (no extra channel).
+    policy.options.insert(
+        "nemo-ab-version".to_owned(),
+        integration::ab_version().to_string(),
+    );
+    // #2: the set of blocked TBFDesk IDs, pushed (signed) so a controlled machine
+    // rejects INCOMING connections from a blocked source even if that source runs a
+    // modified client and connects directly, bypassing the server's punch gate.
+    let blocked = list_blocked_ids(&state.pm).await;
+    if !blocked.is_empty() {
+        policy
+            .options
+            .insert("nemo-blocked-ids".to_owned(), blocked.join(","));
     }
     if matches!(peer.status, Some(0)) {
         policy.allow_user_override = false;
@@ -2088,6 +2460,49 @@ async fn update_policy(
             format!("company_only={}", company_only),
         );
     }
+    if let Some(limit) = request.connection_history_limit {
+        let limit = limit.clamp(1, MAX_CONN_HISTORY_LIMIT);
+        CONN_HISTORY_LIMIT.store(limit, Ordering::SeqCst);
+        persist_conn_history_limit(limit);
+        let mut store = STATS.write().await;
+        // Apply immediately: trim existing history down to the new limit.
+        while store.connections.len() > limit {
+            match store
+                .connections
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, c)| c.last_seen)
+            {
+                Some((idx, _)) => {
+                    store.connections.remove(idx);
+                }
+                None => break,
+            }
+        }
+        record_event_locked(
+            &mut store,
+            "policy-update",
+            None,
+            None,
+            format!("connection_history_limit={}", limit),
+        );
+    }
+    if let Some(limit) = request.log_history_limit {
+        let limit = limit.clamp(1, MAX_LOG_HISTORY_LIMIT);
+        LOG_HISTORY_LIMIT.store(limit, Ordering::SeqCst);
+        persist_log_history_limit(limit);
+        let mut store = STATS.write().await;
+        while store.events.len() > limit {
+            store.events.pop_front();
+        }
+        record_event_locked(
+            &mut store,
+            "policy-update",
+            None,
+            None,
+            format!("log_history_limit={}", limit),
+        );
+    }
     Ok(Json(policy_response()))
 }
 
@@ -2119,7 +2534,7 @@ async fn get_events(
     Query(query): Query<EventsQuery>,
 ) -> ApiResult<EventsResponse> {
     require_auth(&headers, &state.token)?;
-    let limit = query.limit.unwrap_or(100).clamp(1, EVENT_LIMIT);
+    let limit = query.limit.unwrap_or(100).clamp(1, MAX_LOG_HISTORY_LIMIT);
     let store = STATS.read().await;
     let events = store
         .events
@@ -2229,6 +2644,8 @@ fn policy_response() -> PolicyResponse {
         company_only: company_only(),
         blocked_status: 0,
         allowed_status: 1,
+        connection_history_limit: conn_history_limit(),
+        log_history_limit: log_history_limit(),
     }
 }
 
@@ -2432,7 +2849,7 @@ fn record_event_locked(
         remote_addr: remote_addr.map(|addr| addr.to_string()),
         detail,
     });
-    while store.events.len() > EVENT_LIMIT {
+    while store.events.len() > log_history_limit() {
         store.events.pop_front();
     }
 }
@@ -2703,6 +3120,7 @@ mod tests {
             uuid: base64::encode([10u8, 20, 30]),
             policy_version: None,
             access_token: None,
+            hostname: None,
         };
         assert!(validate_client_policy_request(&peer, &ok).is_ok());
         // Empty id.
@@ -2711,6 +3129,7 @@ mod tests {
             uuid: base64::encode([10u8, 20, 30]),
             policy_version: None,
             access_token: None,
+            hostname: None,
         };
         assert_eq!(
             validate_client_policy_request(&peer, &no_id).unwrap_err().0,
@@ -2722,6 +3141,7 @@ mod tests {
             uuid: "!!!".to_owned(),
             policy_version: None,
             access_token: None,
+            hostname: None,
         };
         assert_eq!(
             validate_client_policy_request(&peer, &bad_b64).unwrap_err().0,
@@ -2733,6 +3153,7 @@ mod tests {
             uuid: base64::encode([99u8, 99, 99]),
             policy_version: None,
             access_token: None,
+            hostname: None,
         };
         assert_eq!(
             validate_client_policy_request(&peer, &mismatch).unwrap_err().0,
@@ -2759,6 +3180,26 @@ mod tests {
         // A different pair is a separate row.
         upsert_connection(&mut store, "src2", "tgt1", a, b, "direct-punch", "", "PORT_RESTRICTED");
         assert_eq!(store.connections.len(), 2);
+    }
+
+    // Retention is by COUNT (configurable), not by age: with a limit of 2, a third
+    // distinct connection evicts the oldest (there is no TTL cutoff any more).
+    #[test]
+    fn upsert_connection_caps_by_count_not_ttl() {
+        let saved = CONN_HISTORY_LIMIT.load(Ordering::SeqCst);
+        set_conn_history_limit_for_test(2);
+        let mut store = NemoStatsStore::default();
+        let a: SocketAddr = "192.168.0.102:4646".parse().unwrap();
+        let b: SocketAddr = "192.168.0.176:43739".parse().unwrap();
+        upsert_connection(&mut store, "s1", "t1", a, b, "direct-local", "", "ASYMMETRIC");
+        upsert_connection(&mut store, "s2", "t2", a, b, "direct-local", "", "ASYMMETRIC");
+        upsert_connection(&mut store, "s3", "t3", a, b, "direct-local", "", "ASYMMETRIC");
+        assert_eq!(store.connections.len(), 2);
+        // Oldest (t1) evicted; the two most recent remain.
+        assert!(!store.connections.iter().any(|c| c.target_id == "t1"));
+        assert!(store.connections.iter().any(|c| c.target_id == "t2"));
+        assert!(store.connections.iter().any(|c| c.target_id == "t3"));
+        set_conn_history_limit_for_test(saved);
     }
 
     // Grouped serial test for the functions that read the process-global

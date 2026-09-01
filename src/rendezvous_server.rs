@@ -1607,6 +1607,14 @@ mod tests {
     /// stub relay server, no signing key. `tx`'s receiver is dropped — the
     /// handler under test never sends on it.
     fn test_server(pm: PeerMap, mask: &str) -> RendezvousServer {
+        // Isolate handler tests from any PERSISTED integration state so they exercise
+        // the pure NAT/punch logic deterministically. Without this, a real
+        // nemo_integration.json with require_login=true (or company-only on) makes the
+        // RBAC/require-login gate return OFFLINE for the tokenless punches these tests
+        // send, before the NAT/existence logic under test is ever reached. Only these
+        // handler tests read these globals, so resetting them here is race-free.
+        crate::nemo_management::set_company_only_for_test(false);
+        crate::nemo_integration::set_require_login_for_test(false);
         let (tx, _rx) = mpsc::unbounded_channel::<Data>();
         let mut rs = RendezvousServer {
             tcp_punch: Arc::new(Mutex::new(HashMap::new())),

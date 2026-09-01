@@ -121,9 +121,14 @@ pub struct UserPermission {
     pub is_admin: bool,
     #[serde(default)]
     pub allowed_targets: Vec<String>,
-    /// Session permissions applied to the client this user logs into.
+    /// Session permissions applied to the client this user logs into. Used only
+    /// when `policy_name` is empty (inline/custom policy); otherwise the named
+    /// policy of that name is resolved from `IntegrationConfig::policies`.
     #[serde(default)]
     pub policy: UserManagedPolicy,
+    /// Name of an assigned named policy (empty/None = use the inline `policy`).
+    #[serde(default)]
+    pub policy_name: Option<String>,
     #[serde(default)]
     pub display_name: String,
     #[serde(default)]
@@ -139,6 +144,7 @@ impl Default for UserPermission {
             is_admin: false,
             allowed_targets: Vec::new(),
             policy: UserManagedPolicy::default(),
+            policy_name: None,
             display_name: String::new(),
             email: String::new(),
             last_login: String::new(),
@@ -162,6 +168,19 @@ pub struct IntegrationConfig {
     /// used at all, and the logged-in user's policy replaces the device policy.
     #[serde(default)]
     pub require_login: bool,
+    /// Named, reusable policy templates: policy name -> session settings. Assigned
+    /// to users (UserPermission::policy_name) and to devices (device_policies).
+    #[serde(default)]
+    pub policies: HashMap<String, UserManagedPolicy>,
+    /// Device-level assignment: peer id -> named policy. Applied to that peer's
+    /// incoming sessions when no user is logged in (user policy wins when logged in).
+    #[serde(default)]
+    pub device_policies: HashMap<String, String>,
+    /// Named policy applied to an enabled user who has NO policy of their own
+    /// (no assigned named policy and an empty inline policy). Lets the admin set
+    /// one baseline that auto-applies to newly-allowed users.
+    #[serde(default)]
+    pub default_policy_name: Option<String>,
 }
 
 impl Default for IntegrationConfig {
@@ -171,6 +190,9 @@ impl Default for IntegrationConfig {
             permissions: HashMap::new(),
             default_targets: Vec::new(),
             require_login: false,
+            policies: HashMap::new(),
+            device_policies: HashMap::new(),
+            default_policy_name: None,
         }
     }
 }
@@ -189,6 +211,18 @@ fn config_path() -> PathBuf {
 }
 
 static CONFIG: Lazy<Mutex<IntegrationConfig>> = Lazy::new(|| Mutex::new(load_config()));
+
+// Monotonic address-book / access version. Bumped whenever a change affects what
+// a logged-in user may see (their allowed targets), so clients can detect the
+// change on their next signed policy poll and re-fetch the address book — an
+// encrypted server push of ACL changes without a dedicated channel.
+static AB_VERSION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+pub fn ab_version() -> u64 {
+    AB_VERSION.load(std::sync::atomic::Ordering::Relaxed)
+}
+fn bump_ab_version() {
+    AB_VERSION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
 
 fn load_config() -> IntegrationConfig {
     let path = config_path();
@@ -359,6 +393,9 @@ pub struct PermissionsUpdate {
     pub default_targets: Option<Vec<String>>,
     #[serde(default)]
     pub require_login: Option<bool>,
+    /// Present = set the default policy (empty string clears it); absent = leave.
+    #[serde(default)]
+    pub default_policy_name: Option<String>,
 }
 
 /// Replace the RBAC map (and optionally the default targets / require-login),
@@ -380,8 +417,13 @@ pub fn update_permissions(update: PermissionsUpdate) -> HashMap<String, UserPerm
     if let Some(require) = update.require_login {
         cfg.require_login = require;
     }
+    if let Some(dn) = update.default_policy_name {
+        cfg.default_policy_name = if dn.trim().is_empty() { None } else { Some(dn) };
+    }
     let snapshot = cfg.permissions.clone();
     persist(&cfg);
+    drop(cfg);
+    bump_ab_version(); // signal logged-in clients to re-fetch their address book
     snapshot
 }
 
@@ -463,16 +505,92 @@ pub fn require_login() -> bool {
     CONFIG.lock().unwrap().require_login
 }
 
-/// The session policy configured for a user (empty if the user has none).
+/// Test-only override so handler tests can isolate the require-login gate from the
+/// persisted integration config (mirrors `nemo_management::set_company_only_for_test`).
+#[cfg(test)]
+pub(crate) fn set_require_login_for_test(value: bool) {
+    CONFIG.lock().unwrap().require_login = value;
+}
+
+/// The session policy configured for a user (empty if the user has none). When
+/// the user has an assigned named policy that still exists, it wins; otherwise
+/// the user's inline policy is used.
 pub fn user_policy(username: &str) -> UserManagedPolicy {
     let key = normalize_lookup_username(username);
-    CONFIG
-        .lock()
-        .unwrap()
-        .permissions
-        .get(&key)
-        .map(|p| p.policy.clone())
-        .unwrap_or_default()
+    let cfg = CONFIG.lock().unwrap();
+    match cfg.permissions.get(&key) {
+        Some(p) => {
+            if let Some(name) = p.policy_name.as_deref().filter(|n| !n.is_empty()) {
+                if let Some(named) = cfg.policies.get(name) {
+                    return named.clone();
+                }
+            }
+            // No policy of their own -> fall back to the admin's default policy
+            // for newly-allowed users, if one is set and still exists.
+            if p.policy.options.is_empty() {
+                if let Some(dn) = cfg.default_policy_name.as_deref().filter(|n| !n.is_empty()) {
+                    if let Some(named) = cfg.policies.get(dn) {
+                        return named.clone();
+                    }
+                }
+            }
+            p.policy.clone()
+        }
+        None => UserManagedPolicy::default(),
+    }
+}
+
+/// The admin's default policy name for users without their own policy.
+pub fn default_policy_name() -> Option<String> {
+    CONFIG.lock().unwrap().default_policy_name.clone()
+}
+
+/// The named policy assigned to a device (peer id), if any and it still exists.
+/// Applied to that peer's incoming sessions when no user is logged in.
+pub fn device_policy(peer_id: &str) -> Option<UserManagedPolicy> {
+    let cfg = CONFIG.lock().unwrap();
+    cfg.device_policies
+        .get(peer_id)
+        .and_then(|name| cfg.policies.get(name).cloned())
+}
+
+/// All named policies (name -> policy), for the dashboard editor.
+pub fn list_policies() -> HashMap<String, UserManagedPolicy> {
+    CONFIG.lock().unwrap().policies.clone()
+}
+
+/// Current device -> named-policy assignments, for the dashboard.
+pub fn list_device_policies() -> HashMap<String, String> {
+    CONFIG.lock().unwrap().device_policies.clone()
+}
+
+/// Replace the named-policy definitions (full replace, like permissions). Device
+/// assignments pointing at a now-deleted policy are pruned; a user's dangling
+/// `policy_name` simply falls back to its inline policy at resolve time.
+pub fn set_policies(policies: HashMap<String, UserManagedPolicy>) {
+    let mut cfg = CONFIG.lock().unwrap();
+    cfg.policies = policies;
+    let names: std::collections::HashSet<String> = cfg.policies.keys().cloned().collect();
+    cfg.device_policies.retain(|_, name| names.contains(name.as_str()));
+    persist(&cfg);
+}
+
+/// Set or clear a single device -> named-policy assignment. An empty/None name,
+/// or a name that does not exist, clears the assignment for that peer.
+pub fn set_device_policy(peer_id: &str, policy_name: Option<&str>) {
+    if peer_id.is_empty() {
+        return;
+    }
+    let mut cfg = CONFIG.lock().unwrap();
+    match policy_name.map(str::trim).filter(|n| !n.is_empty()) {
+        Some(name) if cfg.policies.contains_key(name) => {
+            cfg.device_policies.insert(peer_id.to_owned(), name.to_owned());
+        }
+        _ => {
+            cfg.device_policies.remove(peer_id);
+        }
+    }
+    persist(&cfg);
 }
 
 /// Whether a user is on the allowlist (enabled to use the software).
@@ -507,7 +625,7 @@ pub fn user_allowed_target(is_admin: bool, allowed_targets: &[String], target_id
 // config on every request via `effective_permission`, so an admin narrowing a
 // user's targets or demoting them takes effect immediately, and a deleted user
 // loses access at once (rather than lingering for the token TTL).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Session {
     pub username: String,
     pub display_name: String,
@@ -515,7 +633,39 @@ pub struct Session {
     pub expires_at: u64,
 }
 
-static SESSIONS: Lazy<Mutex<HashMap<String, Session>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+// Sessions are PERSISTED (not just in-memory) so a server restart — e.g. rebooting
+// a box that runs both hbbs and a controlled host — does NOT log every user out and
+// invalidate their tokens mid-work. Loaded (and pruned) at startup, rewritten on
+// create/remove/expiry.
+static SESSIONS: Lazy<Mutex<HashMap<String, Session>>> =
+    Lazy::new(|| Mutex::new(load_sessions()));
+
+fn sessions_path() -> PathBuf {
+    let arg = get_arg("nemo-sessions-file");
+    if arg.is_empty() {
+        PathBuf::from("nemo_sessions.json")
+    } else {
+        PathBuf::from(arg)
+    }
+}
+
+fn load_sessions() -> HashMap<String, Session> {
+    let mut sessions: HashMap<String, Session> = std::fs::read_to_string(sessions_path())
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default();
+    prune_sessions(&mut sessions);
+    sessions
+}
+
+fn persist_sessions(sessions: &HashMap<String, Session>) {
+    if let Ok(text) = serde_json::to_string(sessions) {
+        let path = sessions_path();
+        if let Err(err) = std::fs::write(&path, text) {
+            log::error!("failed to persist Nemo sessions to {}: {}", path.display(), err);
+        }
+    }
+}
 
 pub fn create_session(username: String, display_name: String, email: String) -> String {
     let token = uuid::Uuid::new_v4().simple().to_string();
@@ -528,6 +678,7 @@ pub fn create_session(username: String, display_name: String, email: String) -> 
     let mut sessions = SESSIONS.lock().unwrap();
     prune_sessions(&mut sessions);
     sessions.insert(token.clone(), session);
+    persist_sessions(&sessions);
     token
 }
 
@@ -555,6 +706,7 @@ pub fn session_for_token(token: &str) -> Option<Session> {
         Some(s) if s.expires_at > now => Some(s.clone()),
         Some(_) => {
             sessions.remove(token);
+            persist_sessions(&sessions);
             None
         }
         None => None,
@@ -562,7 +714,10 @@ pub fn session_for_token(token: &str) -> Option<Session> {
 }
 
 pub fn remove_session(token: &str) {
-    SESSIONS.lock().unwrap().remove(token.trim());
+    let mut sessions = SESSIONS.lock().unwrap();
+    if sessions.remove(token.trim()).is_some() {
+        persist_sessions(&sessions);
+    }
 }
 
 fn prune_sessions(sessions: &mut HashMap<String, Session>) {
@@ -846,6 +1001,13 @@ pub fn pem_cert_summary(pem: &str) -> (String, Vec<String>) {
     }
 }
 
+/// Full X.509 summary (subject/issuer/SANs/validity/SHA-256 fingerprint) of the
+/// first certificate in a PEM blob, for the client-facing TLS info view. Returns
+/// None when the PEM cannot be parsed or the x509 parser is not compiled in.
+pub fn pem_cert_full_summary(pem: &str) -> Option<CertSummary> {
+    pem_to_der(pem).and_then(|der| parse_cert_der(&der))
+}
+
 /// Split `ldaps://host:port` (or `ldap://…`) into (host, port).
 fn ldap_host_port(url: &str) -> Result<(String, u16), String> {
     let u = url.trim();
@@ -947,6 +1109,10 @@ pub struct DirectoryUser {
     pub username: String,
     pub display_name: String,
     pub email: String,
+    /// AD "category" fields, shown in the picker so a role search (e.g.
+    /// "techniker") makes clear why each user matched.
+    pub department: String,
+    pub title: String,
 }
 
 /// Search the directory for users matching `query` (empty = list users), using
@@ -996,7 +1162,14 @@ pub async fn search_ldap_users(
         .map_err(|e| format!("service bind rejected: {}", e))?;
 
     let filter = directory_search_filter(query);
-    let attr_list = vec!["sAMAccountName", "userPrincipalName", "displayName", "mail"];
+    let attr_list = vec![
+        "sAMAccountName",
+        "userPrincipalName",
+        "displayName",
+        "mail",
+        "department",
+        "title",
+    ];
     let search = ldap
         .search(base, Scope::Subtree, &filter, attr_list)
         .await
@@ -1016,6 +1189,8 @@ pub async fn search_ldap_users(
             username,
             display_name: first_attr(&se.attrs, "displayName"),
             email: first_attr(&se.attrs, "mail"),
+            department: first_attr(&se.attrs, "department"),
+            title: first_attr(&se.attrs, "title"),
         });
     }
     users.sort_by(|a, b| a.username.cmp(&b.username));
@@ -1024,21 +1199,78 @@ pub async fn search_ldap_users(
     Ok(users)
 }
 
-/// Build a directory search filter for people (not computer accounts). With a
-/// query, substring-match it (escaped) across the common name attributes.
+/// LDAP filter metacharacters escaped in a directory query value, but `*` is
+/// PRESERVED so the user can type wildcard patterns (regex-lite): `tech*`,
+/// `*iker`, `a*b`. Everything else that could break out of the assertion is
+/// still escaped, so the query cannot inject filter structure.
+#[cfg(feature = "nemo-ldap")]
+fn escape_filter_keep_wildcard(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for ch in input.chars() {
+        match ch {
+            '\\' => out.push_str("\\5c"),
+            '(' => out.push_str("\\28"),
+            ')' => out.push_str("\\29"),
+            '\0' => out.push_str("\\00"),
+            '/' => out.push_str("\\2f"),
+            '*' => out.push('*'), // keep as an LDAP wildcard
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+/// Attributes the directory picker matches a query against: identity + contact,
+/// plus the AD "category" fields (department/title/description/office/company)
+/// and group membership — so typing a role like "techniker" finds everyone whose
+/// department, title, description, or group contains it.
+#[cfg(feature = "nemo-ldap")]
+const DIRECTORY_SEARCH_ATTRS: &[&str] = &[
+    "sAMAccountName",
+    "userPrincipalName",
+    "displayName",
+    "cn",
+    "givenName",
+    "sn",
+    "mail",
+    "department",
+    "title",
+    "description",
+    "physicalDeliveryOfficeName",
+    "company",
+    "memberOf",
+];
+
+/// Baseline: normal, enabled human accounts only. Excludes disabled accounts
+/// (userAccountControl ACCOUNTDISABLE bit), built-in/critical system objects
+/// (krbtgt, Guest, system trust accounts…), and machine/trust accounts
+/// (sAMAccountName ending in `$`). AD-specific, matching the target directory.
+#[cfg(feature = "nemo-ldap")]
+const DIRECTORY_BASELINE: &str = "(objectCategory=person)(objectClass=user)\
+    (!(userAccountControl:1.2.840.113556.1.4.803:=2))\
+    (!(isCriticalSystemObject=TRUE))(!(sAMAccountName=*$))";
+
+/// Build a directory search filter. The baseline restricts to normal enabled
+/// users. Each whitespace-separated term in `query` must match (AND) somewhere
+/// across [`DIRECTORY_SEARCH_ATTRS`] (OR); a term keeps any `*` the user typed
+/// (wildcard), otherwise it is substring-matched. Empty query = list all.
 #[cfg(feature = "nemo-ldap")]
 fn directory_search_filter(query: &str) -> String {
     let q = query.trim();
     if q.is_empty() {
-        "(&(objectCategory=person)(objectClass=user))".to_owned()
-    } else {
-        let e = escape_filter(q);
-        format!(
-            "(&(objectCategory=person)(objectClass=user)(|(sAMAccountName=*{e}*)\
-             (displayName=*{e}*)(mail=*{e}*)(userPrincipalName=*{e}*)))",
-            e = e
-        )
+        return format!("(&{})", DIRECTORY_BASELINE);
     }
+    let mut terms = String::new();
+    for term in q.split_whitespace() {
+        let e = escape_filter_keep_wildcard(term);
+        let pat = if term.contains('*') { e } else { format!("*{}*", e) };
+        terms.push_str("(|");
+        for attr in DIRECTORY_SEARCH_ATTRS {
+            terms.push_str(&format!("({}={})", attr, pat));
+        }
+        terms.push(')');
+    }
+    format!("(&{}{})", DIRECTORY_BASELINE, terms)
 }
 
 /// Stub when the `nemo-ldap` feature is disabled at build time.
@@ -1222,6 +1454,46 @@ pub async fn authenticate_ldap(
 mod tests {
     use super::*;
 
+    // Named-policy resolution: an assigned named policy wins over a user's inline
+    // policy and provides the device policy; a dangling name falls back to inline.
+    // Mutates the process-global CONFIG directly (no disk write) with unique keys
+    // and cleans them up, so it does not disturb other tests.
+    #[test]
+    fn named_policy_wins_for_user_and_device() {
+        {
+            let mut cfg = CONFIG.lock().unwrap();
+            let mut opts = HashMap::new();
+            opts.insert("view_only".to_owned(), "Y".to_owned());
+            opts.insert("one-way-file-transfer".to_owned(), "Y".to_owned());
+            cfg.policies.insert(
+                "__test_pol".to_owned(),
+                UserManagedPolicy { allow_user_override: false, options: opts },
+            );
+            let mut up = UserPermission::default();
+            up.policy_name = Some("__test_pol".to_owned());
+            // Inline differs, to prove the named policy is the one resolved.
+            up.policy.options.insert("view_only".to_owned(), "N".to_owned());
+            cfg.permissions.insert("__testuser".to_owned(), up);
+            cfg.device_policies.insert("__testpeer".to_owned(), "__test_pol".to_owned());
+        }
+        // User: named policy wins over inline.
+        let up = user_policy("__testuser");
+        assert_eq!(up.options.get("view_only").map(String::as_str), Some("Y"));
+        assert_eq!(up.options.get("one-way-file-transfer").map(String::as_str), Some("Y"));
+        // Device: resolves the assigned named policy.
+        let dp = device_policy("__testpeer").expect("device policy resolved");
+        assert_eq!(dp.options.get("one-way-file-transfer").map(String::as_str), Some("Y"));
+        // Dangling name falls back to the inline policy.
+        CONFIG.lock().unwrap().policies.remove("__test_pol");
+        let up2 = user_policy("__testuser");
+        assert_eq!(up2.options.get("view_only").map(String::as_str), Some("N"));
+        assert!(device_policy("__testpeer").is_none());
+        // Cleanup.
+        let mut cfg = CONFIG.lock().unwrap();
+        cfg.permissions.remove("__testuser");
+        cfg.device_policies.remove("__testpeer");
+    }
+
     #[test]
     fn raw_username_strips_domain_decorations() {
         assert_eq!(raw_username("EXAMPLE\\jdoe"), "jdoe");
@@ -1244,6 +1516,38 @@ mod tests {
         assert_eq!(auth_principal("EXAMPLE\\jdoe", "x"), "EXAMPLE\\jdoe");
         // No domain configured => raw username.
         assert_eq!(auth_principal("jdoe", ""), "jdoe");
+    }
+
+    #[cfg(feature = "nemo-ldap")]
+    #[test]
+    fn directory_search_filter_categories_wildcards_and_baseline() {
+        // Empty query = baseline only (normal, enabled users), no match clause.
+        let all = directory_search_filter("");
+        assert!(all.contains("(!(userAccountControl:1.2.840.113556.1.4.803:=2))")); // not disabled
+        assert!(all.contains("(!(sAMAccountName=*$))")); // not machine/trust
+        assert!(all.contains("(!(isCriticalSystemObject=TRUE))")); // not system
+        assert!(!all.contains("(|")); // no per-term OR group when listing all
+
+        // A role term also matches the AD "category" attributes + groups.
+        let tech = directory_search_filter("techniker");
+        assert!(tech.contains(DIRECTORY_BASELINE));
+        assert!(tech.contains("(department=*techniker*)"));
+        assert!(tech.contains("(title=*techniker*)"));
+        assert!(tech.contains("(memberOf=*techniker*)"));
+
+        // Whitespace-separated terms are AND-ed (each its own OR group).
+        let two = directory_search_filter("tech wien");
+        assert_eq!(two.matches("(|").count(), 2);
+
+        // A user-typed wildcard is preserved verbatim (not re-wrapped).
+        let star = directory_search_filter("tech*");
+        assert!(star.contains("(title=tech*)"));
+        assert!(!star.contains("*tech*"));
+
+        // Injection can't break out: parens are escaped, not literal.
+        let inj = directory_search_filter("a)(uid=x");
+        assert!(!inj.contains("(uid=x)"));
+        assert!(inj.contains("\\29\\28")); // ")(" → escaped
     }
 
     #[test]

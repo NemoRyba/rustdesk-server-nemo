@@ -570,6 +570,8 @@
       color: #1668dc;
       border-bottom-color: #1668dc;
     }
+    .mainnav .navbtn.nav-dragging { opacity: 0.4; }
+    .mainnav .navbtn[draggable="true"] { cursor: grab; }
     .view[hidden] { display: none; }
     .mini-stats { font-size: 12px; font-weight: 500; color: #888; margin-left: 10px; }
     .mini-stats b { color: #333; font-weight: 700; }
@@ -580,29 +582,65 @@
     .view input[type="text"],
     .view input[type="password"] { padding: 6px 8px; border: 1px solid #d0d0d0; border-radius: 4px; font: inherit; }
     .integration-form code, code { background: #f0f0f0; padding: 1px 4px; border-radius: 3px; font-size: 12px; }
-    /* User-adjustable multi-column form layout (Settings + Integration). The
-       column count comes from --cols (set per-view by the "Columns" switcher and
-       persisted in localStorage). Wide/emphasis rows opt out with .span-all so
-       checkboxes, the certificate block and Save rows keep the full width. */
-    .col-grid { display: grid; grid-template-columns: repeat(var(--cols, 2), minmax(0, 1fr)); gap: 14px 24px; align-items: start; }
+    /* Snap-grid packing dashboard. A 12-column grid with a 1px row unit and dense
+       auto-flow, so panels tuck into gaps: two short panels stack beside one tall
+       panel, filling empty space instead of leaving a hole. Drag the header to
+       reorder; drag the right edge to snap width (½, ⅓, ¼…), the bottom edge or
+       corner for height. align-self:start keeps each panel content-sized; a
+       ResizeObserver sets each panel's row span from its measured height so the
+       packing stays exact as content, width, or the window changes. The extra 14
+       rows (=1px each) reserved below every panel are the vertical gap. Layout
+       (order + column span + locked height) persists per view in localStorage. */
+    .panel-board { display: grid; grid-template-columns: repeat(12, minmax(0, 1fr));
+      column-gap: 14px; row-gap: 0; grid-auto-rows: 1px; grid-auto-flow: row dense; align-items: start; }
+    .panel-board > .panel { position: relative; grid-column: span 12; align-self: start; min-width: 0; }
+    .panel-board > .panel > .panel-head { cursor: move; user-select: none; }
+    .panel-board > .panel > .panel-head .drag-dots { color: var(--muted); opacity: 0.55; margin-right: 8px; letter-spacing: -2px; }
+    .panel-board > .panel.dragging { opacity: 0.45; }
+    .panel-board > .panel.drop-before { box-shadow: -3px 0 0 0 var(--accent); }
+    .panel-board > .panel.drop-after { box-shadow: 3px 0 0 0 var(--accent); }
+    .panel-resize { position: absolute; top: 0; right: 0; width: 10px; height: 100%; cursor: ew-resize; z-index: 3; }
+    .panel-resize:hover { background: linear-gradient(to right, transparent, rgba(8,127,140,.18)); }
+    .panel-resize-v { position: absolute; left: 0; bottom: 0; height: 10px; width: 100%; cursor: ns-resize; z-index: 3; }
+    .panel-resize-v:hover { background: linear-gradient(to bottom, transparent, rgba(8,127,140,.18)); }
+    .panel-resize-c { position: absolute; right: 0; bottom: 0; width: 16px; height: 16px; cursor: nwse-resize; z-index: 4; }
+    .panel-resize-c::after { content: ""; position: absolute; right: 3px; bottom: 3px; width: 7px; height: 7px;
+      border-right: 2px solid var(--muted); border-bottom: 2px solid var(--muted); opacity: 0.5; }
+    .panel-resize-c:hover::after { opacity: 0.9; border-color: var(--accent); }
+    /* A height-locked panel (explicit height, from the bottom/corner handle) becomes
+       a flex column so its body scrolls inside the fixed box. Double-click the bottom
+       handle to release it back to auto (content) height. */
+    .panel-board > .panel.panel-sized { display: flex; flex-direction: column; overflow: hidden; }
+    .panel-board > .panel.panel-sized > .panel-head { flex: 0 0 auto; }
+    .panel-board > .panel.panel-sized > :not(.panel-head):not(.panel-resize):not(.panel-resize-v):not(.panel-resize-c) {
+      flex: 1 1 auto; overflow: auto; min-height: 0; }
+    .board-hint { padding: 12px 2px 10px; text-align: right; }
+    .board-hint button { min-height: 26px; padding: 3px 14px; font-size: 12px;
+      background: #c97e76; color: #fff; border: 1px solid #b56a62; border-radius: 4px; cursor: pointer; }
+    .board-hint button:hover { background: #b56a62; }
+    /* Content grids auto-reflow to the panel's width (no manual column count). */
+    .col-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px 24px; align-items: start; }
     .col-grid > .span-all { grid-column: 1 / -1; }
     .col-grid .fld > input, .col-grid .fld > select { width: 100%; }
-    @media (max-width: 760px) { .col-grid { grid-template-columns: 1fr; } }
-    /* Segmented "Columns: 1 2 3" switcher shown in a panel head. */
-    .col-switch { display: inline-flex; align-items: center; gap: 8px; font-size: 12px; color: var(--muted); font-weight: 500; }
-    .col-switch .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; }
-    .col-switch .seg button { min-height: 28px; padding: 3px 12px; border: 0; border-left: 1px solid var(--line); border-radius: 0; background: #fff; color: var(--text); font-size: 12px; line-height: 1; }
-    .col-switch .seg button:first-child { border-left: 0; }
-    .col-switch .seg button:hover { background: #eef3f4; }
-    .col-switch .seg button.active { background: var(--accent); color: #fff; }
     #permsBody td { padding: 6px 10px; vertical-align: top; }
     #permsBody select[multiple] { min-width: 240px; min-height: 68px; font: inherit; }
+    /* Selected (enabled) targets stay blue like the other active controls,
+       even when the list is not focused. The gradient forces the color past
+       the browser's default OS highlight. */
+    #permsBody select[multiple] option:checked {
+      background: #1a73e8 linear-gradient(0deg, #1a73e8 0%, #1a73e8 100%);
+      color: #fff;
+      font-weight: 600;
+    }
     #permsBody .perm-admin { text-align: center; }
     .user-policy-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 6px 18px; }
     .user-policy-grid .policy-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
     .user-policy-grid .policy-row label { font-size: 12px; }
     .user-policy-grid .policy-row select, .user-policy-grid .policy-row input { font: inherit; padding: 2px 6px; max-width: 130px; }
     .perm-policy { white-space: nowrap; }
+    .perm-clear-targets { border: 1px solid #ccc; background: #f5f5f5; border-radius: 4px; cursor: pointer; }
+    /* Highlighted (blue, like the checkboxes) when "no peers" is the active state. */
+    .perm-clear-targets.active { background: #1a73e8; color: #fff; border-color: #1a73e8; font-weight: 600; }
     .msg-ok { color: #2e9e5b; }
     .msg-err { color: #d4380d; }
     .conn-path { font-size: 12px; font-weight: 700; padding: 1px 8px; border-radius: 4px; color: #fff; }
@@ -628,10 +666,9 @@
 
     <nav class="mainnav" aria-label="Sections">
       <button class="navbtn active" data-view="peers">Peers</button>
-      <button class="navbtn" data-view="connections">Connections</button>
       <button class="navbtn" data-view="settings">Settings</button>
       <button class="navbtn" data-view="integration">Integration</button>
-      <button class="navbtn" data-view="acl">ACL</button>
+      <button class="navbtn" data-view="acl">ACL &amp; Policy</button>
       <button class="navbtn" data-view="log">Log</button>
     </nav>
 
@@ -664,7 +701,8 @@
                 <th title="The peer's RustDesk ID — the number you type to connect to this machine.">ID</th>
                 <th title="Friendly name (alias) for this machine, if set via its management policy.">Alias</th>
                 <th title="online = registered and seen within the last ~30s; otherwise offline.">State</th>
-                <th title="Admission decision: allowed (can be connected to), blocked (refused), or open/unapproved.">Policy</th>
+                <th title="Admission decision: allowed (can be connected to), blocked (refused), or open/unapproved.">Access</th>
+                <th title="The named policy applied to this device (session settings). A logged-in user's own policy overrides it. Assign it in the peer's detail panel or in ACL &amp; Policy.">Policy</th>
                 <th title="The network address the peer registered from, as the server sees it.">Registered IP</th>
                 <th title="The public IP:port the server hands out to other peers for hole punching to reach this machine.">Public<br>Addr</th>
                 <th title="How long ago the peer last checked in (registration heartbeat).">Seen</th>
@@ -691,8 +729,10 @@
     </main>
     </div>
 
-    <div id="view-connections" class="view" hidden>
-      <section class="panel">
+    <div id="view-log" class="view" hidden>
+      <div class="board-hint"><button type="button" data-board-reset>Reset layout</button></div>
+      <div class="panel-board">
+      <section class="panel" data-panel-id="connections">
         <div class="panel-head">
           <h2 class="panel-title">Connections <small class="mini-stats"><b id="mConnActive">0</b> active · <b id="mConnDirect">0</b> direct · <b id="mConnRelay">0</b> relay</small></h2>
           <div class="peer-tools">
@@ -700,7 +740,7 @@
             <button id="connRefresh">Refresh</button>
           </div>
         </div>
-        <div style="padding:6px 16px 0;font-size:12px;opacity:0.7;line-height:1.4;">Connections the server has negotiated recently (last 15 min), by path. <b>Direct</b> (direct-local / direct-punch) is the fast path; <b>relay</b> is the fallback. The server observes connection setup, not live byte flow — so a direct entry means a direct session was established, and entries age out rather than ending exactly when a session closes.</div>
+        <div style="padding:6px 16px 0;font-size:12px;opacity:0.7;line-height:1.4;">Connections the server has negotiated, most recent first, by path. <b>Direct</b> (direct-local / direct-punch) is the fast path; <b>relay</b> is the fallback. The server observes connection setup, not live byte flow — a direct entry means a direct session was established. History is kept by <b>count</b> (Settings → Connection history size), with no time cutoff.</div>
         <div class="table-wrap">
           <table>
             <thead>
@@ -717,24 +757,26 @@
             </thead>
             <tbody id="connections"></tbody>
           </table>
-          <div id="connEmpty" class="empty">No connections in the last 15 minutes</div>
+          <div id="connEmpty" class="empty">No connections recorded yet</div>
         </div>
       </section>
+      <section class="panel" data-panel-id="log">
+        <div class="panel-head">
+          <h2 class="panel-title">Log &mdash; Events</h2>
+        </div>
+        <div id="events" class="events empty">No events loaded</div>
+      </section>
+      </div>
     </div>
 
     <div id="view-settings" class="view" hidden>
-      <section class="panel">
+      <div class="board-hint"><button type="button" data-board-reset>Reset layout</button></div>
+      <div class="panel-board">
+      <section class="panel" data-panel-id="settings">
         <div class="panel-head">
           <h2 class="panel-title">Settings</h2>
-          <div class="col-switch" title="How many columns to lay the settings forms out in.">Columns
-            <span class="seg">
-              <button type="button" data-cols="1">1</button>
-              <button type="button" data-cols="2">2</button>
-              <button type="button" data-cols="3">3</button>
-            </span>
-          </div>
         </div>
-        <div class="settings-list" style="padding:10px 16px;">
+        <div class="col-grid" style="padding:12px 16px;">
           <label style="display:flex;gap:10px;align-items:flex-start;cursor:pointer;">
             <input id="companyOnly" type="checkbox" style="margin-top:3px;">
             <span>
@@ -742,9 +784,27 @@
               <span style="display:block;font-size:12px;opacity:0.7;margin-top:3px;line-height:1.4;">Only peers you have explicitly allowed can be connection targets. Open/unapproved peers are refused until you allow them.</span>
             </span>
           </label>
+          <div class="fld" style="max-width:460px;">
+            <label for="connHistoryLimit" style="font-weight:600;">Connection history size</label>
+            <div style="display:flex;gap:8px;align-items:center;margin-top:4px;">
+              <input id="connHistoryLimit" type="number" min="1" max="100000" step="1" style="width:130px;">
+              <button id="connHistorySave" class="primary">Save</button>
+              <span id="connHistoryMsg" style="font-size:12px;opacity:0.8;"></span>
+            </div>
+            <span style="display:block;font-size:12px;opacity:0.7;margin-top:3px;line-height:1.4;">How many recent connections the server keeps for the <b>Connections</b> view — most-recent first, <b>no time cutoff</b>. Oldest drop past this count (max 100000).</span>
+          </div>
+          <div class="fld" style="max-width:460px;">
+            <label for="logHistoryLimit" style="font-weight:600;">Log history size</label>
+            <div style="display:flex;gap:8px;align-items:center;margin-top:4px;">
+              <input id="logHistoryLimit" type="number" min="1" max="100000" step="1" style="width:130px;">
+              <button id="logHistorySave" class="primary">Save</button>
+              <span id="logHistoryMsg" style="font-size:12px;opacity:0.8;"></span>
+            </div>
+            <span style="display:block;font-size:12px;opacity:0.7;margin-top:3px;line-height:1.4;">How many recent server events (logins, connection setups, policy changes) the server keeps for the <b>Log</b> view. Oldest drop past this count (max 100000).</span>
+          </div>
         </div>
       </section>
-      <section class="panel">
+      <section class="panel" data-panel-id="global">
         <div class="panel-head">
           <h2 class="panel-title">Global client defaults</h2>
         </div>
@@ -767,20 +827,15 @@
           </div>
         </div>
       </section>
+      </div>
     </div>
 
     <div id="view-integration" class="view" hidden>
-      <main style="flex-direction: column; align-items: stretch;">
-        <section class="panel">
+      <div class="board-hint"><button type="button" data-board-reset>Reset layout</button></div>
+      <div class="panel-board">
+        <section class="panel" data-panel-id="ldap">
           <div class="panel-head">
             <h2 class="panel-title">LDAP / Active Directory login</h2>
-            <div class="col-switch" title="How many columns to lay these settings out in.">Columns
-              <span class="seg">
-                <button type="button" data-cols="1">1</button>
-                <button type="button" data-cols="2">2</button>
-                <button type="button" data-cols="3">3</button>
-              </span>
-            </div>
           </div>
           <div class="integration-form col-grid" style="padding:14px 16px;">
             <label class="span-all" style="display:flex;gap:10px;align-items:flex-start;cursor:pointer;">
@@ -837,7 +892,7 @@
           </div>
         </section>
 
-        <section class="panel">
+        <section class="panel" data-panel-id="testlogin">
           <div class="panel-head">
             <h2 class="panel-title">Test login</h2>
           </div>
@@ -852,14 +907,14 @@
           </div>
         </section>
 
-        <section class="panel">
+        <section class="panel" data-panel-id="directory">
           <div class="panel-head">
             <h2 class="panel-title">Directory users — select who may use TBFDesk</h2>
           </div>
           <div style="padding:12px 16px;display:flex;flex-direction:column;gap:12px;">
-            <div style="font-size:12px;opacity:0.75;line-height:1.4;max-width:900px;">Search your Windows domain and tick the users allowed to sign in to TBFDesk. Enabling a user adds them to the <b>ACL</b> tab, where you set which computers they may reach and their per-user policy. Only enabled users can log in (with <b>Require login</b> on). Browsing the directory needs a read-only <b>service account</b> — set a Bind DN + password in the LDAP settings above and Save first.</div>
+            <div style="font-size:12px;opacity:0.75;line-height:1.4;max-width:900px;">Search your Windows domain and tick the users allowed to sign in to TBFDesk. Enabling a user adds them to the <b>ACL</b> tab, where you set which computers they may reach and their per-user policy. Only enabled users can log in (with <b>Require login</b> on). Search by name, username, email, or <b>category</b> — job title, department, or group (e.g. type <code>techniker</code> to list everyone in that role). Wildcards work (<code>tech*</code>), and multiple words narrow the results (all must match). Disabled, system, and machine accounts are hidden. Browsing the directory needs a read-only <b>service account</b> — set a Bind DN + password in the LDAP settings above and Save first.</div>
             <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;">
-              <input id="ldapUserQuery" type="text" placeholder="search name or username (blank = list all)" style="flex:1;min-width:240px;">
+              <input id="ldapUserQuery" type="text" placeholder="name, username, email, or category e.g. techniker · wildcards ok (tech*) · space = AND · blank = list all" style="flex:1;min-width:240px;">
               <button id="ldapUserSearch" class="primary">Search directory</button>
               <span id="ldapUsersMsg" style="font-size:12px;opacity:0.8;"></span>
             </div>
@@ -871,7 +926,6 @@
                     <th title="The directory account (canonical sAMAccountName).">User</th>
                     <th title="Display name from the directory.">Name</th>
                     <th title="Email from the directory.">Email</th>
-                    <th></th>
                   </tr>
                 </thead>
                 <tbody id="ldapUsersBody"></tbody>
@@ -880,13 +934,15 @@
             </div>
           </div>
         </section>
-      </main>
+      </div>
     </div>
 
     <div id="view-acl" class="view" hidden>
-      <section class="panel">
+      <div class="board-hint"><button type="button" data-board-reset>Reset layout</button></div>
+      <div class="panel-board">
+      <section class="panel" data-panel-id="acl">
         <div class="panel-head">
-          <h2 class="panel-title">Access control <small class="mini-stats"><b id="mUsers">0</b> users</small></h2>
+          <h2 class="panel-title">Access Control &amp; Policy Assignment <small class="mini-stats"><b id="mUsers">0</b> users</small></h2>
         </div>
         <div style="padding:12px 16px;display:flex;flex-direction:column;gap:12px;">
             <label style="display:flex;gap:10px;align-items:flex-start;cursor:pointer;max-width:760px;">
@@ -903,6 +959,14 @@
                 <span style="display:block;font-size:12px;opacity:0.7;margin-top:3px;line-height:1.4;">Seeds a newly-enabled user's allowed targets with "all peers". They still must be Enabled to sign in.</span>
               </span>
             </label>
+          <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
+            <label for="defaultPolicySelect" style="font-weight:600;" title="Applied automatically to any enabled user who has no policy of their own. New users inherit this baseline unless you assign them a specific policy.">Default policy for new users:</label>
+            <select id="defaultPolicySelect" title="Applied automatically to any enabled user who has no policy of their own." style="min-width:200px;"></select>
+          </div>
+          <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
+            <input id="addUserName" type="text" placeholder="add username manually (sAMAccountName)" style="min-width:280px;">
+            <button id="addUser">Add user</button>
+          </div>
           <div style="font-size:12px;opacity:0.75;line-height:1.4;max-width:900px;">Add users in <b>Integration → Directory users</b>. Here you set which computers each may reach in <b>Allowed targets</b>, and what they can do in <b>Policy</b> (e.g. view-only, no file transfer). Untick <b>Enabled</b> to revoke access without deleting the row.</div>
           <div class="table-wrap">
             <table>
@@ -921,25 +985,33 @@
             </table>
             <div id="permsEmpty" class="empty">No users yet. Add them in Integration → Directory users, or type one below.</div>
           </div>
-          <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
-            <input id="addUserName" type="text" placeholder="add username manually (sAMAccountName)" style="min-width:280px;">
-            <button id="addUser">Add user</button>
-            <span style="flex:1;"></span>
+          <div style="display:flex;gap:10px;align-items:center;">
             <button id="permsSave" class="primary">Save access control</button>
             <span id="permsSaveMsg" style="font-size:12px;opacity:0.8;"></span>
           </div>
         </div>
       </section>
+      <section class="panel" data-panel-id="policies">
+        <div class="panel-head">
+          <h2 class="panel-title">Policies <small class="mini-stats"><b id="mPolicies">0</b> defined</small></h2>
+        </div>
+        <div style="padding:12px 16px;display:flex;flex-direction:column;gap:12px;">
+          <div style="font-size:12px;opacity:0.75;line-height:1.4;max-width:900px;">Create reusable <b>policies</b> — named bundles of TBFDesk session settings (view-only, file transfer, one-way file transfer, etc.). Assign them to <b>users</b> (the Policy column above) and to <b>devices</b> (the Peers tab). Precedence: a logged-in user's policy wins over the device's, which wins over the global default. A blank setting = client default.</div>
+          <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
+            <input id="newPolicyName" type="text" placeholder="new policy name (e.g. Techniker)" style="min-width:240px;">
+            <button id="addPolicy">Add policy</button>
+          </div>
+          <div id="policiesList"></div>
+          <div id="policiesEmpty" class="empty">No policies yet. Add one above to reuse across users and devices.</div>
+          <div style="display:flex;gap:10px;align-items:center;">
+            <button id="policiesSave" class="primary">Save policies</button>
+            <span id="policiesSaveMsg" style="font-size:12px;opacity:0.8;"></span>
+          </div>
+        </div>
+      </section>
+      </div>
     </div>
 
-    <div id="view-log" class="view" hidden>
-      <section class="panel">
-        <div class="panel-head">
-          <h2 class="panel-title">Log — Events</h2>
-        </div>
-        <div id="events" class="events empty">No events loaded</div>
-      </section>
-    </div>
   </div>
 
   <script>
@@ -974,7 +1046,8 @@
       ["allow-always-software-render", "Software render allowed", "bool"],
       ["allow-websocket", "Use WebSocket", "bool"],
       ["disable-udp", "Disable UDP", "bool"],
-      ["allow-insecure-tls-fallback", "Insecure TLS fallback", "bool"],
+      ["allow-insecure-tls-fallback", "Insecure TLS fallback", "bool", null, "Allow clients to accept the API's self-signed certificate. Needed until you install a CA-signed cert; the login password is still sealed regardless. Deny once you have a trusted cert."],
+      ["nemo-require-encrypted-session", "Require encrypted session (fail closed, S-A)", "bool", null, "Refuse to connect to a peer whose encryption key can't be verified, instead of silently falling back to plaintext. Allow = maximum security; Deny/Local = permit the (insecure) fallback."],
       ["allow-auto-update", "Auto update", "bool"],
       ["enable-confirm-closing-tabs", "Confirm closing tabs", "bool"],
       ["enable-open-new-connections-in-tabs", "Open connections in tabs", "bool"],
@@ -988,8 +1061,8 @@
       ["whitelist", "IP whitelist", "text"],
       ["proxy-url", "Proxy URL", "text"],
       ["proxy-username", "Proxy username", "text"],
-      ["verification-method", "Verification method", "select", [["", "Local"], ["use-temporary-password", "Temporary password"], ["use-permanent-password", "Permanent password"], ["use-both-passwords", "Both passwords"]]],
-      ["approve-mode", "Approval mode", "select", [["", "Local"], ["password-click", "Password + click"], ["click", "Click"], ["password", "Password"]]],
+      ["verification-method", "Verification method", "select", [["", "Local","Use the client default."], ["use-temporary-password", "Temporary password","Incoming connections need a one-time password shown on the remote screen."], ["use-permanent-password", "Permanent password","Incoming connections need the fixed password you set."], ["use-both-passwords", "Both passwords","Either a temporary or the permanent password is accepted."]], "How an incoming (controlled) connection proves it is allowed."],
+      ["approve-mode", "Approval mode", "select", [["", "Local","Use the client default."], ["password-click", "Password + click","Requires the password AND the local user to accept."], ["click", "Click","The local user must click Accept; no password."], ["password", "Password","Password only; connects without the local user accepting."]], "Whether an incoming connection needs a password, a local click, or both."],
       ["nemo-permanent-password", "Incoming access password", "password"],
       ["default-connect-password", "Outgoing default password", "password"],
       ["nemo-outbound-enabled", "Outgoing connections", "select", [["", "Local"], ["Y", "Allow"], ["N", "Deny"]]],
@@ -1028,9 +1101,44 @@
         if (view === "integration") loadIntegration();
         if (view === "acl") loadIntegration();
         if (view === "settings") refreshGlobalPolicy();
-        if (view === "connections") { loadConnections(); startConnTimer(); } else { stopConnTimer(); }
+        // Connections now live under the Log view (#6): load + auto-refresh there.
+        if (view === "log") { loadConnections(); startConnTimer(); } else { stopConnTimer(); }
       });
     });
+    // #5 Reorderable + persistent top nav. Drag a menu button to reorder it; the
+    // order is saved in this browser and restored on the next visit.
+    (function () {
+      const nav = document.querySelector(".mainnav");
+      if (!nav) return;
+      const KEY = "nemoNavOrder";
+      const btns = () => Array.from(nav.querySelectorAll(".navbtn"));
+      try {
+        const saved = JSON.parse(localStorage.getItem(KEY) || "[]");
+        if (Array.isArray(saved)) saved.forEach((v) => {
+          const b = nav.querySelector('.navbtn[data-view="' + v + '"]');
+          if (b) nav.appendChild(b);
+        });
+      } catch (e) {}
+      let dragEl = null;
+      btns().forEach((b) => b.setAttribute("draggable", "true"));
+      nav.addEventListener("dragstart", (e) => {
+        const b = e.target.closest(".navbtn"); if (!b) return;
+        dragEl = b; b.classList.add("nav-dragging");
+        e.dataTransfer.effectAllowed = "move";
+      });
+      nav.addEventListener("dragend", () => {
+        if (dragEl) dragEl.classList.remove("nav-dragging");
+        dragEl = null;
+        try { localStorage.setItem(KEY, JSON.stringify(btns().map((b) => b.dataset.view))); } catch (e) {}
+      });
+      nav.addEventListener("dragover", (e) => {
+        e.preventDefault();
+        const b = e.target.closest(".navbtn");
+        if (!b || b === dragEl || !dragEl) return;
+        const r = b.getBoundingClientRect();
+        nav.insertBefore(dragEl, (e.clientX - r.left) < r.width / 2 ? b : b.nextSibling);
+      });
+    })();
     $("connRefresh").addEventListener("click", loadConnections);
     $("connAutoRefresh").addEventListener("change", startConnTimer);
     $("ldapSave").addEventListener("click", saveLdap);
@@ -1043,26 +1151,187 @@
     $("permsSave").addEventListener("click", savePermissions);
     $("addUser").addEventListener("click", addUserRow);
     $("addUserName").addEventListener("keydown", (e) => { if (e.key === "Enter") addUserRow(); });
-    // Nemo: per-view adjustable column layout (Settings + Integration). The
-    // "Columns" switcher sets --cols on its own .view, which the .col-grid forms
-    // inside inherit; each view remembers its 1/2/3 choice in localStorage.
-    function nemoApplyColumns(view, n) {
-      if (!view) return;
-      n = Math.min(3, Math.max(1, parseInt(n, 10) || 2));
-      view.style.setProperty("--cols", n);
-      view.querySelectorAll(".col-switch .seg button").forEach((b) => {
-        b.classList.toggle("active", parseInt(b.dataset.cols, 10) === n);
-      });
-      try { localStorage.setItem("nemoCols:" + view.id, n); } catch (e) {}
+    $("addPolicy").addEventListener("click", addPolicy);
+    $("newPolicyName").addEventListener("keydown", (e) => { if (e.key === "Enter") addPolicy(); });
+    $("policiesSave").addEventListener("click", savePolicies);
+    // Nemo: snap-grid packing dashboard. Panels live in a .panel-board (a 12-column
+    // CSS grid, 1px row unit, dense auto-flow). Drag a panel's header to reorder;
+    // drag its right edge to snap WIDTH to a column count (½, ⅓, ¼…), its bottom edge
+    // for HEIGHT (double-click the bottom edge to release back to auto height), or its
+    // corner for both. A ResizeObserver keeps each panel's grid-row span equal to its
+    // measured height (+ a fixed gap), so panels pack tightly into gaps and re-pack
+    // when content, width, or the window changes. Layout persists per view.
+    const NEMO_COLS = 12;      // grid columns
+    const NEMO_GAP = 14;       // column gap + reserved vertical gap below each panel (px)
+    const NEMO_MINCOLS = 2;    // narrowest a panel may snap to (2/12 ≈ 1/6 width)
+    let nemoDragEl = null;
+    const nemoBoardKey = (board) => "nemoBoard:" + (board.closest(".view") ? board.closest(".view").id : "x");
+    // Set a panel's grid-row span from its own rendered height so it occupies just
+    // enough 1px rows (+ NEMO_GAP for the gap below). No-op while hidden (height 0) —
+    // the ResizeObserver re-fires once the panel's view is shown.
+    function nemoSizeRows(panel) {
+      const h = Math.round(panel.getBoundingClientRect().height);
+      if (h > 0) panel.style.gridRow = "span " + (h + NEMO_GAP);
     }
-    document.querySelectorAll(".col-switch .seg button").forEach((b) => {
-      b.addEventListener("click", () => nemoApplyColumns(b.closest(".view"), b.dataset.cols));
+    function nemoGetCols(panel) {
+      const m = /span\s+(\d+)/.exec(panel.style.gridColumn || "");
+      return m ? Math.max(NEMO_MINCOLS, Math.min(NEMO_COLS, +m[1])) : NEMO_COLS;
+    }
+    function nemoSetCols(panel, cols) {
+      cols = Math.max(NEMO_MINCOLS, Math.min(NEMO_COLS, Math.round(cols)));
+      panel.style.gridColumn = "span " + cols;
+    }
+    function nemoSaveBoard(board) {
+      const layout = {};
+      board.querySelectorAll(":scope > .panel[data-panel-id]").forEach((p, i) => {
+        const locked = p.classList.contains("panel-sized");
+        layout[p.dataset.panelId] = {
+          order: i,
+          cols: nemoGetCols(p),
+          hlock: locked,
+          h: locked ? Math.round(p.getBoundingClientRect().height) : 0,
+        };
+      });
+      try { localStorage.setItem(nemoBoardKey(board), JSON.stringify(layout)); } catch (e) {}
+    }
+    function nemoRestoreBoard(board) {
+      let layout = null;
+      try { layout = JSON.parse(localStorage.getItem(nemoBoardKey(board)) || "null"); } catch (e) {}
+      if (!layout) return;
+      const panels = Array.from(board.querySelectorAll(":scope > .panel[data-panel-id]"));
+      panels.forEach((p) => {
+        const s = layout[p.dataset.panelId];
+        if (!s) return;
+        if (s.cols) nemoSetCols(p, s.cols);
+        if (s.hlock && s.h) { p.style.height = s.h + "px"; p.classList.add("panel-sized"); }
+        nemoSizeRows(p);
+      });
+      panels.sort((a, b) => {
+        const oa = layout[a.dataset.panelId] ? layout[a.dataset.panelId].order : 999;
+        const ob = layout[b.dataset.panelId] ? layout[b.dataset.panelId].order : 999;
+        return oa - ob;
+      }).forEach((p) => board.appendChild(p));
+    }
+    function nemoWireResize(panel, board) {
+      if (panel.querySelector(":scope > .panel-resize")) return;
+      // one column + its share of the gap, so px width ÷ this = column count
+      const cellPlusGap = () => (board.getBoundingClientRect().width + NEMO_GAP) / NEMO_COLS;
+      const mkHandle = (cls, title, resizeW, resizeH) => {
+        const h = document.createElement("div");
+        h.className = cls; h.title = title;
+        panel.appendChild(h);
+        h.addEventListener("mousedown", (e) => {
+          e.preventDefault(); e.stopPropagation();
+          const startX = e.clientX, startY = e.clientY;
+          const rect = panel.getBoundingClientRect();
+          const startW = rect.width, startH = rect.height;
+          const unit = cellPlusGap();
+          const move = (ev) => {
+            if (resizeW) {
+              const wpx = startW + (ev.clientX - startX);
+              nemoSetCols(panel, (wpx + NEMO_GAP) / unit);   // snap px width → column span
+            }
+            if (resizeH) {
+              const ht = Math.max(90, startH + (ev.clientY - startY));
+              panel.style.height = Math.round(ht) + "px";
+              panel.classList.add("panel-sized");
+            }
+            nemoSizeRows(panel);
+          };
+          const up = () => {
+            document.removeEventListener("mousemove", move);
+            document.removeEventListener("mouseup", up);
+            nemoSizeRows(panel);
+            nemoSaveBoard(board);
+          };
+          document.addEventListener("mousemove", move);
+          document.addEventListener("mouseup", up);
+        });
+        // Double-click the bottom (height-only) handle to release a locked height.
+        if (resizeH && !resizeW) {
+          h.addEventListener("dblclick", (e) => {
+            e.preventDefault(); e.stopPropagation();
+            panel.style.height = "";
+            panel.classList.remove("panel-sized");
+            nemoSizeRows(panel);
+            nemoSaveBoard(board);
+          });
+        }
+      };
+      mkHandle("panel-resize", "Drag to snap width", true, false);
+      mkHandle("panel-resize-v", "Drag to set height · double-click for auto", false, true);
+      mkHandle("panel-resize-c", "Drag to resize width and height", true, true);
+    }
+    function nemoWireDrag(panel, board) {
+      const head = panel.querySelector(":scope > .panel-head");
+      if (head && !head.dataset.dragWired) {
+        head.dataset.dragWired = "1";
+        head.setAttribute("draggable", "true");
+        if (!head.querySelector(".drag-dots")) {
+          const dots = document.createElement("span");
+          dots.className = "drag-dots"; dots.textContent = "⠇⠇";
+          head.insertBefore(dots, head.firstChild);
+        }
+        head.addEventListener("dragstart", (e) => {
+          nemoDragEl = panel; panel.classList.add("dragging");
+          e.dataTransfer.effectAllowed = "move";
+          try { e.dataTransfer.setData("text/plain", panel.dataset.panelId || ""); } catch (x) {}
+        });
+        head.addEventListener("dragend", () => {
+          panel.classList.remove("dragging");
+          board.querySelectorAll(".drop-before,.drop-after").forEach((p) => p.classList.remove("drop-before", "drop-after"));
+          nemoDragEl = null;
+        });
+      }
+      panel.addEventListener("dragover", (e) => {
+        if (!nemoDragEl || nemoDragEl === panel) return;
+        e.preventDefault();
+        const r = panel.getBoundingClientRect();
+        const after = (e.clientX - r.left) > r.width / 2;
+        panel.classList.toggle("drop-after", after);
+        panel.classList.toggle("drop-before", !after);
+      });
+      panel.addEventListener("dragleave", () => panel.classList.remove("drop-before", "drop-after"));
+      panel.addEventListener("drop", (e) => {
+        if (!nemoDragEl || nemoDragEl === panel) return;
+        e.preventDefault();
+        const r = panel.getBoundingClientRect();
+        const after = (e.clientX - r.left) > r.width / 2;
+        panel.classList.remove("drop-before", "drop-after");
+        if (after) panel.after(nemoDragEl); else panel.before(nemoDragEl);
+        nemoSaveBoard(board);
+      });
+    }
+    // One observer keeps every panel's row span in sync with its height: content
+    // loads, width snaps, view show/hide, and window resize all change a panel's
+    // measured height and funnel through here to re-pack. Setting the row span does
+    // not change a start-aligned panel's own height, so this never loops.
+    const nemoRowObserver = (typeof ResizeObserver !== "undefined")
+      ? new ResizeObserver((entries) => { entries.forEach((en) => nemoSizeRows(en.target)); })
+      : null;
+    document.querySelectorAll(".panel-board").forEach((board) => {
+      board.querySelectorAll(":scope > .panel").forEach((panel) => {
+        nemoWireResize(panel, board);
+        nemoWireDrag(panel, board);
+        nemoSizeRows(panel);
+        if (nemoRowObserver) nemoRowObserver.observe(panel);
+      });
+      nemoRestoreBoard(board);
     });
-    document.querySelectorAll(".view").forEach((view) => {
-      if (!view.querySelector(".col-switch")) return;
-      let n = 2;
-      try { n = parseInt(localStorage.getItem("nemoCols:" + view.id), 10) || 2; } catch (e) {}
-      nemoApplyColumns(view, n);
+    window.addEventListener("resize", () => {
+      document.querySelectorAll(".panel-board > .panel").forEach(nemoSizeRows);
+    });
+    document.querySelectorAll("[data-board-reset]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const board = btn.closest(".view").querySelector(".panel-board");
+        if (board) {
+          board.querySelectorAll(":scope > .panel").forEach((p) => {
+            p.style.gridColumn = ""; p.style.height = ""; p.style.gridRow = ""; p.classList.remove("panel-sized");
+          });
+          try { localStorage.removeItem(nemoBoardKey(board)); } catch (e) {}
+          location.reload();
+        }
+      });
     });
     // Nemo: clicking empty, non-interactive space clears the selected peer.
     // Row clicks stopPropagation, so they never reach here; keep the selection
@@ -1098,6 +1367,28 @@
       });
       await loadAll();
     });
+    $("connHistorySave").addEventListener("click", async () => {
+      const n = parseInt($("connHistoryLimit").value, 10);
+      if (!Number.isFinite(n) || n < 1) { setMsg("connHistoryMsg", "enter a number ≥ 1", false); return; }
+      try {
+        await api("/nemo/api/policy", { method: "PUT", body: JSON.stringify({ connection_history_limit: n }) });
+        setMsg("connHistoryMsg", "Saved", true);
+        await loadAll();
+      } catch (err) {
+        setMsg("connHistoryMsg", err.message, false);
+      }
+    });
+    $("logHistorySave").addEventListener("click", async () => {
+      const n = parseInt($("logHistoryLimit").value, 10);
+      if (!Number.isFinite(n) || n < 1) { setMsg("logHistoryMsg", "enter a number ≥ 1", false); return; }
+      try {
+        await api("/nemo/api/policy", { method: "PUT", body: JSON.stringify({ log_history_limit: n }) });
+        setMsg("logHistoryMsg", "Saved", true);
+        await loadAll();
+      } catch (err) {
+        setMsg("logHistoryMsg", err.message, false);
+      }
+    });
     $("autoRefresh").addEventListener("change", schedule);
 
     function headers() {
@@ -1125,13 +1416,22 @@
     async function loadAll() {
       setHealth("loading", "Loading");
       try {
-        const [health, peers, stats, events] = await Promise.all([
+        const [health, peers, stats, events, pol] = await Promise.all([
           api("/nemo/api/health"),
           api("/nemo/api/peers?limit=1000"),
           api("/nemo/api/stats"),
-          api("/nemo/api/events?limit=80")
+          api("/nemo/api/events?limit=80"),
+          api("/nemo/api/policies")
         ]);
+        integ.policies = pol.policies || {};
+        integ.devicePolicies = pol.device_policies || {};
         $("companyOnly").checked = !!health.company_only;
+        if (health.connection_history_limit != null && document.activeElement !== $("connHistoryLimit")) {
+          $("connHistoryLimit").value = health.connection_history_limit;
+        }
+        if (health.log_history_limit != null && $("logHistoryLimit") && document.activeElement !== $("logHistoryLimit")) {
+          $("logHistoryLimit").value = health.log_history_limit;
+        }
         state.peers = peers.peers || [];
         const currentIds = new Set(state.peers.map((peer) => peer.id));
         state.selectedIds = new Set([...state.selectedIds].filter((id) => currentIds.has(id)));
@@ -1207,6 +1507,7 @@
           <td>${escapeHtml(peerAlias(peer))}</td>
           <td>${badge(peer.online ? "online" : "offline")}</td>
           <td>${badge(peer.policy)}</td>
+          <td>${((integ.devicePolicies || {})[peer.id]) ? escapeHtml(integ.devicePolicies[peer.id]) : '<span style="opacity:0.4">—</span>'}</td>
           <td class="mono">${escapeHtml(peer.registered_ip || "")}</td>
           <td class="mono">${escapeHtml(peer.public_addr || "")}</td>
           <td>${formatSeen(peer.last_seen_ms_ago)}</td>
@@ -1334,38 +1635,31 @@
         </dl>
         <div class="management-policy">
           <h3>Management</h3>
-          <label class="switch"><input id="allowUserOverride" type="checkbox" ${allowUserOverride ? "checked" : ""}>Allow user override</label>
-          <div class="policy-grid">
-            ${managementOptions.map((option) => policyControl(option, policyOptions[option[0]] || "")).join("")}
+          <div class="fld" style="margin-bottom:10px;">
+            <label for="devicePolicySelect" title="Assign a named policy to this device. Applies to its incoming sessions when no user is logged in; a logged-in user's own policy still wins.">Device policy</label>
+            <div style="display:flex;gap:8px;align-items:center;margin-top:3px;">
+              <select id="devicePolicySelect">
+                <option value="">— none (use inline settings below) —</option>
+                ${Object.keys(integ.policies || {}).sort().map((pn) => `<option value="${escapeHtml(pn)}" ${((integ.devicePolicies || {})[peer.id] || "") === pn ? "selected" : ""}>${escapeHtml(pn)}</option>`).join("")}
+              </select>
+              <span id="devicePolicyMsg" style="font-size:12px;opacity:0.8;"></span>
+            </div>
           </div>
-          <textarea id="policyOptionsJson" class="policy-json" spellcheck="false">${escapeHtml(JSON.stringify(advancedOptions, null, 2))}</textarea>
-          <div class="policy-actions">
-            <button id="saveManagementPolicy" class="primary">Save Management</button>
-          </div>
+          <div style="font-size:12px;opacity:0.75;line-height:1.5;margin-top:8px;">Session settings (file transfer, view-only, terminal, etc.) are managed through <b>named policies</b>. Assign one above, or create and edit them in <b>ACL &amp; Policy</b>. A logged-in user's own policy still overrides the device policy.</div>
         </div>
       `;
-      $("saveManagementPolicy").addEventListener("click", async () => {
-        let options = {};
-        const raw = $("policyOptionsJson").value.trim();
-        if (raw) {
-          options = JSON.parse(raw);
-          if (!options || Array.isArray(options) || typeof options !== "object") throw new Error("Advanced settings must be a JSON object");
+      const dps = $("devicePolicySelect");
+      if (dps) dps.addEventListener("change", async () => {
+        try {
+          const res = await api("/nemo/api/policies/device", {
+            method: "POST",
+            body: JSON.stringify({ peer_id: peer.id, policy_name: dps.value || null })
+          });
+          integ.devicePolicies = res.device_policies || {};
+          setMsg("devicePolicyMsg", dps.value ? "Assigned" : "Cleared", true);
+        } catch (err) {
+          setMsg("devicePolicyMsg", err.message, false);
         }
-        detail.querySelectorAll("[data-policy-key]").forEach((input) => {
-          if (input.value) {
-            options[input.dataset.policyKey] = input.value;
-          } else {
-            delete options[input.dataset.policyKey];
-          }
-        });
-        await api(`/nemo/api/peers/${encodeURIComponent(peer.id)}/management-policy`, {
-          method: "PUT",
-          body: JSON.stringify({
-            allow_user_override: $("allowUserOverride").checked,
-            options
-          })
-        });
-        await loadAll();
       });
     }
 
@@ -1391,22 +1685,30 @@
       return `<span class="badge ${escapeAttr(label)}">${escapeHtml(label)}</span>`;
     }
 
+    // Default hover text for the standard tri-state (bool) options, so every
+    // choice explains itself even when the option didn't ship custom titles.
+    const BOOL_CHOICES = [
+      ["", "Local", "Use the client's own setting - no override."],
+      ["Y", "Allow", "Force this feature ON for every session."],
+      ["N", "Deny", "Force this feature OFF (enforced) for every session."],
+    ];
     function policyControl(option, value) {
-      const [key, label, type, choices] = option;
+      const [key, label, type, choices, desc] = option;
+      const lt = desc ? ` title="${escapeAttr(desc)}"` : "";
       if (type === "text" || type === "password") {
         return `
           <div class="policy-row">
-            <label for="policy-${escapeAttr(key)}">${escapeHtml(label)}</label>
-            <input id="policy-${escapeAttr(key)}" type="${type === "password" ? "password" : "text"}" autocomplete="new-password" data-policy-key="${escapeHtml(key)}" value="${escapeHtml(value)}" placeholder="Local">
+            <label for="policy-${escapeAttr(key)}"${lt}>${escapeHtml(label)}</label>
+            <input id="policy-${escapeAttr(key)}" type="${type === "password" ? "password" : "text"}" autocomplete="new-password" data-policy-key="${escapeHtml(key)}" value="${escapeHtml(value)}" placeholder="Local"${lt}>
           </div>
         `;
       }
-      const items = choices || [["", "Local"], ["Y", "Allow"], ["N", "Deny"]];
+      const items = choices || BOOL_CHOICES;
       return `
         <div class="policy-row">
-          <label for="policy-${escapeAttr(key)}">${escapeHtml(label)}</label>
-          <select id="policy-${escapeAttr(key)}" data-policy-key="${escapeHtml(key)}">
-            ${items.map(([itemValue, itemLabel]) => `<option value="${escapeHtml(itemValue)}" ${value === itemValue ? "selected" : ""}>${escapeHtml(itemLabel)}</option>`).join("")}
+          <label for="policy-${escapeAttr(key)}"${lt}>${escapeHtml(label)}</label>
+          <select id="policy-${escapeAttr(key)}" data-policy-key="${escapeHtml(key)}"${lt}>
+            ${items.map((it) => `<option value="${escapeHtml(it[0])}" ${value === it[0] ? "selected" : ""}${it[2] ? ` title="${escapeAttr(it[2])}"` : ""}>${escapeHtml(it[1])}</option>`).join("")}
           </select>
         </div>
       `;
@@ -1438,21 +1740,26 @@
     }
 
     // ---- Integration view: LDAP config + per-user RBAC ----
-    const integ = { ldap: null, perms: {}, defaultTargets: [], peers: [], requireLogin: false, selectedPolicyUser: null, globalPolicy: { allow_user_override: false, options: {} } };
+    const integ = { ldap: null, perms: {}, defaultTargets: [], peers: [], requireLogin: false, selectedPolicyUser: null, globalPolicy: { allow_user_override: false, options: {} }, policies: {}, devicePolicies: {}, selectedEditPolicy: null };
 
     async function loadIntegration() {
       try {
-        const [ldap, perms] = await Promise.all([
+        const [ldap, perms, pol] = await Promise.all([
           api("/nemo/api/integration/ldap"),
-          api("/nemo/api/integration/permissions")
+          api("/nemo/api/integration/permissions"),
+          api("/nemo/api/policies")
         ]);
         integ.ldap = ldap;
         integ.perms = perms.permissions || {};
         integ.defaultTargets = perms.default_targets || [];
         integ.requireLogin = !!perms.require_login;
+        integ.defaultPolicyName = perms.default_policy_name || "";
         integ.selectedPolicyUser = null;
         integ.peers = perms.peers || [];
+        integ.policies = pol.policies || {};
+        integ.devicePolicies = pol.device_policies || {};
         renderLdapForm();
+        renderPolicies();
         renderPerms();
       } catch (err) {
         setMsg("ldapSaveMsg", err.message, false);
@@ -1503,11 +1810,6 @@
         tr.appendChild(dirCell(u.username));
         tr.appendChild(dirCell(u.display_name));
         tr.appendChild(dirCell(u.email));
-        const status = document.createElement("td");
-        status.style.fontSize = "12px";
-        status.style.opacity = "0.7";
-        status.textContent = u.enabled ? "allowed" : (u.in_acl ? "disabled" : "");
-        tr.appendChild(status);
         body.appendChild(tr);
       }
     }
@@ -1521,8 +1823,6 @@
         });
         u.enabled = enabled;
         u.in_acl = true;
-        const row = cb.closest("tr");
-        if (row) row.lastChild.textContent = enabled ? "allowed" : "disabled";
         setMsg("ldapUsersMsg", (enabled ? "Enabled " : "Disabled ") + u.username + " — see the ACL tab for targets/policy", true);
       } catch (err) {
         cb.checked = !enabled; // revert on failure
@@ -1701,18 +2001,104 @@
 
     // Per-user session-permission policy (a focused subset of the device options).
     const userPolicyOptions = [
-      ["view_only", "View only", "select", [["","Local"],["Y","Yes"],["N","No"]]],
-      ["enable-keyboard", "Keyboard & mouse", "bool"],
-      ["enable-clipboard", "Clipboard", "bool"],
-      ["enable-file-transfer", "File transfer", "bool"],
-      ["enable-audio", "Audio", "bool"],
-      ["enable-remote-restart", "Remote restart", "bool"],
-      ["enable-record-session", "Session recording", "bool"],
-      ["enable-block-input", "Block local input", "bool"],
-      ["enable-privacy-mode", "Privacy mode", "bool"],
-      ["image_quality", "Image quality", "select", [["","Local"],["best","Best"],["balanced","Balanced"],["low","Reaction time"]]],
-      ["nemo-permanent-password", "Incoming access password", "password"],
+      ["view_only", "View only", "select", [["","Local","Use the client default."],["Y","Yes","Controller can watch the screen but NOT move the mouse or type."],["N","No","Controller has full keyboard/mouse control."]], "Whether the controller may only watch, or also control the remote machine."],
+      ["enable-keyboard", "Keyboard & mouse", "bool", null, "Allow the controller to use the remote keyboard and mouse. Deny = look but don't touch."],
+      ["enable-clipboard", "Clipboard", "bool", null, "Share clipboard (copy/paste of text and images) between the two machines."],
+      ["enable-file-transfer", "File transfer", "bool", null, "Copy files to/from the remote machine. Deny fully blocks all file transfer (enforced by the client)."],
+      ["one-way-file-transfer", "File transfer direction", "select", [["","Local","Use the client default (normally two-way)."],["N","Two-way","Files may move both ways: upload to and download from the remote."],["Y","Upload only (one-way)","Files may only be sent TO the remote machine; downloading from it is blocked."]], "Limits which direction files may move. 'Local' just keeps the client's own default; it does not block anything."],
+      ["enable-audio", "Audio", "bool", null, "Forward the remote machine's sound to the controller."],
+      ["enable-camera", "Camera", "bool", null, "Let the controller view the remote machine's webcam."],
+      ["enable-terminal", "Remote terminal / shell", "bool", null, "Allow opening a command shell/terminal on the remote machine (Windows and Linux)."],
+      ["enable-tunnel", "TCP tunneling / port-forward", "bool", null, "Allow forwarding TCP ports through the session (e.g. RDP/SSH tunneling)."],
+      ["enable-remote-printer", "Remote printer", "bool", null, "Allow printing from the remote machine to the controller's local printer."],
+      ["enable-remote-restart", "Remote restart", "bool", null, "Allow the controller to reboot the remote machine."],
+      ["enable-record-session", "Session recording", "bool", null, "Allow recording the remote session to a local video file."],
+      ["enable-block-input", "Block local input", "bool", null, "Allow the controller to lock out the remote machine's own keyboard/mouse during control."],
+      ["enable-privacy-mode", "Privacy mode", "bool", null, "Allow blanking the remote monitor so bystanders can't watch (needs supported graphics hardware)."],
+      ["image_quality", "Image quality", "select", [["","Local","Use the client default."],["best","Best","Sharpest image, higher bandwidth/latency."],["balanced","Balanced","Middle ground between sharpness and speed."],["low","Reaction time","Lowest latency for fast interaction (recommended for control)."]], "Trade-off between picture sharpness and responsiveness of the stream."],
+      ["nemo-permanent-password", "Incoming access password", "password", null, "Sets a fixed password the client requires for incoming connections. Leave blank to keep the client's own password."],
     ];
+
+    // A policy control WITHOUT a global id (multiple named-policy blocks render at
+    // once, so ids would collide). Read back by data-policy-key within each block.
+    function policyControlScoped(option, value) {
+      const [key, label, type, choices, desc] = option;
+      const lt = desc ? ` title="${escapeAttr(desc)}"` : "";
+      if (type === "text" || type === "password") {
+        return `<div class="policy-row"><label${lt}>${escapeHtml(label)}</label>
+          <input type="${type === "password" ? "password" : "text"}" autocomplete="new-password" data-policy-key="${escapeHtml(key)}" value="${escapeHtml(value)}" placeholder="Local"${lt}></div>`;
+      }
+      const items = choices || BOOL_CHOICES;
+      return `<div class="policy-row"><label${lt}>${escapeHtml(label)}</label>
+        <select data-policy-key="${escapeHtml(key)}"${lt}>${items.map((it) => `<option value="${escapeHtml(it[0])}" ${value === it[0] ? "selected" : ""}${it[2] ? ` title="${escapeAttr(it[2])}"` : ""}>${escapeHtml(it[1])}</option>`).join("")}</select></div>`;
+    }
+
+    function renderPolicies() {
+      const names = Object.keys(integ.policies).sort();
+      if ($("mPolicies")) $("mPolicies").textContent = names.length;
+      const list = $("policiesList");
+      if ($("policiesEmpty")) $("policiesEmpty").style.display = names.length ? "none" : "";
+      if (!list) return;
+      list.innerHTML = names.map((name) => {
+        const pol = integ.policies[name] || { options: {} };
+        const opts = pol.options || {};
+        const controls = userPolicyOptions.map((o) => policyControlScoped(o, opts[o[0]] || "")).join("");
+        return `<div class="policy-def" data-policy-name="${escapeHtml(name)}" style="border:1px solid #e0e0e0;border-radius:6px;padding:10px 12px;margin-bottom:10px;">
+          <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;">
+            <b>${escapeHtml(name)}</b><span style="flex:1;"></span>
+            <button type="button" class="policy-del danger" title="Delete this policy">✕</button>
+          </div>
+          <div class="user-policy-grid">${controls}</div>
+        </div>`;
+      }).join("");
+      list.querySelectorAll(".policy-del").forEach((btn) => {
+        btn.addEventListener("click", (e) => {
+          collectPolicies();
+          const name = e.target.closest(".policy-def").dataset.policyName;
+          delete integ.policies[name];
+          renderPolicies();
+        });
+      });
+    }
+
+    function collectPolicies() {
+      const list = $("policiesList");
+      if (!list) return;
+      list.querySelectorAll(".policy-def").forEach((block) => {
+        const name = block.dataset.policyName;
+        const options = {};
+        block.querySelectorAll("[data-policy-key]").forEach((el) => {
+          const v = (el.value || "").trim();
+          if (v !== "") options[el.dataset.policyKey] = v;
+        });
+        const prev = integ.policies[name] || {};
+        integ.policies[name] = { allow_user_override: !!prev.allow_user_override, options };
+      });
+    }
+
+    function addPolicy() {
+      const name = $("newPolicyName").value.trim();
+      if (!name) { setMsg("policiesSaveMsg", "enter a policy name", false); return; }
+      collectPolicies();
+      if (!integ.policies[name]) integ.policies[name] = { allow_user_override: false, options: {} };
+      $("newPolicyName").value = "";
+      renderPolicies();
+      setMsg("policiesSaveMsg", "Added — set its options, then Save policies", true);
+    }
+
+    async function savePolicies() {
+      collectPolicies();
+      try {
+        const res = await api("/nemo/api/policies", { method: "PUT", body: JSON.stringify({ policies: integ.policies }) });
+        integ.policies = res.policies || {};
+        integ.devicePolicies = res.device_policies || {};
+        setMsg("policiesSaveMsg", "Saved", true);
+        renderPolicies();
+        renderPerms();
+      } catch (err) {
+        setMsg("policiesSaveMsg", err.message, false);
+      }
+    }
 
     function renderPerms() {
       const body = $("permsBody");
@@ -1720,12 +2106,19 @@
       $("mUsers").textContent = names.length;
       $("defaultAllowAll").checked = (integ.defaultTargets || []).includes("*");
       $("requireLogin").checked = !!integ.requireLogin;
+      const dps = $("defaultPolicySelect");
+      if (dps) {
+        const cur = integ.defaultPolicyName || "";
+        dps.innerHTML = `<option value="">None (client default)</option>` +
+          Object.keys(integ.policies || {}).sort().map((pn) => `<option value="${escapeHtml(pn)}" ${cur === pn ? "selected" : ""}>${escapeHtml(pn)}</option>`).join("");
+      }
       if (!names.length) {
         body.innerHTML = "";
         $("permsEmpty").style.display = "";
         return;
       }
       $("permsEmpty").style.display = "none";
+      const policyNames = Object.keys(integ.policies || {}).sort();
       body.innerHTML = names.map((name) => {
         const u = integ.perms[name] || {};
         const isOpen = integ.selectedPolicyUser === name;
@@ -1735,8 +2128,14 @@
           <td><code>${escapeHtml(name)}</code></td>
           <td>${escapeHtml(u.display_name || "")}</td>
           <td class="perm-admin"><input type="checkbox" class="perm-admin-cb" ${u.is_admin ? "checked" : ""}></td>
-          <td><select multiple class="perm-targets">${targetOptionsHtml(u.allowed_targets)}</select></td>
-          <td><button class="perm-policy${isOpen ? ' primary' : ''}" title="Edit this user's session permissions">Policy${npol ? ` (${npol})` : ''} ${isOpen ? '▲' : '▾'}</button></td>
+          <td><select multiple class="perm-targets">${targetOptionsHtml(u.allowed_targets)}</select><div style="margin-top:4px;"><button type="button" class="perm-clear-targets${(u.allowed_targets || []).length === 0 ? ' active' : ''}" style="font-size:11px;padding:1px 8px;" title="Clear the selection so this user reaches NO peers. (No effect on admins, who always reach every peer.)">No peers</button></div></td>
+          <td>
+            <select class="perm-policy-select" title="Assign a named policy, or keep a custom/inline policy for this user">
+              <option value="">— Custom / inline —</option>
+              ${policyNames.map((pn) => `<option value="${escapeHtml(pn)}" ${(u.policy_name || "") === pn ? "selected" : ""}>${escapeHtml(pn)}</option>`).join("")}
+            </select>
+            ${(!u.policy_name) ? `<div style="margin-top:4px;"><button class="perm-policy${isOpen ? ' primary' : ''}" title="Edit this user's inline session permissions">Edit${npol ? ` (${npol})` : ''} ${isOpen ? '▲' : '▾'}</button></div>` : ''}
+          </td>
           <td><button class="perm-remove danger" title="Remove this user">✕</button></td>
         </tr>`;
         if (isOpen) {
@@ -1758,6 +2157,13 @@
           renderPerms();
         });
       });
+      body.querySelectorAll(".perm-policy-select").forEach((sel) => {
+        sel.addEventListener("change", (e) => {
+          collectPerms();
+          if (e.target.value) integ.selectedPolicyUser = null; // named policy → close inline editor
+          renderPerms();
+        });
+      });
       body.querySelectorAll(".perm-remove").forEach((btn) => {
         btn.addEventListener("click", (e) => {
           collectPerms();
@@ -1765,6 +2171,23 @@
           delete integ.perms[name];
           if (integ.selectedPolicyUser === name) integ.selectedPolicyUser = null;
           renderPerms();
+        });
+      });
+      body.querySelectorAll(".perm-clear-targets").forEach((btn) => {
+        btn.addEventListener("click", (e) => {
+          const sel = e.target.closest("td").querySelector(".perm-targets");
+          if (sel) {
+            Array.from(sel.options).forEach((o) => { o.selected = false; });
+            e.currentTarget.classList.add("active"); // highlight: this user now reaches no peers
+            collectPerms();
+          }
+        });
+      });
+      // Un-highlight "No peers" as soon as a peer is selected again.
+      body.querySelectorAll(".perm-targets").forEach((sel) => {
+        sel.addEventListener("change", (e) => {
+          const btn = e.target.closest("td").querySelector(".perm-clear-targets");
+          if (btn) btn.classList.toggle("active", e.target.selectedOptions.length === 0);
         });
       });
     }
@@ -1776,6 +2199,8 @@
         u.enabled = tr.querySelector(".perm-enabled").checked;
         u.is_admin = tr.querySelector(".perm-admin-cb").checked;
         u.allowed_targets = Array.from(tr.querySelector(".perm-targets").selectedOptions).map((o) => o.value);
+        const psel = tr.querySelector(".perm-policy-select");
+        u.policy_name = psel && psel.value ? psel.value : null;
         integ.perms[name] = u;
       });
       // Read the currently-open policy editor into that user's policy.
@@ -1796,12 +2221,14 @@
       const body = {
         permissions: integ.perms,
         default_targets: $("defaultAllowAll").checked ? ["*"] : [],
-        require_login: $("requireLogin").checked
+        require_login: $("requireLogin").checked,
+        default_policy_name: ($("defaultPolicySelect") ? $("defaultPolicySelect").value : "") || ""
       };
       try {
         integ.perms = await api("/nemo/api/integration/permissions", { method: "PUT", body: JSON.stringify(body) });
         integ.defaultTargets = body.default_targets;
         integ.requireLogin = body.require_login;
+        integ.defaultPolicyName = body.default_policy_name;
         renderPerms();
         setMsg("permsSaveMsg", "Saved.", true);
       } catch (err) {
