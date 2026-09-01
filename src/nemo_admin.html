@@ -991,6 +991,20 @@
           </div>
         </div>
       </section>
+      <section class="panel" data-panel-id="admin-policy">
+        <div class="panel-head">
+          <h2 class="panel-title">Admin policy</h2>
+        </div>
+        <div style="padding:12px 16px;display:flex;flex-direction:column;gap:12px;">
+          <div style="font-size:12px;opacity:0.75;line-height:1.4;max-width:900px;">Applies to every user marked <b>Admin</b> in the table above. Admins <b>bypass all normal policies</b> (named, default and per-user) and get this one instead. It is <b>full access by default</b> &mdash; change any control to <b>Deny</b> to restrict what admins may do.</div>
+          <div id="adminPolicyGrid" class="policy-grid"></div>
+          <div style="display:flex;gap:10px;align-items:center;">
+            <button id="adminPolicySave" class="primary">Save admin policy</button>
+            <button id="adminPolicyReset">Reset to full access</button>
+            <span id="adminPolicyMsg" style="font-size:12px;opacity:0.8;"></span>
+          </div>
+        </div>
+      </section>
       <section class="panel" data-panel-id="policies">
         <div class="panel-head">
           <h2 class="panel-title">Policies <small class="mini-stats"><b id="mPolicies">0</b> defined</small></h2>
@@ -1149,6 +1163,22 @@
     $("ldapUserQuery").addEventListener("keydown", (e) => { if (e.key === "Enter") searchDirectory(); });
     $("gpSave").addEventListener("click", saveGlobalPolicy);
     $("permsSave").addEventListener("click", savePermissions);
+    $("adminPolicySave").addEventListener("click", async () => {
+      const ap = collectAdminPolicy();
+      try {
+        await api("/nemo/api/integration/permissions", { method: "PUT", body: JSON.stringify({ admin_policy: ap }) });
+        integ.adminPolicy = ap;
+        setMsg("adminPolicyMsg", "Saved.", true);
+      } catch (err) { setMsg("adminPolicyMsg", err.message, false); }
+    });
+    $("adminPolicyReset").addEventListener("click", () => {
+      const opts = {};
+      ["enable-keyboard","enable-clipboard","enable-file-transfer","enable-audio","enable-camera","enable-terminal","enable-tunnel","enable-remote-printer","enable-remote-restart","enable-record-session","enable-block-input","enable-privacy-mode"].forEach((k) => opts[k] = "Y");
+      opts["view_only"] = "N"; opts["one-way-file-transfer"] = "N";
+      integ.adminPolicy = { allow_user_override: false, options: opts };
+      renderAdminPolicy();
+      setMsg("adminPolicyMsg", "Reset to full access (not saved yet).", true);
+    });
     $("addUser").addEventListener("click", addUserRow);
     $("addUserName").addEventListener("keydown", (e) => { if (e.key === "Enter") addUserRow(); });
     $("addPolicy").addEventListener("click", addPolicy);
@@ -1740,7 +1770,7 @@
     }
 
     // ---- Integration view: LDAP config + per-user RBAC ----
-    const integ = { ldap: null, perms: {}, defaultTargets: [], peers: [], requireLogin: false, selectedPolicyUser: null, globalPolicy: { allow_user_override: false, options: {} }, policies: {}, devicePolicies: {}, selectedEditPolicy: null };
+    const integ = { ldap: null, perms: {}, defaultTargets: [], peers: [], requireLogin: false, selectedPolicyUser: null, globalPolicy: { allow_user_override: false, options: {} }, policies: {}, devicePolicies: {}, selectedEditPolicy: null, adminPolicy: { allow_user_override: false, options: {} } };
 
     async function loadIntegration() {
       try {
@@ -1754,6 +1784,7 @@
         integ.defaultTargets = perms.default_targets || [];
         integ.requireLogin = !!perms.require_login;
         integ.defaultPolicyName = perms.default_policy_name || "";
+        integ.adminPolicy = perms.admin_policy || { allow_user_override: false, options: {} };
         integ.selectedPolicyUser = null;
         integ.peers = perms.peers || [];
         integ.policies = pol.policies || {};
@@ -1761,9 +1792,27 @@
         renderLdapForm();
         renderPolicies();
         renderPerms();
+        renderAdminPolicy();
       } catch (err) {
         setMsg("ldapSaveMsg", err.message, false);
       }
+    }
+
+    // The admin policy panel: full-access controls admins get instead of any
+    // normal policy. Rendered from integ.adminPolicy; saved on its own.
+    function renderAdminPolicy() {
+      const grid = $("adminPolicyGrid");
+      if (!grid) return;
+      const opts = (integ.adminPolicy && integ.adminPolicy.options) || {};
+      grid.innerHTML = userPolicyOptions.map((o) => policyControlScoped(o, opts[o[0]] || "")).join("");
+    }
+    function collectAdminPolicy() {
+      const options = {};
+      const grid = $("adminPolicyGrid");
+      if (grid) grid.querySelectorAll("[data-policy-key]").forEach((el) => {
+        if (el.value) options[el.dataset.policyKey] = el.value;
+      });
+      return { allow_user_override: false, options };
     }
 
     // ---- Integration: directory user picker ----

@@ -181,6 +181,39 @@ pub struct IntegrationConfig {
     /// one baseline that auto-applies to newly-allowed users.
     #[serde(default)]
     pub default_policy_name: Option<String>,
+    /// The single policy applied to ALL admin users. Admins bypass every normal
+    /// policy (named/default/inline) and get this one instead — full access by
+    /// default, adjustable if the operator wants to restrict admins.
+    #[serde(default = "default_admin_policy")]
+    pub admin_policy: UserManagedPolicy,
+}
+
+/// Full-access baseline for admin users: every capability allowed, full control,
+/// two-way file transfer. The admin can then tighten specific controls.
+pub fn default_admin_policy() -> UserManagedPolicy {
+    let mut options = HashMap::new();
+    for k in [
+        "enable-keyboard",
+        "enable-clipboard",
+        "enable-file-transfer",
+        "enable-audio",
+        "enable-camera",
+        "enable-terminal",
+        "enable-tunnel",
+        "enable-remote-printer",
+        "enable-remote-restart",
+        "enable-record-session",
+        "enable-block-input",
+        "enable-privacy-mode",
+    ] {
+        options.insert(k.to_owned(), "Y".to_owned());
+    }
+    options.insert("view_only".to_owned(), "N".to_owned());
+    options.insert("one-way-file-transfer".to_owned(), "N".to_owned());
+    UserManagedPolicy {
+        allow_user_override: false,
+        options,
+    }
 }
 
 impl Default for IntegrationConfig {
@@ -193,6 +226,7 @@ impl Default for IntegrationConfig {
             policies: HashMap::new(),
             device_policies: HashMap::new(),
             default_policy_name: None,
+            admin_policy: default_admin_policy(),
         }
     }
 }
@@ -387,8 +421,10 @@ pub fn default_targets() -> Vec<String> {
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct PermissionsUpdate {
+    /// Present = replace the whole permission set; absent = leave it (so a panel
+    /// can update just default_policy_name / admin_policy without wiping users).
     #[serde(default)]
-    pub permissions: HashMap<String, UserPermission>,
+    pub permissions: Option<HashMap<String, UserPermission>>,
     #[serde(default)]
     pub default_targets: Option<Vec<String>>,
     #[serde(default)]
@@ -396,21 +432,27 @@ pub struct PermissionsUpdate {
     /// Present = set the default policy (empty string clears it); absent = leave.
     #[serde(default)]
     pub default_policy_name: Option<String>,
+    /// Present = replace the admin policy; absent = leave unchanged.
+    #[serde(default)]
+    pub admin_policy: Option<UserManagedPolicy>,
 }
 
 /// Replace the RBAC map (and optionally the default targets / require-login),
 /// persist, return it.
 pub fn update_permissions(update: PermissionsUpdate) -> HashMap<String, UserPermission> {
     let mut cfg = CONFIG.lock().unwrap();
-    // Normalise keys to canonical lower-case so lookups at login match.
-    cfg.permissions = update
-        .permissions
-        .into_iter()
-        .map(|(k, mut v)| {
-            v.allowed_targets = normalize_targets(v.allowed_targets);
-            (normalize_lookup_username(&k), v)
-        })
-        .collect();
+    // Normalise keys to canonical lower-case so lookups at login match. Only when
+    // permissions are actually provided — a partial update (e.g. just the admin
+    // policy) must NOT wipe the whole allowlist.
+    if let Some(perms) = update.permissions {
+        cfg.permissions = perms
+            .into_iter()
+            .map(|(k, mut v)| {
+                v.allowed_targets = normalize_targets(v.allowed_targets);
+                (normalize_lookup_username(&k), v)
+            })
+            .collect();
+    }
     if let Some(targets) = update.default_targets {
         cfg.default_targets = normalize_targets(targets);
     }
@@ -419,6 +461,9 @@ pub fn update_permissions(update: PermissionsUpdate) -> HashMap<String, UserPerm
     }
     if let Some(dn) = update.default_policy_name {
         cfg.default_policy_name = if dn.trim().is_empty() { None } else { Some(dn) };
+    }
+    if let Some(ap) = update.admin_policy {
+        cfg.admin_policy = ap;
     }
     let snapshot = cfg.permissions.clone();
     persist(&cfg);
@@ -520,6 +565,11 @@ pub fn user_policy(username: &str) -> UserManagedPolicy {
     let cfg = CONFIG.lock().unwrap();
     match cfg.permissions.get(&key) {
         Some(p) => {
+            // Admins bypass every normal policy and get the single admin policy
+            // (full access by default, adjustable by the operator).
+            if p.is_admin {
+                return cfg.admin_policy.clone();
+            }
             if let Some(name) = p.policy_name.as_deref().filter(|n| !n.is_empty()) {
                 if let Some(named) = cfg.policies.get(name) {
                     return named.clone();
@@ -543,6 +593,11 @@ pub fn user_policy(username: &str) -> UserManagedPolicy {
 /// The admin's default policy name for users without their own policy.
 pub fn default_policy_name() -> Option<String> {
     CONFIG.lock().unwrap().default_policy_name.clone()
+}
+
+/// The policy applied to all admin users.
+pub fn admin_policy() -> UserManagedPolicy {
+    CONFIG.lock().unwrap().admin_policy.clone()
 }
 
 /// The named policy assigned to a device (peer id), if any and it still exists.

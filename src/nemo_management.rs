@@ -1472,6 +1472,7 @@ struct PermissionsResponse {
     default_targets: Vec<String>,
     require_login: bool,
     default_policy_name: Option<String>,
+    admin_policy: integration::UserManagedPolicy,
     peers: Vec<PeerBrief>,
 }
 
@@ -1504,6 +1505,7 @@ async fn get_permissions(
         default_targets: integration::default_targets(),
         require_login: integration::require_login(),
         default_policy_name: integration::default_policy_name(),
+        admin_policy: integration::admin_policy(),
         peers: briefs,
     }))
 }
