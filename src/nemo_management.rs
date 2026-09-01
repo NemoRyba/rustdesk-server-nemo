@@ -275,6 +275,27 @@ static STATS: Lazy<RwLock<NemoStatsStore>> = Lazy::new(|| RwLock::new(NemoStatsS
 // persisted so labels survive a restart before the next poll re-reports them.
 static PEER_HOSTNAMES: Lazy<std::sync::RwLock<HashMap<String, String>>> =
     Lazy::new(|| std::sync::RwLock::new(load_peer_hostnames()));
+// S-DUALKEY: which key each peer used on its last poll — "device-key" (its own
+// pinned private key) or "default" (the shared server public key). Runtime only.
+static PEER_AUTH_MODES: Lazy<std::sync::RwLock<HashMap<String, String>>> =
+    Lazy::new(|| std::sync::RwLock::new(HashMap::new()));
+fn record_peer_auth_mode(id: &str, mode: &str) {
+    if id.is_empty() {
+        return;
+    }
+    PEER_AUTH_MODES
+        .write()
+        .unwrap()
+        .insert(id.to_owned(), mode.to_owned());
+}
+fn peer_auth_mode(id: &str) -> String {
+    PEER_AUTH_MODES
+        .read()
+        .unwrap()
+        .get(id)
+        .cloned()
+        .unwrap_or_else(|| "unknown".to_owned())
+}
 
 #[derive(Clone)]
 struct HbbsApiState {
@@ -395,6 +416,8 @@ struct PolicyRequest {
     connection_history_limit: Option<usize>,
     #[serde(default)]
     log_history_limit: Option<usize>,
+    #[serde(default)]
+    require_device_key: Option<bool>,
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -427,6 +450,14 @@ struct ClientPolicyRequest {
     /// "which computer is this ID".
     #[serde(default)]
     hostname: Option<String>,
+    /// S-DUALKEY: the client's provisioned device public key (base64 Ed25519) and
+    /// an attached signature over "nemo-poll:{id}:{ts}". When present and pinned +
+    /// fresh, the client is authenticated with its OWN key (auth mode device-key);
+    /// otherwise it falls back to the shared server key (auth mode default).
+    #[serde(default)]
+    device_key_pub: Option<String>,
+    #[serde(default)]
+    device_key_sig: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -469,6 +500,8 @@ struct PeerResponse {
     online: bool,
     last_seen_ms_ago: Option<u64>,
     stats: NemoPeerStats,
+    // S-DUALKEY: which key this peer used on its last poll — "device-key" / "default".
+    auth_mode: String,
 }
 
 #[derive(Serialize)]
@@ -486,6 +519,7 @@ struct PolicyResponse {
     allowed_status: i64,
     connection_history_limit: usize,
     log_history_limit: usize,
+    require_device_key: bool,
 }
 
 #[derive(Serialize)]
@@ -719,6 +753,11 @@ pub(crate) async fn spawn_hbbs_api(
             "/nemo/api/integration/permissions",
             get(get_permissions).put(put_permissions),
         )
+        .route(
+            "/nemo/api/device-keys",
+            get(list_device_keys).post(generate_device_key),
+        )
+        .route("/nemo/api/device-keys/:id/delete", post(delete_device_key))
         .route(
             "/nemo/api/policies",
             get(get_policies).put(put_policies),
@@ -1519,6 +1558,100 @@ async fn put_permissions(
     Ok(Json(integration::update_permissions(update)))
 }
 
+// --- S-DUALKEY: provisioned device keys -------------------------------------
+#[derive(Deserialize)]
+struct GenerateDeviceKeyRequest {
+    #[serde(default)]
+    label: String,
+}
+#[derive(Serialize)]
+struct GenerateDeviceKeyResponse {
+    id: String,
+    label: String,
+    public_key: String,
+    private_key: String,
+    created_at: String,
+}
+async fn generate_device_key(
+    Extension(state): Extension<HbbsApiState>,
+    headers: HeaderMap,
+    Json(req): Json<GenerateDeviceKeyRequest>,
+) -> ApiResult<GenerateDeviceKeyResponse> {
+    require_auth(&headers, &state.token)?;
+    let (pk, sk) = sign::gen_keypair();
+    let public_key = base64::encode(pk.as_ref());
+    let private_key = base64::encode(sk.as_ref());
+    let created_at = now_iso();
+    let dk = integration::add_device_key(
+        req.label.trim().to_owned(),
+        public_key.clone(),
+        created_at.clone(),
+    );
+    Ok(Json(GenerateDeviceKeyResponse {
+        id: dk.id,
+        label: dk.label,
+        public_key,
+        private_key,
+        created_at,
+    }))
+}
+async fn list_device_keys(
+    Extension(state): Extension<HbbsApiState>,
+    headers: HeaderMap,
+) -> ApiResult<Vec<integration::DeviceKey>> {
+    require_auth(&headers, &state.token)?;
+    Ok(Json(integration::list_device_keys()))
+}
+async fn delete_device_key(
+    Path(id): Path<String>,
+    Extension(state): Extension<HbbsApiState>,
+    headers: HeaderMap,
+) -> ApiResult<serde_json::Value> {
+    require_auth(&headers, &state.token)?;
+    let removed = integration::remove_device_key(&id);
+    Ok(Json(serde_json::json!({ "removed": removed })))
+}
+// Verify a client's device-key signature over "nemo-poll:{id}:{ts}". True only if
+// the public key is pinned, the signature is valid, the id matches, and the ts is
+// fresh (replay window).
+fn verify_device_key(request: &ClientPolicyRequest) -> bool {
+    let (Some(pub_b64), Some(sig_b64)) = (
+        request.device_key_pub.as_deref(),
+        request.device_key_sig.as_deref(),
+    ) else {
+        return false;
+    };
+    if !integration::is_device_key_pinned(pub_b64) {
+        return false;
+    }
+    let (Ok(pk_bytes), Ok(sig_bytes)) =
+        (base64::decode(pub_b64.trim()), base64::decode(sig_b64.trim()))
+    else {
+        return false;
+    };
+    let Some(pk) = sign::PublicKey::from_slice(&pk_bytes) else {
+        return false;
+    };
+    let Ok(msg) = sign::verify(&sig_bytes, &pk) else {
+        return false;
+    };
+    let msg = String::from_utf8_lossy(&msg);
+    let parts: Vec<&str> = msg.splitn(3, ':').collect();
+    if parts.len() != 3 || parts[0] != "nemo-poll" || parts[1] != request.id {
+        return false;
+    }
+    if let Ok(ts) = parts[2].parse::<u64>() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if now.saturating_sub(ts) > 300 || ts.saturating_sub(now) > 60 {
+            return false;
+        }
+    }
+    true
+}
+
 // ---- Named policies (reusable templates assignable to users + devices) ----
 
 #[derive(Serialize)]
@@ -2297,6 +2430,16 @@ async fn client_policy(
     validate_client_policy_request(&peer, &request)?;
     // Learn this peer's hostname from its own poll so the address book can show it.
     record_peer_hostname(&request.id, request.hostname.as_deref().unwrap_or(""));
+    // S-DUALKEY: note which key the client authenticated with, and enforce the
+    // "require provisioned device key" setting.
+    let device_key_ok = verify_device_key(&request);
+    record_peer_auth_mode(&request.id, if device_key_ok { "device-key" } else { "default" });
+    if integration::require_device_key() && !device_key_ok {
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "a provisioned device key is required",
+        ));
+    }
     if let Some(version) = request.policy_version.as_deref() {
         log::trace!("Client {} requested management policy after {}", request.id, version);
     }
@@ -2505,6 +2648,9 @@ async fn update_policy(
             format!("log_history_limit={}", limit),
         );
     }
+    if let Some(require) = request.require_device_key {
+        integration::set_require_device_key(require);
+    }
     Ok(Json(policy_response()))
 }
 
@@ -2628,6 +2774,7 @@ async fn peer_response(pm: &PeerMap, peer: RegisteredPeer) -> PeerResponse {
             .and_then(|snapshot| snapshot.public_addr.clone()),
         online: runtime.as_ref().map(|snapshot| snapshot.online).unwrap_or(false),
         last_seen_ms_ago: runtime.and_then(|snapshot| snapshot.last_seen_ms_ago),
+        auth_mode: peer_auth_mode(&peer.id),
         stats: peer_stats(&peer.id).await,
     }
 }
@@ -2648,6 +2795,7 @@ fn policy_response() -> PolicyResponse {
         allowed_status: 1,
         connection_history_limit: conn_history_limit(),
         log_history_limit: log_history_limit(),
+        require_device_key: integration::require_device_key(),
     }
 }
 

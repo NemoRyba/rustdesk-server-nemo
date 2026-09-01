@@ -827,6 +827,34 @@
           </div>
         </div>
       </section>
+      <section class="panel" data-panel-id="device-keys">
+        <div class="panel-head">
+          <h2 class="panel-title">Device keys</h2>
+        </div>
+        <div style="padding:12px 16px;display:flex;flex-direction:column;gap:12px;">
+          <div style="font-size:12px;opacity:0.75;line-height:1.4;max-width:900px;">Generate a per-client key here, then <b>import the private key into that client</b> (the client's &ldquo;Import device key&rdquo; dialog). The server pins the public half; the client then proves its identity with its <b>own</b> key instead of only the shared server key. <b>The private key is shown once &mdash; copy it immediately.</b></div>
+          <label style="display:flex;gap:10px;align-items:flex-start;cursor:pointer;max-width:760px;">
+            <input id="requireDeviceKey" type="checkbox" style="margin-top:3px;">
+            <span><span style="font-weight:600;">Require a provisioned device key</span><span style="display:block;font-size:12px;opacity:0.7;margin-top:3px;line-height:1.4;">Reject any client that does not sign its poll with a pinned device key (clients with only the shared server key are refused).</span></span>
+          </label>
+          <div style="display:flex;gap:8px;align-items:center;">
+            <button id="reqDeviceKeySave" class="primary">Save requirement</button>
+            <span id="reqDeviceKeyMsg" style="font-size:12px;opacity:0.8;"></span>
+          </div>
+          <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
+            <input id="deviceKeyLabel" type="text" placeholder="label (e.g. Reception-PC)" style="min-width:220px;">
+            <button id="generateDeviceKey">Generate device key</button>
+          </div>
+          <div id="deviceKeyGenerated" style="display:none;"></div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Label</th><th>Public key</th><th>Created</th><th></th></tr></thead>
+              <tbody id="deviceKeysBody"></tbody>
+            </table>
+            <div id="deviceKeysEmpty" class="empty">No device keys yet.</div>
+          </div>
+        </div>
+      </section>
       </div>
     </div>
 
@@ -1114,7 +1142,7 @@
         document.querySelectorAll(".view").forEach((v) => { v.hidden = v.id !== "view-" + view; });
         if (view === "integration") loadIntegration();
         if (view === "acl") loadIntegration();
-        if (view === "settings") refreshGlobalPolicy();
+        if (view === "settings") { refreshGlobalPolicy(); loadDeviceKeys(); }
         // Connections now live under the Log view (#6): load + auto-refresh there.
         if (view === "log") { loadConnections(); startConnTimer(); } else { stopConnTimer(); }
       });
@@ -1419,6 +1447,46 @@
         setMsg("logHistoryMsg", err.message, false);
       }
     });
+    async function loadDeviceKeys() {
+      try {
+        const keys = await api("/nemo/api/device-keys");
+        const body = $("deviceKeysBody");
+        body.innerHTML = (keys || []).map((k) => `<tr>
+          <td>${escapeHtml(k.label || "")}</td>
+          <td class="mono" style="word-break:break-all;font-size:11px;">${escapeHtml(k.public_key || "")}</td>
+          <td>${escapeHtml((k.created_at || "").replace("T", " ").slice(0, 19))}</td>
+          <td><button class="danger" data-devkey-del="${escapeHtml(k.id)}">Delete</button></td>
+        </tr>`).join("");
+        $("deviceKeysEmpty").style.display = (keys && keys.length) ? "none" : "block";
+        body.querySelectorAll("[data-devkey-del]").forEach((btn) => btn.addEventListener("click", async () => {
+          if (!confirm("Delete this device key? A client using it will be refused if 'require device key' is on.")) return;
+          await api("/nemo/api/device-keys/" + encodeURIComponent(btn.dataset.devkeyDel) + "/delete", { method: "POST" });
+          loadDeviceKeys();
+        }));
+      } catch (e) {}
+    }
+    $("generateDeviceKey").addEventListener("click", async () => {
+      const label = $("deviceKeyLabel").value.trim();
+      try {
+        const r = await api("/nemo/api/device-keys", { method: "POST", body: JSON.stringify({ label }) });
+        const box = $("deviceKeyGenerated");
+        box.style.display = "block";
+        box.innerHTML = `<div style="padding:10px 12px;border:1px solid #f0d98c;background:#fff8e6;border-radius:6px;font-size:12px;line-height:1.5;">
+          <b>Copy this private key into the client now &mdash; it will not be shown again.</b><br>
+          Label: ${escapeHtml(r.label || "(none)")}
+          <div style="margin-top:6px;"><b>Private key (import into client):</b><br><textarea readonly style="width:100%;height:52px;font-family:monospace;font-size:11px;">${escapeHtml(r.private_key)}</textarea></div>
+          <div style="margin-top:4px;opacity:0.7;">Public key (pinned): <span class="mono" style="word-break:break-all;">${escapeHtml(r.public_key)}</span></div>
+        </div>`;
+        $("deviceKeyLabel").value = "";
+        loadDeviceKeys();
+      } catch (e) { alert(e.message); }
+    });
+    $("reqDeviceKeySave").addEventListener("click", async () => {
+      try {
+        await api("/nemo/api/policy", { method: "PUT", body: JSON.stringify({ require_device_key: $("requireDeviceKey").checked }) });
+        setMsg("reqDeviceKeyMsg", "Saved", true);
+      } catch (e) { setMsg("reqDeviceKeyMsg", e.message, false); }
+    });
     $("autoRefresh").addEventListener("change", schedule);
 
     function headers() {
@@ -1461,6 +1529,9 @@
         }
         if (health.log_history_limit != null && $("logHistoryLimit") && document.activeElement !== $("logHistoryLimit")) {
           $("logHistoryLimit").value = health.log_history_limit;
+        }
+        if (health.require_device_key != null && $("requireDeviceKey") && document.activeElement !== $("requireDeviceKey")) {
+          $("requireDeviceKey").checked = !!health.require_device_key;
         }
         state.peers = peers.peers || [];
         const currentIds = new Set(state.peers.map((peer) => peer.id));
@@ -1654,6 +1725,7 @@
       detail.className = "detail";
       detail.innerHTML = `
         <dl class="kv">
+          <dt title="Which key this client used to authenticate its last policy poll: its own provisioned device key, or only the shared server key.">Key auth</dt><dd>${peer.auth_mode === 'device-key' ? '<span style="color:#1a7a34;font-weight:600">own device key</span>' : (peer.auth_mode === 'default' ? '<span style="color:#8a6d1a">server key only</span>' : '<span style="opacity:0.5">unknown</span>')}</dd>
           <dt>Local Addr</dt><dd>${stats.local_addr_attempts || 0}</dd>
           <dt>Relay Requests</dt><dd>${stats.relay_requests || 0}</dd>
           <dt>Relay Responses</dt><dd>${stats.relay_responses || 0}</dd>

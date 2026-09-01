@@ -186,6 +186,24 @@ pub struct IntegrationConfig {
     /// default, adjustable if the operator wants to restrict admins.
     #[serde(default = "default_admin_policy")]
     pub admin_policy: UserManagedPolicy,
+    /// Provisioned per-client device keys the server trusts: the operator
+    /// generates a keypair here (pins the public half) and imports the private
+    /// half into the client, so the client can prove its identity to the server.
+    #[serde(default)]
+    pub device_keys: Vec<DeviceKey>,
+    /// When true, only clients that sign their poll with a PINNED device key are
+    /// accepted; clients with just the server's public key are refused.
+    #[serde(default)]
+    pub require_device_key: bool,
+}
+
+/// A provisioned client device key (public half pinned server-side).
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub struct DeviceKey {
+    pub id: String,
+    pub label: String,
+    pub public_key: String, // base64 Ed25519 public key
+    pub created_at: String,
 }
 
 /// Full-access baseline for admin users: every capability allowed, full control,
@@ -227,6 +245,8 @@ impl Default for IntegrationConfig {
             device_policies: HashMap::new(),
             default_policy_name: None,
             admin_policy: default_admin_policy(),
+            device_keys: Vec::new(),
+            require_device_key: false,
         }
     }
 }
@@ -598,6 +618,58 @@ pub fn default_policy_name() -> Option<String> {
 /// The policy applied to all admin users.
 pub fn admin_policy() -> UserManagedPolicy {
     CONFIG.lock().unwrap().admin_policy.clone()
+}
+
+// --- Provisioned device keys -------------------------------------------------
+pub fn add_device_key(label: String, public_key: String, created_at: String) -> DeviceKey {
+    // URL-safe id (base64 can contain '/' '+' '=' which break the :id route).
+    let id = public_key
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(16)
+        .collect::<String>();
+    let dk = DeviceKey {
+        id: id.clone(),
+        label,
+        public_key,
+        created_at,
+    };
+    let mut cfg = CONFIG.lock().unwrap();
+    cfg.device_keys.retain(|k| k.id != id);
+    cfg.device_keys.push(dk.clone());
+    persist(&cfg);
+    dk
+}
+pub fn list_device_keys() -> Vec<DeviceKey> {
+    CONFIG.lock().unwrap().device_keys.clone()
+}
+pub fn remove_device_key(id: &str) -> bool {
+    let mut cfg = CONFIG.lock().unwrap();
+    let before = cfg.device_keys.len();
+    cfg.device_keys.retain(|k| k.id != id);
+    let removed = cfg.device_keys.len() != before;
+    if removed {
+        persist(&cfg);
+    }
+    removed
+}
+pub fn is_device_key_pinned(public_key: &str) -> bool {
+    let pk = public_key.trim();
+    !pk.is_empty()
+        && CONFIG
+            .lock()
+            .unwrap()
+            .device_keys
+            .iter()
+            .any(|k| k.public_key == pk)
+}
+pub fn require_device_key() -> bool {
+    CONFIG.lock().unwrap().require_device_key
+}
+pub fn set_require_device_key(v: bool) {
+    let mut cfg = CONFIG.lock().unwrap();
+    cfg.require_device_key = v;
+    persist(&cfg);
 }
 
 /// The named policy assigned to a device (peer id), if any and it still exists.
