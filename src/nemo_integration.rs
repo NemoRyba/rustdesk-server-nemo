@@ -603,9 +603,15 @@ pub fn user_policy(username: &str) -> UserManagedPolicy {
     match cfg.permissions.get(&key) {
         Some(p) => {
             // Admins bypass every normal policy and get the single admin policy
-            // (full access by default, adjustable by the operator).
+            // (full access by default, adjustable by the operator). It is
+            // delivered as *defaults only* (allow_user_override forced true):
+            // an admin may flip any setting locally on the client they are
+            // logged in to — e.g. test one-way file transfer — regardless of
+            // how the stored admin policy is flagged.
             if p.is_admin {
-                return cfg.admin_policy.clone();
+                let mut ap = cfg.admin_policy.clone();
+                ap.allow_user_override = true;
+                return ap;
             }
             if let Some(name) = p.policy_name.as_deref().filter(|n| !n.is_empty()) {
                 if let Some(named) = cfg.policies.get(name) {
@@ -1639,6 +1645,26 @@ mod tests {
         let mut cfg = CONFIG.lock().unwrap();
         cfg.permissions.remove("__testuser");
         cfg.device_policies.remove("__testpeer");
+    }
+
+    // An admin gets the admin policy as DEFAULTS ONLY: allow_user_override is
+    // forced true on delivery so the admin can flip any setting locally on the
+    // client, even when the stored admin policy is flagged non-overridable.
+    #[test]
+    fn admin_policy_is_delivered_user_overridable() {
+        {
+            let mut cfg = CONFIG.lock().unwrap();
+            assert!(!cfg.admin_policy.allow_user_override, "precondition: stored admin policy is non-overridable");
+            let mut up = UserPermission::default();
+            up.is_admin = true;
+            cfg.permissions.insert("__testadmin".to_owned(), up);
+        }
+        let ap = user_policy("__testadmin");
+        assert!(ap.allow_user_override, "admin policy must be delivered with allow_user_override=true");
+        // The stored config itself must stay untouched.
+        let mut cfg = CONFIG.lock().unwrap();
+        assert!(!cfg.admin_policy.allow_user_override);
+        cfg.permissions.remove("__testadmin");
     }
 
     #[test]
