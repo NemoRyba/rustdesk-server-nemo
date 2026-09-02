@@ -3308,6 +3308,8 @@ mod tests {
             policy_version: None,
             access_token: None,
             hostname: None,
+            device_key_pub: None,
+            device_key_sig: None,
         };
         assert!(validate_client_policy_request(&peer, &ok).is_ok());
         // Empty id.
@@ -3317,6 +3319,8 @@ mod tests {
             policy_version: None,
             access_token: None,
             hostname: None,
+            device_key_pub: None,
+            device_key_sig: None,
         };
         assert_eq!(
             validate_client_policy_request(&peer, &no_id).unwrap_err().0,
@@ -3329,6 +3333,8 @@ mod tests {
             policy_version: None,
             access_token: None,
             hostname: None,
+            device_key_pub: None,
+            device_key_sig: None,
         };
         assert_eq!(
             validate_client_policy_request(&peer, &bad_b64).unwrap_err().0,
@@ -3341,6 +3347,8 @@ mod tests {
             policy_version: None,
             access_token: None,
             hostname: None,
+            device_key_pub: None,
+            device_key_sig: None,
         };
         assert_eq!(
             validate_client_policy_request(&peer, &mismatch).unwrap_err().0,

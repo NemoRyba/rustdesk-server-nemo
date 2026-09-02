@@ -296,6 +296,21 @@ fn load_config() -> IntegrationConfig {
     }
 }
 
+// M3: the integration config holds the LDAP bind password and the sessions file holds
+// live bearer tokens. Restrict them to the service account (0600, like the TLS private
+// key) so other local users cannot read domain credentials or hijack sessions.
+fn restrict_file(path: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
+            log::warn!("could not restrict permissions on {}: {}", path.display(), e);
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+}
+
 fn persist(cfg: &IntegrationConfig) {
     let path = config_path();
     match serde_json::to_string_pretty(cfg) {
@@ -306,6 +321,8 @@ fn persist(cfg: &IntegrationConfig) {
                     path.display(),
                     err
                 );
+            } else {
+                restrict_file(&path);
             }
         }
         Err(err) => log::error!("failed to serialize Nemo integration config: {}", err),
@@ -790,6 +807,9 @@ fn persist_sessions(sessions: &HashMap<String, Session>) {
         let path = sessions_path();
         if let Err(err) = std::fs::write(&path, text) {
             log::error!("failed to persist Nemo sessions to {}: {}", path.display(), err);
+        } else {
+            // M3: live bearer tokens — keep them readable only by the service account.
+            restrict_file(&path);
         }
     }
 }
