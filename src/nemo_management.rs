@@ -1907,6 +1907,28 @@ async fn list_blocked_ids(pm: &PeerMap) -> Vec<String> {
     }
 }
 
+// B (encrypted direct-IP): build the `{id -> Ed25519 pubkey}` map pushed to clients so a
+// controller can verify a direct-IP peer's self-signed SignedId and establish an
+// encrypted session with NO rendezvous broker (server-anchored, no TOFU/MITM window).
+// Format: "id,pkB64;id,pkB64" (pk = the peer's registered identity key). The keys are
+// public and the whole map rides inside the signed client policy, so it can't be forged.
+// (Small deployments: a per-poll scan is fine; add a bump-on-change cache if the peer
+// table ever grows large, same as `list_blocked_ids`.)
+async fn peer_key_map(pm: &PeerMap) -> String {
+    match pm.list_registered(100_000, 0).await {
+        Ok(peers) => peers
+            .into_iter()
+            .filter(|p| p.pk.len() == 32)
+            .map(|p| format!("{},{}", p.id, base64::encode(&p.pk)))
+            .collect::<Vec<_>>()
+            .join(";"),
+        Err(e) => {
+            log::error!("peer_key_map failed: {}", e);
+            String::new()
+        }
+    }
+}
+
 pub(crate) async fn is_peer_allowed(pm: &PeerMap, id: &str) -> bool {
     pm.is_peer_allowed_for_control(id, company_only()).await
 }
@@ -2093,10 +2115,16 @@ pub(crate) async fn record_connection_negotiation(
     // Verbose audit line: the server sees connection SETUP (punch/relay) even for
     // direct sessions, so this records who connected to which machine, over what
     // path — visible in the server log regardless of whether the session is direct.
+    // H1: log ONLY the parsed source id, never the raw `source_field` — it carries the
+    // logged-in user's session token (`nemo-source-v1:<id>:<uuid>:<token>`), and printing
+    // it would leak a live bearer credential into the server log.
+    let source_id = controller_source_identity(source_field)
+        .map(|(sid, _, _)| sid)
+        .unwrap_or_else(|| "?".to_owned());
     log::info!(
-        "Nemo connect: target={} source='{}' from={} to={} nat={} path={}",
+        "Nemo connect: target={} source={} from={} to={} nat={} path={}",
         id,
-        source_field,
+        source_id,
         from_addr,
         to_addr,
         nat_type_name(nat_type),
@@ -2509,6 +2537,15 @@ async fn client_policy(
         policy
             .options
             .insert("nemo-blocked-ids".to_owned(), blocked.join(","));
+    }
+    // B: push the signed `{id -> Ed25519 pubkey}` map so a controller can verify a
+    // direct-IP peer's SignedId and encrypt the session with no rendezvous broker
+    // (server-anchored). Public keys only; anchored by the policy signature.
+    let peer_keys = peer_key_map(&state.pm).await;
+    if !peer_keys.is_empty() {
+        policy
+            .options
+            .insert("nemo-peer-keys".to_owned(), peer_keys);
     }
     if matches!(peer.status, Some(0)) {
         policy.allow_user_override = false;
