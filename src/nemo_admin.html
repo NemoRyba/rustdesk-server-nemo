@@ -1708,6 +1708,22 @@
       return alias ? alias : addr;
     }
 
+    // "which computer is this id" — a small hostname · alias line for the Connections
+    // FROM/TO columns, looked up from the loaded peer list by id.
+    function peerHostAlias(id) {
+      if (!id) return "";
+      const peer = state.peers.find((p) => p.id === id);
+      if (!peer) return "";
+      const host = (peer.hostname || "").trim();
+      const alias = peerAlias(peer).trim();
+      const parts = [];
+      if (host) parts.push(escapeHtml(host));
+      if (alias && alias !== host) parts.push(escapeHtml(alias));
+      return parts.length
+        ? `<div style="font-size:11px;opacity:0.8">${parts.join(" &middot; ")}</div>`
+        : "";
+    }
+
     function renderDetail() {
       const peer = state.peers.find((item) => item.id === state.selectedId);
       const detail = $("detail");
@@ -2405,8 +2421,8 @@
         $("connEmpty").style.display = "none";
         body.innerHTML = conns.map((c) => `
           <tr>
-            <td>${c.source_id ? `<code>${escapeHtml(c.source_id)}</code>` : '<span style="opacity:0.5">unknown</span>'}<div style="font-size:11px;opacity:0.6">${escapeHtml(c.source_addr)}</div></td>
-            <td><code>${escapeHtml(c.target_id)}</code><div style="font-size:11px;opacity:0.6">${escapeHtml(c.target_addr)}</div></td>
+            <td>${c.source_id ? `<code>${escapeHtml(c.source_id)}</code>` : '<span style="opacity:0.5">unknown</span>'}${peerHostAlias(c.source_id)}<div style="font-size:11px;opacity:0.6">${escapeHtml(c.source_addr)}</div></td>
+            <td><code>${escapeHtml(c.target_id)}</code>${peerHostAlias(c.target_id)}<div style="font-size:11px;opacity:0.6">${escapeHtml(c.target_addr)}</div></td>
             <td>${pathBadge(c.path)}</td>
             <td>${c.relay_server ? escapeHtml(c.relay_server) : '<span style="opacity:0.4">—</span>'}</td>
             <td>${escapeHtml(c.nat_type || "")}</td>

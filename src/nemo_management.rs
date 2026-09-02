@@ -485,6 +485,9 @@ struct PeerListResponse {
 #[derive(Serialize)]
 struct PeerResponse {
     id: String,
+    // The peer's self-reported hostname (from its management poll), so the dashboard
+    // can label it (e.g. in the Connections view) with "which computer is this id".
+    hostname: String,
     guid: String,
     uuid: String,
     public_key: String,
@@ -2795,6 +2798,7 @@ async fn peer_response(pm: &PeerMap, peer: RegisteredPeer) -> PeerResponse {
         });
     PeerResponse {
         id: peer.id.clone(),
+        hostname: peer_hostname(&peer.id),
         guid: base64::encode(peer.guid),
         uuid: base64::encode(peer.uuid),
         public_key: base64::encode(peer.pk),
