@@ -1019,6 +1019,27 @@
           </div>
         </div>
       </section>
+      <section class="panel" data-panel-id="device-policies">
+        <div class="panel-head">
+          <h2 class="panel-title">Device Policy Assignment <small class="mini-stats"><b id="mDevices">0</b> devices</small></h2>
+        </div>
+        <div style="padding:12px 16px;display:flex;flex-direction:column;gap:12px;">
+          <div style="font-size:12px;opacity:0.75;line-height:1.4;max-width:900px;">Assign a named policy directly to a <b>device</b> (registered peer). It applies to that device's incoming sessions <b>when no user is logged in</b> &mdash; e.g. an unattended machine or a TBFDesk <b>service</b>. Precedence: a logged-in user's own policy still wins, the device policy overrides the global default. Changes save immediately. Manage the policies themselves below in <b>Policies</b>.</div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th title="The registered peer / device ID.">Device (ID)</th>
+                  <th title="The device's self-reported hostname and/or alias.">Hostname / Alias</th>
+                  <th title="Named policy applied to this device when no user is logged in.">Device policy</th>
+                </tr>
+              </thead>
+              <tbody id="devicePolicyBody"></tbody>
+            </table>
+            <div id="devicePolicyEmpty" class="empty">No registered devices yet.</div>
+          </div>
+        </div>
+      </section>
       <section class="panel" data-panel-id="admin-policy">
         <div class="panel-head">
           <h2 class="panel-title">Admin policy</h2>
@@ -2194,6 +2215,38 @@
           const name = e.target.closest(".policy-def").dataset.policyName;
           delete integ.policies[name];
           renderPolicies();
+        });
+      });
+      renderDevicePolicies();
+    }
+
+    // Device-level policy assignment (ACL & Policy tab): assign a named policy to
+    // a device/registered peer, applied when no user is logged in (e.g. services).
+    // Reuses the existing POST /nemo/api/policies/device endpoint; saves on change.
+    function renderDevicePolicies() {
+      const body = $("devicePolicyBody");
+      if (!body) return;
+      const peers = integ.peers || [];
+      const policyNames = Object.keys(integ.policies || {}).sort();
+      if ($("mDevices")) $("mDevices").textContent = peers.length;
+      if ($("devicePolicyEmpty")) $("devicePolicyEmpty").style.display = peers.length ? "none" : "";
+      body.innerHTML = peers.map((p) => {
+        const cur = (integ.devicePolicies || {})[p.id] || "";
+        const opts = ['<option value="">— none —</option>'].concat(
+          policyNames.map((pn) => `<option value="${escapeHtml(pn)}" ${cur === pn ? "selected" : ""}>${escapeHtml(pn)}</option>`)
+        ).join("");
+        const sp = (state.peers || []).find((x) => x.id === p.id);
+        const host = ((sp && sp.hostname) || p.hostname || "").trim();
+        const alias = peerAlias(sp || p) || "";
+        const label = [host, alias].filter((x) => x && x.trim()).map((x) => escapeHtml(x)).join(" &middot; ") || '<span style="opacity:0.4">&mdash;</span>';
+        return `<tr data-peer="${escapeHtml(p.id)}"><td><code>${escapeHtml(p.id)}</code></td><td>${label}</td><td><select class="devpol-select" data-peer="${escapeHtml(p.id)}">${opts}</select></td></tr>`;
+      }).join("");
+      body.querySelectorAll("select.devpol-select").forEach((sel) => {
+        sel.addEventListener("change", async () => {
+          try {
+            const res = await api("/nemo/api/policies/device", { method: "POST", body: JSON.stringify({ peer_id: sel.dataset.peer, policy_name: sel.value || null }) });
+            integ.devicePolicies = res.device_policies || {};
+          } catch (err) { alert(err.message); }
         });
       });
     }
