@@ -614,6 +614,10 @@
     .panel-board > .panel.panel-sized > .panel-head { flex: 0 0 auto; }
     .panel-board > .panel.panel-sized > :not(.panel-head):not(.panel-resize):not(.panel-resize-v):not(.panel-resize-c) {
       flex: 1 1 auto; overflow: auto; min-height: 0; }
+    /* Inside a height-locked panel the body is the single scroll region: drop the
+       table's own max-height so its content fills the panel instead of leaving dead
+       space above a nested scrollbar. */
+    .panel-board > .panel.panel-sized .table-wrap { max-height: none; }
     .board-hint { padding: 12px 2px 10px; text-align: right; }
     .board-hint button { min-height: 26px; padding: 3px 14px; font-size: 12px;
       background: #c97e76; color: #fff; border: 1px solid #b56a62; border-radius: 4px; cursor: pointer; }
@@ -847,7 +851,8 @@
           </div>
           <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
             <input id="deviceKeyLabel" type="text" placeholder="label (e.g. Reception-PC)" style="min-width:220px;">
-            <input id="deviceKeyPeerId" type="text" placeholder="bind to TBFDesk ID (recommended)" style="min-width:220px;">
+            <input id="deviceKeyPeerId" list="deviceKeyPeerList" type="text" placeholder="bind to TBFDesk ID — pick or type (empty = any client)" style="min-width:300px;">
+            <datalist id="deviceKeyPeerList"></datalist>
             <button id="generateDeviceKey">Generate device key</button>
           </div>
           <div style="font-size:12px;opacity:0.7;line-height:1.4;max-width:900px;">Binding a key to one TBFDesk ID means it can only authenticate <b>that</b> client &mdash; a leaked key no longer works fleet-wide. Leave empty only for a legacy any-client key.</div>
@@ -1474,8 +1479,24 @@
         setMsg("logHistoryMsg", err.message, false);
       }
     });
+    // The "bind to TBFDesk ID" field is pick-or-type: this fills its datalist with
+    // the known devices (registered peers) so an operator can select instead of
+    // remembering an id. Empty stays valid (legacy any-client key); a not-yet-seen
+    // id can still be typed freely.
+    function renderDeviceKeyPeerList() {
+      const dl = $("deviceKeyPeerList");
+      if (!dl) return;
+      const peers = (state.peers || []).slice()
+        .sort((a, b) => (a.alias || a.hostname || a.id).localeCompare(b.alias || b.hostname || b.id));
+      dl.innerHTML = peers.map((p) => {
+        const name = (p.alias || p.hostname || "").trim();
+        const label = (name ? name + " · " : "") + (p.online ? "online" : "offline");
+        return `<option value="${escapeHtml(p.id)}" label="${escapeHtml(label)}"></option>`;
+      }).join("");
+    }
     async function loadDeviceKeys() {
       try {
+        renderDeviceKeyPeerList();
         const keys = await api("/nemo/api/device-keys");
         const body = $("deviceKeysBody");
         body.innerHTML = (keys || []).map((k) => `<tr>
@@ -1578,6 +1599,7 @@
         setHealth("ok", "Online");
         renderSummary();
         renderPeers();
+        renderDeviceKeyPeerList();
         renderEvents();
         renderDetail();
       } catch (err) {
@@ -2324,6 +2346,9 @@
       }
       $("permsEmpty").style.display = "none";
       const policyNames = Object.keys(integ.policies || {}).sort();
+      // Grow the "Allowed targets" list to fit the fleet (wildcard + peers) up to a
+      // sane cap, so it uses the panel's room instead of a fixed cramped scroll box.
+      const targetRows = Math.min(Math.max((integ.peers || []).length + 1, 4), 12);
       body.innerHTML = names.map((name) => {
         const u = integ.perms[name] || {};
         const isOpen = integ.selectedPolicyUser === name;
@@ -2333,7 +2358,7 @@
           <td><code>${escapeHtml(name)}</code></td>
           <td>${escapeHtml(u.display_name || "")}</td>
           <td class="perm-admin"><input type="checkbox" class="perm-admin-cb" ${u.is_admin ? "checked" : ""}></td>
-          <td><select multiple class="perm-targets">${targetOptionsHtml(u.allowed_targets)}</select><div style="margin-top:4px;"><button type="button" class="perm-clear-targets${(u.allowed_targets || []).length === 0 ? ' active' : ''}" style="font-size:11px;padding:1px 8px;" title="Clear the selection so this user reaches NO peers. (No effect on admins, who always reach every peer.)">No peers</button></div></td>
+          <td><select multiple size="${targetRows}" class="perm-targets">${targetOptionsHtml(u.allowed_targets)}</select><div style="margin-top:4px;"><button type="button" class="perm-clear-targets${(u.allowed_targets || []).length === 0 ? ' active' : ''}" style="font-size:11px;padding:1px 8px;" title="Clear the selection so this user reaches NO peers. (No effect on admins, who always reach every peer.)">No peers</button></div></td>
           <td>
             <select class="perm-policy-select" title="Assign a named policy, or keep a custom/inline policy for this user">
               <option value="">— Custom / inline —</option>
