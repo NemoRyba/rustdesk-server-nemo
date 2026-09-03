@@ -17,12 +17,19 @@ fn nemo_build_id() {
     }
     let hash = git(&["rev-parse", "--short", "HEAD"]).unwrap_or_else(|| "unknown".to_owned());
     let date = git(&["show", "-s", "--format=%cs", "HEAD"]).unwrap_or_default();
-    let dirty = git(&["status", "--porcelain", "--untracked-files=no"])
-        .map(|s| {
-            s.lines()
-                .any(|l| l.get(3..).map(|p| p.trim() != "db_v2.sqlite3").unwrap_or(true))
-        })
-        .unwrap_or(false);
+    // Any tracked change other than the live DB makes this a dirty (uncommitted)
+    // build. Let git evaluate the pathspec exclusion so line-ending/normalization
+    // is handled correctly (a substring compare misfired on scp'd working copies).
+    let dirty = git(&[
+        "status",
+        "--porcelain",
+        "--untracked-files=no",
+        "--",
+        ".",
+        ":!db_v2.sqlite3",
+    ])
+    .map(|s| !s.trim().is_empty())
+    .unwrap_or(false);
     println!(
         "cargo:rustc-env=NEMO_BUILD_ID={}{}{}{}",
         hash,
