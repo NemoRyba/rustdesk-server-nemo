@@ -195,6 +195,12 @@ pub struct IntegrationConfig {
     /// accepted; clients with just the server's public key are refused.
     #[serde(default)]
     pub require_device_key: bool,
+    /// H4: when true, secret policy values (managed password etc.) are STRIPPED from
+    /// any policy response that cannot be sealed to a verified device key, instead of
+    /// being sent in plaintext authenticated only by id+uuid. Off by default so an
+    /// unprovisioned fleet keeps working; turn on once every client has a device key.
+    #[serde(default)]
+    pub strip_unsealed_secrets: bool,
 }
 
 /// A provisioned client device key (public half pinned server-side).
@@ -204,6 +210,11 @@ pub struct DeviceKey {
     pub label: String,
     pub public_key: String, // base64 Ed25519 public key
     pub created_at: String,
+    /// M1: the peer id this key is bound to. Empty = legacy unbound key (any id).
+    /// A bound key only authenticates polls for exactly this peer id, so one leaked
+    /// key no longer satisfies require_device_key for the whole fleet.
+    #[serde(default)]
+    pub peer_id: String,
 }
 
 /// Full-access baseline for admin users: every capability allowed, full control,
@@ -247,6 +258,7 @@ impl Default for IntegrationConfig {
             admin_policy: default_admin_policy(),
             device_keys: Vec::new(),
             require_device_key: false,
+            strip_unsealed_secrets: false,
         }
     }
 }
@@ -296,9 +308,11 @@ fn load_config() -> IntegrationConfig {
     }
 }
 
-// M3: the integration config holds the LDAP bind password and the sessions file holds
-// live bearer tokens. Restrict them to the service account (0600, like the TLS private
-// key) so other local users cannot read domain credentials or hijack sessions.
+// M3 / C1: the integration config holds the LDAP bind password and the sessions file
+// holds live bearer tokens. Restrict them to the service account so other local users
+// cannot read domain credentials or hijack sessions. The production server runs on Linux
+// (0600, like the TLS private key); the Windows branch is defensive for a Windows-hosted
+// server (C1: the previous cfg(not(unix)) no-op left these files world-readable there).
 fn restrict_file(path: &std::path::Path) {
     #[cfg(unix)]
     {
@@ -307,8 +321,45 @@ fn restrict_file(path: &std::path::Path) {
             log::warn!("could not restrict permissions on {}: {}", path.display(), e);
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        restrict_file_windows(path);
+    }
+    #[cfg(not(any(unix, windows)))]
     let _ = path;
+}
+
+// C1: strip inherited ACEs and grant Full Control ONLY to SYSTEM, Administrators, and the
+// account running the server. Uses icacls (always present on Windows); SIDs are used for
+// SYSTEM (S-1-5-18) and Administrators (S-1-5-32-544) so it is locale-independent. Best
+// effort with a loud warning on failure — never silently leaves the file world-readable.
+#[cfg(windows)]
+fn restrict_file_windows(path: &std::path::Path) {
+    let Some(path_str) = path.to_str() else {
+        log::warn!("could not restrict {}: non-UTF-8 path", path.display());
+        return;
+    };
+    let mut cmd = std::process::Command::new("icacls");
+    cmd.arg(path_str)
+        .args(["/inheritance:r"])
+        .args(["/grant:r", "*S-1-5-18:(F)"])
+        .args(["/grant:r", "*S-1-5-32-544:(F)"]);
+    // Grant the running account too, so the service can still read/write its own files.
+    if let Ok(user) = std::env::var("USERNAME") {
+        if !user.trim().is_empty() {
+            cmd.args(["/grant:r", &format!("{}:(F)", user.trim())]);
+        }
+    }
+    match cmd.output() {
+        Ok(out) if out.status.success() => {}
+        Ok(out) => log::warn!(
+            "icacls could not restrict {} (exit {:?}): {}",
+            path.display(),
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ),
+        Err(e) => log::warn!("could not run icacls to restrict {}: {}", path.display(), e),
+    }
 }
 
 fn persist(cfg: &IntegrationConfig) {
@@ -644,21 +695,52 @@ pub fn admin_policy() -> UserManagedPolicy {
 }
 
 // --- Provisioned device keys -------------------------------------------------
-pub fn add_device_key(label: String, public_key: String, created_at: String) -> DeviceKey {
-    // URL-safe id (base64 can contain '/' '+' '=' which break the :id route).
-    let id = public_key
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric())
-        .take(16)
-        .collect::<String>();
+
+// URL-safe id for a device key (base64 can contain '/' '+' '=' which break the
+// :id route). L-fix: a bare 16-char prefix could collide between two different
+// keys and silently REPLACE the previously pinned one — extend the prefix until
+// it is unique among the existing keys (extremely unlikely to go past 16 chars,
+// but a collision must never unpin someone else's key).
+pub(crate) fn device_key_id_for(public_key: &str, existing: &[DeviceKey]) -> String {
+    let alnum: String = public_key.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+    // B2: an all-symbol / empty public key yields an empty alnum; `.max(1)` would then
+    // slice &alnum[..1] and panic. Return empty rather than panic (the only caller
+    // supplies a real base64 Ed25519 key, but keep this total for any future path).
+    if alnum.is_empty() {
+        return String::new();
+    }
+    let mut len = 16.min(alnum.len()).max(1);
+    loop {
+        let candidate = &alnum[..len];
+        let collides = existing
+            .iter()
+            .any(|k| k.id == candidate && k.public_key != public_key);
+        if !collides || len >= alnum.len() {
+            return candidate.to_owned();
+        }
+        len = (len + 4).min(alnum.len());
+    }
+}
+
+pub fn add_device_key(
+    label: String,
+    public_key: String,
+    created_at: String,
+    peer_id: String,
+) -> DeviceKey {
+    let mut cfg = CONFIG.lock().unwrap();
+    let id = device_key_id_for(&public_key, &cfg.device_keys);
     let dk = DeviceKey {
         id: id.clone(),
         label,
-        public_key,
+        public_key: public_key.clone(),
         created_at,
+        peer_id: peer_id.trim().to_owned(),
     };
-    let mut cfg = CONFIG.lock().unwrap();
-    cfg.device_keys.retain(|k| k.id != id);
+    // Re-adding the SAME public key replaces its entry (label/binding update);
+    // a different key never displaces an existing one (ids are unique by now).
+    cfg.device_keys
+        .retain(|k| k.public_key != public_key && k.id != id);
     cfg.device_keys.push(dk.clone());
     persist(&cfg);
     dk
@@ -686,12 +768,51 @@ pub fn is_device_key_pinned(public_key: &str) -> bool {
             .iter()
             .any(|k| k.public_key == pk)
 }
+/// Test-only: pin/unpin a device key directly in the in-memory config, without
+/// touching the on-disk nemo_integration.json (tests must not write to the repo).
+#[cfg(test)]
+pub(crate) fn pin_device_key_for_test(dk: DeviceKey) {
+    CONFIG.lock().unwrap().device_keys.push(dk);
+}
+#[cfg(test)]
+pub(crate) fn unpin_device_key_for_test(public_key: &str) {
+    CONFIG
+        .lock()
+        .unwrap()
+        .device_keys
+        .retain(|k| k.public_key != public_key);
+}
+
+/// M1: the peer id a pinned key is bound to. None = key not pinned at all;
+/// Some("") = pinned but unbound (legacy key, authenticates any id).
+pub fn device_key_binding(public_key: &str) -> Option<String> {
+    let pk = public_key.trim();
+    if pk.is_empty() {
+        return None;
+    }
+    CONFIG
+        .lock()
+        .unwrap()
+        .device_keys
+        .iter()
+        .find(|k| k.public_key == pk)
+        .map(|k| k.peer_id.clone())
+}
 pub fn require_device_key() -> bool {
     CONFIG.lock().unwrap().require_device_key
 }
 pub fn set_require_device_key(v: bool) {
     let mut cfg = CONFIG.lock().unwrap();
     cfg.require_device_key = v;
+    persist(&cfg);
+}
+/// H4: strip secret policy values from responses that cannot be sealed.
+pub fn strip_unsealed_secrets() -> bool {
+    CONFIG.lock().unwrap().strip_unsealed_secrets
+}
+pub fn set_strip_unsealed_secrets(v: bool) {
+    let mut cfg = CONFIG.lock().unwrap();
+    cfg.strip_unsealed_secrets = v;
     persist(&cfg);
 }
 
@@ -1233,6 +1354,34 @@ pub struct LdapUser {
     pub dn: String,
 }
 
+/// S-C: whether the operator explicitly allowed running LDAP with certificate
+/// verification off. Without this loud, non-default flag, `tls_verify=false`
+/// FAILS CLOSED instead of silently accepting any DC cert (a MITM on the DC leg
+/// would otherwise harvest every domain login).
+#[cfg(feature = "nemo-ldap")]
+fn insecure_ldap_allowed() -> bool {
+    crate::nemo_management::is_truthy(&get_arg("insecure-ldap-i-accept-mitm"))
+}
+
+/// S-C: resolve the effective verification posture. verify-on always passes;
+/// verify-off only with the explicit override flag, otherwise an error that
+/// tells the operator the two safe options (pin the DC cert, or the loud flag).
+pub(crate) fn ldap_tls_verify_effective(
+    tls_verify: bool,
+    insecure_allowed: bool,
+) -> Result<bool, String> {
+    if tls_verify {
+        Ok(true)
+    } else if insecure_allowed {
+        Ok(false)
+    } else {
+        Err("LDAP tls_verify is disabled, but accepting any DC certificate is refused. \
+             Pin the DC certificate (ca_cert) and re-enable verification, or start the \
+             server with --insecure-ldap-i-accept-mitm Y to explicitly accept the risk."
+            .to_owned())
+    }
+}
+
 /// Build the TLS connector for LDAPS: trust a pinned cert if provided (verify
 /// against exactly that certificate — safe for a self-signed DC), or accept any
 /// certificate when verification is explicitly disabled. Shared by the login and
@@ -1240,7 +1389,11 @@ pub struct LdapUser {
 #[cfg(feature = "nemo-ldap")]
 fn build_ldap_connector(cfg: &LdapConfig) -> Result<native_tls::TlsConnector, String> {
     let mut builder = native_tls::TlsConnector::builder();
-    if !cfg.tls_verify {
+    if !ldap_tls_verify_effective(cfg.tls_verify, insecure_ldap_allowed())? {
+        log::warn!(
+            "LDAP certificate verification is DISABLED via --insecure-ldap-i-accept-mitm; \
+             the DC connection is open to man-in-the-middle credential harvesting"
+        );
         builder.danger_accept_invalid_certs(true);
         builder.danger_accept_invalid_hostnames(true);
     }
@@ -1517,10 +1670,13 @@ pub async fn authenticate_ldap(
             .map_err(|e| format!("user search rejected: {}", e))?;
         let _ = ldap.unbind().await;
 
-        let entry = entries
-            .into_iter()
-            .next()
-            .ok_or_else(|| "user not found in directory".to_owned())?;
+        let entry = entries.into_iter().next().ok_or_else(|| {
+            // L-fix (user enumeration): an unknown username must be indistinguishable
+            // from a wrong password in the client-visible error. Detail stays in the
+            // server log for the operator.
+            log::warn!("LDAP login: user '{}' not found in directory", username);
+            "invalid username or password".to_owned()
+        })?;
         let se = SearchEntry::construct(entry);
         dn = se.dn.clone();
         attrs = se.attrs;
@@ -1665,6 +1821,38 @@ mod tests {
         let mut cfg = CONFIG.lock().unwrap();
         assert!(!cfg.admin_policy.allow_user_override);
         cfg.permissions.remove("__testadmin");
+    }
+
+    // L-fix: two different keys sharing a 16-char alphanumeric prefix must get
+    // DISTINCT ids (the old scheme silently replaced the first pinned key).
+    #[test]
+    fn device_key_id_extends_prefix_on_collision() {
+        let shared = "AAAABBBBCCCCDDDD"; // 16 alnum chars
+        let key_a = format!("{}EEEE+rest/of/keyA==", shared);
+        let key_b = format!("{}FFFF+rest/of/keyB==", shared);
+        let id_a = device_key_id_for(&key_a, &[]);
+        assert_eq!(id_a, shared);
+        let existing = vec![DeviceKey {
+            id: id_a.clone(),
+            label: String::new(),
+            public_key: key_a.clone(),
+            created_at: String::new(),
+            peer_id: String::new(),
+        }];
+        let id_b = device_key_id_for(&key_b, &existing);
+        assert_ne!(id_b, id_a, "colliding prefix must not reuse the id");
+        assert!(id_b.starts_with(shared));
+        // Re-deriving for the SAME key keeps its id stable.
+        assert_eq!(device_key_id_for(&key_a, &existing), id_a);
+    }
+
+    // S-C: tls_verify=false is refused unless the loud override flag is set.
+    #[test]
+    fn ldap_tls_verify_off_requires_explicit_override() {
+        assert_eq!(ldap_tls_verify_effective(true, false), Ok(true));
+        assert_eq!(ldap_tls_verify_effective(true, true), Ok(true));
+        assert_eq!(ldap_tls_verify_effective(false, true), Ok(false));
+        assert!(ldap_tls_verify_effective(false, false).is_err());
     }
 
     #[test]

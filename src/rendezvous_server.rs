@@ -47,7 +47,10 @@ enum Data {
     RelayServers(RelayServers),
 }
 
-const REG_TIMEOUT: i32 = 30_000;
+// Upstream bug port (91fb928, rustdesk-server #676): i64 not i32 — `as_millis() as i32`
+// wraps negative after ~24.9 days offline and falsely reports a peer online (relaying to
+// its stale addr). Widened here and at the two elapsed casts below.
+const REG_TIMEOUT: i64 = 30_000;
 type TcpStreamSink = SplitSink<Framed<TcpStream, BytesCodec>, Bytes>;
 type WsSink = SplitSink<tokio_tungstenite::WebSocketStream<TcpStream>, tungstenite::Message>;
 enum Sink {
@@ -331,7 +334,10 @@ impl RendezvousServer {
         bytes: &BytesMut,
         addr: SocketAddr,
         socket: &mut FramedSocket,
-        key: &str,
+        // Unused since the UDP punch/hole/local-addr handlers were disabled (upstream
+        // 80d3a50/109d9a2, reflection/amplification); kept in the signature for symmetry
+        // with handle_listener and in case a future UDP arm needs it.
+        _key: &str,
     ) -> ResultType<()> {
         if let Ok(msg_in) = RendezvousMessage::parse_from_bytes(bytes) {
             match msg_in.union {
@@ -464,23 +470,20 @@ impl RendezvousServer {
                     });
                     socket.send(&msg_out, addr).await?
                 }
-                Some(rendezvous_message::Union::PunchHoleRequest(ph)) => {
-                    if self.pm.is_in_memory(&ph.id).await {
-                        self.handle_udp_punch_hole_request(addr, ph, key).await?;
-                    } else {
-                        // not in memory, fetch from db with spawn in case blocking me
-                        let mut me = self.clone();
-                        let key = key.to_owned();
-                        tokio::spawn(async move {
-                            allow_err!(me.handle_udp_punch_hole_request(addr, ph, &key).await);
-                        });
-                    }
+                Some(rendezvous_message::Union::PunchHoleRequest(_ph)) => {
+                    // Upstream security port (80d3a50, rustdesk-server #670): UDP
+                    // PunchHoleRequest is intentionally unsupported to avoid UDP
+                    // reflection/amplification (a spoofed-source packet made hbbs emit a
+                    // response to a victim). Supported clients punch over TCP/WS, where our
+                    // Nemo policy/recording hooks (handle_udp_punch_hole_request) still run.
                 }
-                Some(rendezvous_message::Union::PunchHoleSent(phs)) => {
-                    self.handle_hole_sent(phs, addr, Some(socket)).await?;
+                Some(rendezvous_message::Union::PunchHoleSent(_phs)) => {
+                    // Upstream security port (109d9a2): UDP PunchHoleSent intentionally
+                    // unsupported to avoid UDP reflection/amplification.
                 }
-                Some(rendezvous_message::Union::LocalAddr(la)) => {
-                    self.handle_local_addr(la, addr, Some(socket)).await?;
+                Some(rendezvous_message::Union::LocalAddr(_la)) => {
+                    // Upstream security port (109d9a2): UDP LocalAddr intentionally
+                    // unsupported to avoid UDP reflection/amplification.
                 }
                 Some(rendezvous_message::Union::ConfigureUpdate(mut cu)) => {
                     if try_into_v4(addr).ip().is_loopback() && cu.serial > self.inner.serial {
@@ -883,7 +886,7 @@ impl RendezvousServer {
         if let Some(peer) = self.pm.get(&id).await {
             let (elapsed, peer_addr) = {
                 let r = peer.read().await;
-                (r.last_reg_time.elapsed().as_millis() as i32, r.socket_addr)
+                (r.last_reg_time.elapsed().as_millis() as i64, r.socket_addr)
             };
             if elapsed >= REG_TIMEOUT {
                 let mut msg_out = RendezvousMessage::new();
@@ -1001,7 +1004,7 @@ impl RendezvousServer {
         let mut states = BytesMut::zeroed((peers.len() + 7) / 8);
         for (i, peer_id) in peers.iter().enumerate() {
             if let Some(peer) = self.pm.get_in_memory(peer_id).await {
-                let elapsed = peer.read().await.last_reg_time.elapsed().as_millis() as i32;
+                let elapsed = peer.read().await.last_reg_time.elapsed().as_millis() as i64;
                 // bytes index from left to right
                 let states_idx = i / 8;
                 let bit_idx = 7 - i % 8;

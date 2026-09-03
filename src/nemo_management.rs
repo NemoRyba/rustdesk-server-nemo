@@ -93,6 +93,11 @@ const CLIENT_MANAGEMENT_POLICY_KEYS: &[&str] = &[
     "nemo-require-login",
     "nemo-require-encrypted-session",
     "nemo-logged-in-user",
+    // S-B item 5: SHA-256 fingerprint the client pins the nemo-api TLS cert to
+    // (colon-separated hex). Pushable via the signed policy so the whole fleet
+    // can be pinned centrally; with a pin set the client stops using the
+    // accept-any-invalid-cert fallback for the api server.
+    "nemo-api-cert-fingerprint",
     OPTION_NEMO_OUTBOUND_ENABLED,
     OPTION_NEMO_OUTBOUND_TARGETS,
     "enable-lan-discovery",
@@ -279,14 +284,28 @@ static PEER_HOSTNAMES: Lazy<std::sync::RwLock<HashMap<String, String>>> =
 // pinned private key) or "default" (the shared server public key). Runtime only.
 static PEER_AUTH_MODES: Lazy<std::sync::RwLock<HashMap<String, String>>> =
     Lazy::new(|| std::sync::RwLock::new(HashMap::new()));
+// C2: bound the per-peer label maps (hostname / auth-mode). record_peer_hostname and
+// record_peer_auth_mode run for every poll BEFORE the require_device_key rejection, so an
+// unauthenticated flood of distinct ids could otherwise grow them without limit (and the
+// hostname map is disk-backed). Labels are re-reported each poll, so evicting an arbitrary
+// entry at the cap is harmless.
+const MAX_PEER_LABELS: usize = 50_000;
+const MAX_HOSTNAME_LEN: usize = 256;
+// Evict one arbitrary entry so a new key can be inserted without unbounded growth.
+fn evict_one_if_full(map: &mut HashMap<String, String>, id: &str) {
+    if map.len() >= MAX_PEER_LABELS && !map.contains_key(id) {
+        if let Some(victim) = map.keys().next().cloned() {
+            map.remove(&victim);
+        }
+    }
+}
 fn record_peer_auth_mode(id: &str, mode: &str) {
     if id.is_empty() {
         return;
     }
-    PEER_AUTH_MODES
-        .write()
-        .unwrap()
-        .insert(id.to_owned(), mode.to_owned());
+    let mut map = PEER_AUTH_MODES.write().unwrap();
+    evict_one_if_full(&mut map, id);
+    map.insert(id.to_owned(), mode.to_owned());
 }
 fn peer_auth_mode(id: &str) -> String {
     PEER_AUTH_MODES
@@ -418,6 +437,8 @@ struct PolicyRequest {
     log_history_limit: Option<usize>,
     #[serde(default)]
     require_device_key: Option<bool>,
+    #[serde(default)]
+    strip_unsealed_secrets: Option<bool>,
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -443,9 +464,14 @@ struct ClientPolicyRequest {
     #[serde(default)]
     policy_version: Option<String>,
     /// The logged-in user's session token, so the server can deliver that user's
-    /// policy (identity-based policy).
+    /// policy (identity-based policy). A1: superseded by `sealed_token` when present.
     #[serde(default)]
     access_token: Option<String>,
+    /// A1: base64 sealedbox({token, ts}) to the server's management key. When present
+    /// it supersedes the plaintext access_token, so the session token is confidential
+    /// on the wire regardless of TLS.
+    #[serde(default)]
+    sealed_token: Option<String>,
     /// The peer's own hostname, so the server can label the address book with
     /// "which computer is this ID".
     #[serde(default)]
@@ -458,12 +484,22 @@ struct ClientPolicyRequest {
     device_key_pub: Option<String>,
     #[serde(default)]
     device_key_sig: Option<String>,
+    /// S-B/S-DUALKEY step 3: "v1" = this client can unseal a policy response sealed
+    /// to its device key (NaCl sealedbox over the Ed25519-signed payload). Absent on
+    /// older clients, which keep receiving the signed-plaintext shape.
+    #[serde(default)]
+    sealed: Option<String>,
 }
 
 #[derive(Serialize)]
 struct ClientPolicyPayload {
     id: String,
     issued_at: String,
+    /// Epoch seconds twin of issued_at: lets a seal-capable client reject a
+    /// replayed old sealed response without parsing RFC3339 (sealedbox itself has
+    /// no replay protection; the signed timestamp inside the seal is what does).
+    #[serde(default)]
+    issued_ts: u64,
     policy: ManagementPolicy,
 }
 
@@ -471,7 +507,16 @@ struct ClientPolicyPayload {
 struct ClientPolicyResponse {
     server_public_key: String,
     signed_payload: String,
-    payload: ClientPolicyPayload,
+    /// Cleartext payload (legacy shape). None when the response is sealed — the
+    /// payload then exists ONLY inside `sealed_payload`, so the pushed managed
+    /// password and config are ciphertext to anything but this client's device key.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    payload: Option<ClientPolicyPayload>,
+    /// base64(NaCl sealedbox(sign::sign(payload_json), client device key)) —
+    /// sign-then-seal: the Ed25519 signature stays INSIDE the seal so the payload
+    /// is neither readable nor recoverable from an attached signature by a MITM.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sealed_payload: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -523,6 +568,7 @@ struct PolicyResponse {
     connection_history_limit: usize,
     log_history_limit: usize,
     require_device_key: bool,
+    strip_unsealed_secrets: bool,
 }
 
 #[derive(Serialize)]
@@ -645,6 +691,9 @@ fn record_peer_hostname(id: &str, hostname: &str) {
     if id.is_empty() || hostname.is_empty() {
         return;
     }
+    // C2: bound the stored value so a peer cannot make us persist a multi-MB "hostname".
+    let hostname: String = hostname.chars().take(MAX_HOSTNAME_LEN).collect();
+    let hostname = hostname.as_str();
     {
         let map = PEER_HOSTNAMES.read().unwrap();
         if map.get(id).map(|h| h == hostname).unwrap_or(false) {
@@ -653,6 +702,7 @@ fn record_peer_hostname(id: &str, hostname: &str) {
     }
     let snapshot = {
         let mut map = PEER_HOSTNAMES.write().unwrap();
+        evict_one_if_full(&mut map, id);
         map.insert(id.to_owned(), hostname.to_owned());
         map.clone()
     };
@@ -713,6 +763,17 @@ pub(crate) async fn spawn_hbbs_api(
             addr
         );
     }
+    // L-fix: the admin API must never run tokenless (require_auth fails closed).
+    // With no configured token, generate an ephemeral one and print it so the
+    // local-dev dashboard workflow still works — copy it from the log.
+    let token = Some(token.unwrap_or_else(|| {
+        let generated = base64::encode(sodiumoxide::randombytes::randombytes(24));
+        log::warn!(
+            "--nemo-api-token not set; generated an ephemeral admin API token for this run: {}",
+            generated
+        );
+        generated
+    }));
 
     let (login_enc_pk, login_enc_sk) = box_::gen_keypair();
     let state = HbbsApiState {
@@ -993,6 +1054,12 @@ struct SealedLogin {
     password: String,
     #[serde(default)]
     ts: u64,
+    /// L-fix (replay): a random client nonce; the server remembers nonces seen
+    /// inside the freshness window and rejects duplicates, so a captured sealed
+    /// blob cannot be re-POSTed even within the timestamp window. Optional for
+    /// older clients (absent = timestamp window only, logged).
+    #[serde(default)]
+    nonce: String,
 }
 
 #[derive(Serialize)]
@@ -1041,6 +1108,61 @@ async fn api_login_key(Extension(state): Extension<HbbsApiState>) -> Json<LoginK
     Json(LoginKeyResponse { key, signed_key })
 }
 
+// L-fix (replay): nonces seen inside the freshness window. In-memory is enough —
+// the sealed-login keypair is per-process too (a restart rotates the key, which
+// invalidates every previously captured blob outright).
+static SEEN_LOGIN_NONCES: Lazy<std::sync::Mutex<HashMap<String, u64>>> =
+    Lazy::new(|| std::sync::Mutex::new(HashMap::new()));
+
+const SEALED_LOGIN_MAX_AGE_SECS: u64 = 300;
+const SEALED_LOGIN_MAX_SKEW_SECS: u64 = 60;
+// C2: hard cap so an unauthenticated attacker flooding fresh nonces cannot grow the map
+// without bound. The retain() below already prunes by time; this bounds memory under a
+// burst by evicting the oldest entry when full (the ts window still caps replay).
+const MAX_SEEN_NONCES: usize = 100_000;
+
+// Pure replay guard for a sealed login: freshness window on ts (a ts of 0 — the
+// old "legacy client" bypass — is now REJECTED) and at-most-once nonces within the
+// window. Split out of decode_sealed_login so it is unit-testable.
+fn sealed_login_guard(
+    ts: u64,
+    nonce: &str,
+    now: u64,
+    seen: &mut HashMap<String, u64>,
+) -> Result<(), String> {
+    if now.saturating_sub(ts) > SEALED_LOGIN_MAX_AGE_SECS
+        || ts.saturating_sub(now) > SEALED_LOGIN_MAX_SKEW_SECS
+    {
+        return Err("sealed credential expired; please retry".to_owned());
+    }
+    let nonce = nonce.trim();
+    if nonce.is_empty() {
+        // Older client without a nonce: the timestamp window is the only replay
+        // bound. Accepted (fleet transition), but visible in the log.
+        log::warn!("sealed login without nonce (older client); replayable within the ts window");
+        return Ok(());
+    }
+    // Prune expired entries, then insert-or-reject.
+    seen.retain(|_, &mut seen_at| now.saturating_sub(seen_at) <= SEALED_LOGIN_MAX_AGE_SECS);
+    if seen.contains_key(nonce) {
+        return Err("sealed credential replayed; please retry".to_owned());
+    }
+    // C2: bound memory under a nonce-flood — evict the oldest when at the cap.
+    while seen.len() >= MAX_SEEN_NONCES {
+        if let Some(oldest) = seen
+            .iter()
+            .min_by_key(|(_, &t)| t)
+            .map(|(k, _)| k.clone())
+        {
+            seen.remove(&oldest);
+        } else {
+            break;
+        }
+    }
+    seen.insert(nonce.to_owned(), now);
+    Ok(())
+}
+
 // S-B: open a sealed login credential to (username, password). Fails closed on any
 // decode/parse/replay error.
 fn decode_sealed_login(state: &HbbsApiState, sealed_b64: &str) -> Result<(String, String), String> {
@@ -1050,17 +1172,11 @@ fn decode_sealed_login(state: &HbbsApiState, sealed_b64: &str) -> Result<(String
         .map_err(|_| "sealed credential could not be opened (stale login key? re-fetch /api/login-key)".to_owned())?;
     let s: SealedLogin =
         serde_json::from_slice(&plain).map_err(|_| "invalid sealed credential payload".to_owned())?;
-    // Replay guard: reject stale timestamps (allow modest clock skew). ts==0 skips
-    // the check (older clients) but still gets confidentiality.
-    if s.ts != 0 {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        if now.saturating_sub(s.ts) > 300 || s.ts.saturating_sub(now) > 60 {
-            return Err("sealed credential expired; please retry".to_owned());
-        }
-    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    sealed_login_guard(s.ts, &s.nonce, now, &mut SEEN_LOGIN_NONCES.lock().unwrap())?;
     Ok((s.username.trim().to_owned(), s.password))
 }
 
@@ -1193,37 +1309,67 @@ struct AbResult {
     updated_at: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     data: Option<String>,
+    /// S-B (P0): base64(NaCl sealedbox(address-book JSON, client device key)).
+    /// Present instead of `data` when the requester proved a pinned device key and
+    /// asked for a sealed response — the peer list is then ciphertext to a MITM.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sealed_data: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+}
+
+impl AbResult {
+    fn err(message: impl Into<String>) -> Self {
+        Self {
+            updated_at: None,
+            data: None,
+            sealed_data: None,
+            error: Some(message.into()),
+        }
+    }
+}
+
+/// Optional body of /api/ab/get. The stock client posts `{}`; a seal-capable
+/// client identifies its device and signs "nemo-ab:{id}:{ts}" with its device key
+/// (a domain distinct from the policy poll, so signatures are not cross-replayable).
+#[derive(Default, Deserialize)]
+struct AbGetRequest {
+    #[serde(default)]
+    sealed: Option<String>,
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    device_key_pub: String,
+    #[serde(default)]
+    device_key_sig: String,
 }
 
 async fn api_ab_get(
     Extension(state): Extension<HbbsApiState>,
     headers: HeaderMap,
+    body: Option<Json<AbGetRequest>>,
 ) -> Json<AbResult> {
     let Some(token) = bearer_token(&headers) else {
-        return Json(AbResult {
-            updated_at: None,
-            data: None,
-            error: Some("Invalid token".to_owned()),
-        });
+        return Json(AbResult::err("Invalid token"));
     };
     let Some(session) = integration::session_for_token(&token) else {
-        return Json(AbResult {
-            updated_at: None,
-            data: None,
-            error: Some("Invalid token".to_owned()),
-        });
+        return Json(AbResult::err("Invalid token"));
     };
+    let req = body.map(|Json(b)| b).unwrap_or_default();
+    let device_key_ok = !req.device_key_pub.is_empty()
+        && !req.device_key_sig.is_empty()
+        && verify_device_signature(&req.device_key_pub, &req.device_key_sig, "nemo-ab", &req.id);
+    // The same enforcement as the policy poll: when the operator requires
+    // provisioned device keys, an address book is not served to anything else.
+    if integration::require_device_key() && !device_key_ok {
+        return Json(AbResult::err("a provisioned device key is required"));
+    }
+    let seal_this = device_key_ok && req.sealed.as_deref() == Some("v1");
 
     let peers = match state.pm.list_registered(1000, 0).await {
         Ok(peers) => peers,
         Err(err) => {
-            return Json(AbResult {
-                updated_at: None,
-                data: None,
-                error: Some(err.to_string()),
-            });
+            return Json(AbResult::err(err.to_string()));
         }
     };
     // Re-resolve permissions from live config (not the login-time snapshot) so
@@ -1250,9 +1396,34 @@ async fn api_ab_get(
         peers: ab_peers,
     })
     .unwrap_or_else(|_| "{\"tags\":[],\"peers\":[]}".to_owned());
+    if seal_this {
+        // A6: SIGN-then-seal (mirror the policy poll). A bare sealedbox gives
+        // confidentiality but NO sender authentication — the device pubkey is public,
+        // so anyone could forge a sealed list. Sign the JSON with the server key first,
+        // then seal the signed blob to the device key; the client verifies the inner
+        // signature after unsealing. Fail closed if there is no signing key.
+        let Some(secret_key) = state.server_secret_key.as_ref() else {
+            return Json(AbResult::err(
+                "server has no signing key; cannot seal the address book",
+            ));
+        };
+        let signed = sign::sign(data.as_bytes(), secret_key);
+        let Some(sealed) = seal_to_device_key(&req.device_key_pub, &signed) else {
+            return Json(AbResult::err(
+                "could not seal the address book to the device key",
+            ));
+        };
+        return Json(AbResult {
+            updated_at: Some(now_epoch_secs()),
+            data: None,
+            sealed_data: Some(sealed),
+            error: None,
+        });
+    }
     Json(AbResult {
         updated_at: Some(now_epoch_secs()),
         data: Some(data),
+        sealed_data: None,
         error: None,
     })
 }
@@ -1566,6 +1737,9 @@ async fn put_permissions(
 struct GenerateDeviceKeyRequest {
     #[serde(default)]
     label: String,
+    /// M1: the peer id this key is generated FOR. Empty = unbound legacy key.
+    #[serde(default)]
+    peer_id: String,
 }
 #[derive(Serialize)]
 struct GenerateDeviceKeyResponse {
@@ -1574,6 +1748,7 @@ struct GenerateDeviceKeyResponse {
     public_key: String,
     private_key: String,
     created_at: String,
+    peer_id: String,
 }
 async fn generate_device_key(
     Extension(state): Extension<HbbsApiState>,
@@ -1589,6 +1764,7 @@ async fn generate_device_key(
         req.label.trim().to_owned(),
         public_key.clone(),
         created_at.clone(),
+        req.peer_id,
     );
     Ok(Json(GenerateDeviceKeyResponse {
         id: dk.id,
@@ -1596,6 +1772,7 @@ async fn generate_device_key(
         public_key,
         private_key,
         created_at,
+        peer_id: dk.peer_id,
     }))
 }
 async fn list_device_keys(
@@ -1614,18 +1791,23 @@ async fn delete_device_key(
     let removed = integration::remove_device_key(&id);
     Ok(Json(serde_json::json!({ "removed": removed })))
 }
-// Verify a client's device-key signature over "nemo-poll:{id}:{ts}". True only if
-// the public key is pinned, the signature is valid, the id matches, and the ts is
-// fresh (replay window).
-fn verify_device_key(request: &ClientPolicyRequest) -> bool {
-    let (Some(pub_b64), Some(sig_b64)) = (
-        request.device_key_pub.as_deref(),
-        request.device_key_sig.as_deref(),
-    ) else {
-        return false;
-    };
+// Verify a client's device-key signature over "{domain}:{id}:{ts}" (domain is
+// "nemo-poll" for the policy poll, "nemo-ab" for the address-book fetch — distinct
+// domains so a captured poll signature cannot be replayed against another
+// endpoint). True only if the public key is pinned, its M1 binding (if any)
+// matches the claimed peer id, the signature is valid, the id matches, and the ts
+// is fresh (replay window). A non-numeric ts is REJECTED (it used to silently skip
+// the freshness check).
+fn verify_device_signature(pub_b64: &str, sig_b64: &str, domain: &str, id: &str) -> bool {
     if !integration::is_device_key_pinned(pub_b64) {
         return false;
+    }
+    // M1: a key bound to a peer id authenticates ONLY that id. Unbound (legacy)
+    // keys keep authenticating any id until the operator binds or replaces them.
+    match integration::device_key_binding(pub_b64) {
+        Some(bound) if !bound.is_empty() && bound != id => return false,
+        None => return false, // unpinned (racing delete)
+        _ => {}
     }
     let (Ok(pk_bytes), Ok(sig_bytes)) =
         (base64::decode(pub_b64.trim()), base64::decode(sig_b64.trim()))
@@ -1640,19 +1822,83 @@ fn verify_device_key(request: &ClientPolicyRequest) -> bool {
     };
     let msg = String::from_utf8_lossy(&msg);
     let parts: Vec<&str> = msg.splitn(3, ':').collect();
-    if parts.len() != 3 || parts[0] != "nemo-poll" || parts[1] != request.id {
+    if parts.len() != 3 || parts[0] != domain || parts[1] != id {
         return false;
     }
-    if let Ok(ts) = parts[2].parse::<u64>() {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        if now.saturating_sub(ts) > 300 || ts.saturating_sub(now) > 60 {
-            return false;
-        }
+    let Ok(ts) = parts[2].parse::<u64>() else {
+        return false;
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if now.saturating_sub(ts) > 300 || ts.saturating_sub(now) > 60 {
+        return false;
     }
     true
+}
+
+fn verify_device_key(request: &ClientPolicyRequest) -> bool {
+    let (Some(pub_b64), Some(sig_b64)) = (
+        request.device_key_pub.as_deref(),
+        request.device_key_sig.as_deref(),
+    ) else {
+        return false;
+    };
+    verify_device_signature(pub_b64, sig_b64, "nemo-poll", &request.id)
+}
+
+// S-B/S-DUALKEY step 3: seal `data` to a client's Ed25519 device key with a NaCl
+// sealedbox (Ed25519 -> Curve25519 conversion). Returns base64 ciphertext, or None
+// if the key is unusable — the caller must then FAIL CLOSED (never fall back to
+// sending the plaintext it meant to seal).
+fn seal_to_device_key(pub_b64: &str, data: &[u8]) -> Option<String> {
+    let pk_bytes = base64::decode(pub_b64.trim()).ok()?;
+    let pk = sign::PublicKey::from_slice(&pk_bytes)?;
+    let curve_pk = sign::to_curve25519_pk(&pk).ok()?;
+    Some(base64::encode(sealedbox::seal(data, &curve_pk)))
+}
+
+// A1: open a request secret the client sealed to our MANAGEMENT key (the client sealed
+// to the Curve25519 form of `server_public_key`; we open with the Curve25519 form of our
+// Ed25519 secret key + public key). Returns the plaintext, or None on any failure.
+fn open_sealed_to_mgmt_key(state: &HbbsApiState, sealed_b64: &str) -> Option<Vec<u8>> {
+    let sk = state.server_secret_key.as_ref()?;
+    let curve_sk = sign::to_curve25519_sk(sk).ok()?;
+    let pk_bytes = base64::decode(state.server_public_key.trim()).ok()?;
+    let pk = sign::PublicKey::from_slice(&pk_bytes)?;
+    let curve_pk = sign::to_curve25519_pk(&pk).ok()?;
+    let ciphertext = base64::decode(sealed_b64.trim()).ok()?;
+    sealedbox::open(&ciphertext, &curve_pk, &curve_sk).ok()
+}
+
+// A1: the effective session token for this poll — prefer the sealed one (confidential
+// regardless of TLS), fall back to the plaintext field for older clients / no mgmt key.
+fn resolve_access_token(state: &HbbsApiState, request: &ClientPolicyRequest) -> Option<String> {
+    #[derive(Deserialize)]
+    struct SealedToken {
+        token: String,
+    }
+    if let Some(sealed) = request.sealed_token.as_deref() {
+        if !sealed.trim().is_empty() {
+            let opened = open_sealed_to_mgmt_key(state, sealed)?;
+            let parsed: SealedToken = serde_json::from_slice(&opened).ok()?;
+            return Some(parsed.token);
+        }
+    }
+    request.access_token.clone().filter(|t| !t.trim().is_empty())
+}
+
+// H4: remove secret values from a policy that is about to leave the server WITHOUT
+// device-key sealing. Returns how many secrets were stripped.
+fn strip_secret_options(policy: &mut ManagementPolicy) -> usize {
+    let mut stripped = 0;
+    for key in SECRET_POLICY_KEYS {
+        if policy.options.remove(*key).is_some() {
+            stripped += 1;
+        }
+    }
+    stripped
 }
 
 // ---- Named policies (reusable templates assignable to users + devices) ----
@@ -2478,8 +2724,9 @@ async fn client_policy(
     let mut policy = global_policy();
 
     // Identity-based policy: resolve the logged-in, enabled user from the token.
-    let user = request
-        .access_token
+    // A1: the token may arrive sealed to our mgmt key (confidential on the wire).
+    let access_token = resolve_access_token(&state, &request);
+    let user = access_token
         .as_deref()
         .and_then(integration::session_for_token)
         .filter(|s| integration::user_is_enabled(&s.username));
@@ -2556,21 +2803,66 @@ async fn client_policy(
             .options
             .insert(OPTION_NEMO_OUTBOUND_ENABLED.to_owned(), "N".to_owned());
     }
+    // S-B/S-DUALKEY step 3: seal the response to the client's device key whenever
+    // the client proved possession of a pinned key AND advertised unseal support.
+    // Sign-then-seal: the Ed25519 signature (with the payload embedded, attached
+    // form) goes INSIDE the sealedbox; the cleartext payload field is omitted.
+    let seal_this = device_key_ok && request.sealed.as_deref() == Some("v1");
+    // H4: a response that will NOT be sealed must not carry secrets once the
+    // operator turns stripping on (until then unprovisioned clients keep the
+    // legacy plaintext-over-TLS push so the fleet doesn't break).
+    if !seal_this && integration::strip_unsealed_secrets() {
+        let stripped = strip_secret_options(&mut policy);
+        if stripped > 0 {
+            log::info!(
+                "policy for {} sent WITHOUT {} secret option(s): client cannot receive a sealed response",
+                peer.id,
+                stripped
+            );
+        }
+    }
     let payload = ClientPolicyPayload {
         id: peer.id.clone(),
         issued_at: now_iso(),
+        issued_ts: now_epoch_secs(),
         policy,
     };
     let payload_bytes = serde_json::to_vec(&payload).map_err(server_error)?;
-    let signed_payload = state
+    let signed_bytes = state
         .server_secret_key
         .as_ref()
-        .map(|secret_key| base64::encode(sign::sign(&payload_bytes, secret_key)))
-        .unwrap_or_default();
+        .map(|secret_key| sign::sign(&payload_bytes, secret_key));
+    if seal_this {
+        let Some(signed_bytes) = signed_bytes.as_deref() else {
+            // No signing key: cannot produce the sealed (sign-then-seal) shape.
+            // Fail closed rather than answering a seal-capable client in plaintext.
+            return Err(api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "server has no signing key; cannot seal the policy response",
+            ));
+        };
+        let sealed_payload = request
+            .device_key_pub
+            .as_deref()
+            .and_then(|pub_b64| seal_to_device_key(pub_b64, signed_bytes))
+            .ok_or_else(|| {
+                api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "could not seal the policy response to the device key",
+                )
+            })?;
+        return Ok(Json(ClientPolicyResponse {
+            server_public_key: state.server_public_key,
+            signed_payload: String::new(),
+            payload: None,
+            sealed_payload: Some(sealed_payload),
+        }));
+    }
     Ok(Json(ClientPolicyResponse {
         server_public_key: state.server_public_key,
-        signed_payload,
-        payload,
+        signed_payload: signed_bytes.map(base64::encode).unwrap_or_default(),
+        payload: Some(payload),
+        sealed_payload: None,
     }))
 }
 
@@ -2690,6 +2982,9 @@ async fn update_policy(
     }
     if let Some(require) = request.require_device_key {
         integration::set_require_device_key(require);
+    }
+    if let Some(strip) = request.strip_unsealed_secrets {
+        integration::set_strip_unsealed_secrets(strip);
     }
     Ok(Json(policy_response()))
 }
@@ -2837,6 +3132,7 @@ fn policy_response() -> PolicyResponse {
         connection_history_limit: conn_history_limit(),
         log_history_limit: log_history_limit(),
         require_device_key: integration::require_device_key(),
+        strip_unsealed_secrets: integration::strip_unsealed_secrets(),
     }
 }
 
@@ -2951,8 +3247,14 @@ fn validate_client_policy_request(
 }
 
 fn require_auth(headers: &HeaderMap, token: &Option<String>) -> Result<(), ApiFailure> {
+    // L-fix: no configured token used to mean OPEN — any local process could
+    // administer the server. Now it fails closed; spawn_hbbs_api guarantees a
+    // token always exists (auto-generated and logged when the operator sets none).
     let Some(token) = token else {
-        return Ok(());
+        return Err(api_error(
+            StatusCode::UNAUTHORIZED,
+            "management API token not configured",
+        ));
     };
     let bearer = format!("Bearer {}", token);
     let auth = headers
@@ -3074,7 +3376,7 @@ fn now_iso() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
-fn is_truthy(value: &str) -> bool {
+pub(crate) fn is_truthy(value: &str) -> bool {
     matches!(
         value.trim().to_ascii_lowercase().as_str(),
         "1" | "y" | "yes" | "true" | "on"
@@ -3263,10 +3565,21 @@ mod tests {
         assert_eq!(nat_type_name(42), "UNKNOWN_NAT");
     }
 
+    // L-fix: a missing token no longer means "open" — the API refuses everything
+    // until a token exists (spawn_hbbs_api auto-generates one when unset).
     #[test]
-    fn require_auth_is_open_when_no_token_configured() {
+    fn require_auth_fails_closed_when_no_token_configured() {
         let headers = HeaderMap::new();
-        assert!(require_auth(&headers, &None).is_ok());
+        assert_eq!(
+            require_auth(&headers, &None).unwrap_err().0,
+            StatusCode::UNAUTHORIZED
+        );
+        let mut with_header = HeaderMap::new();
+        with_header.insert(AUTHORIZATION, "Bearer anything".parse().unwrap());
+        assert_eq!(
+            require_auth(&with_header, &None).unwrap_err().0,
+            StatusCode::UNAUTHORIZED
+        );
     }
 
     #[test]
@@ -3299,6 +3612,204 @@ mod tests {
         );
     }
 
+    // L-fix (sealed-login replay): freshness window enforced (ts=0 no longer
+    // bypasses), and a nonce is accepted at most once inside the window.
+    #[test]
+    fn sealed_login_guard_enforces_window_and_nonce() {
+        let now = 1_000_000u64;
+        let mut seen = HashMap::new();
+        // Fresh, nonce accepted once.
+        assert!(sealed_login_guard(now - 10, "n1", now, &mut seen).is_ok());
+        // Same nonce again inside the window = replay.
+        assert!(sealed_login_guard(now - 5, "n1", now, &mut seen).is_err());
+        // Different nonce passes.
+        assert!(sealed_login_guard(now - 5, "n2", now, &mut seen).is_ok());
+        // Too old / too far in the future / the old ts==0 bypass — all rejected.
+        assert!(sealed_login_guard(now - 301, "n3", now, &mut seen).is_err());
+        assert!(sealed_login_guard(now + 61, "n4", now, &mut seen).is_err());
+        assert!(sealed_login_guard(0, "n5", now, &mut seen).is_err());
+        // Empty nonce (older client): timestamp window only, accepted.
+        assert!(sealed_login_guard(now - 10, "", now, &mut seen).is_ok());
+        // A nonce seen long ago is pruned and usable again.
+        let later = now + 400;
+        assert!(sealed_login_guard(later - 10, "n1", later, &mut seen).is_ok());
+    }
+
+    // S-B/S-DUALKEY step 3: what the server seals to an Ed25519 device key, the
+    // holder of the matching secret key (the client) can open — and only them.
+    #[test]
+    fn seal_to_device_key_roundtrip() {
+        sodiumoxide::init().ok();
+        let (pk, sk) = sign::gen_keypair();
+        let pub_b64 = base64::encode(pk.as_ref());
+        let sealed_b64 = seal_to_device_key(&pub_b64, b"secret payload").expect("seal");
+        // Client-side recipe: Ed25519 -> Curve25519 for both halves, then open.
+        let curve_pk = sign::to_curve25519_pk(&pk).expect("pk conversion");
+        let curve_sk = sign::to_curve25519_sk(&sk).expect("sk conversion");
+        let opened = sealedbox::open(
+            &base64::decode(&sealed_b64).expect("b64"),
+            &curve_pk,
+            &curve_sk,
+        )
+        .expect("open");
+        assert_eq!(opened, b"secret payload");
+        // A different keypair cannot open it.
+        let (pk2, sk2) = sign::gen_keypair();
+        let other_pk = sign::to_curve25519_pk(&pk2).unwrap();
+        let other_sk = sign::to_curve25519_sk(&sk2).unwrap();
+        assert!(sealedbox::open(
+            &base64::decode(&sealed_b64).unwrap(),
+            &other_pk,
+            &other_sk
+        )
+        .is_err());
+        // Junk public key -> None, never a bogus seal.
+        assert!(seal_to_device_key("!!!", b"x").is_none());
+        assert!(seal_to_device_key(&base64::encode([1u8; 7]), b"x").is_none());
+    }
+
+    // A1: what the CLIENT seals to the server's mgmt key (Ed25519 pub -> Curve25519),
+    // the server opens with its Ed25519 secret (-> Curve25519). Mirror both directions.
+    #[test]
+    fn mgmt_key_seal_roundtrip() {
+        sodiumoxide::init().ok();
+        let (pk, sk) = sign::gen_keypair();
+        // Client side: seal to to_curve25519_pk(server_pub).
+        let curve_pk = sign::to_curve25519_pk(&pk).unwrap();
+        let sealed = base64::encode(sealedbox::seal(b"session-token", &curve_pk));
+        // Server side (open_sealed_to_mgmt_key math): to_curve25519_sk(secret) + pub.
+        let curve_sk = sign::to_curve25519_sk(&sk).unwrap();
+        let opened = sealedbox::open(
+            &base64::decode(&sealed).unwrap(),
+            &curve_pk,
+            &curve_sk,
+        )
+        .expect("open");
+        assert_eq!(opened, b"session-token");
+        // A different server key cannot open it.
+        let (_pk2, sk2) = sign::gen_keypair();
+        let curve_sk2 = sign::to_curve25519_sk(&sk2).unwrap();
+        assert!(sealedbox::open(&base64::decode(&sealed).unwrap(), &curve_pk, &curve_sk2).is_err());
+    }
+
+    // H4: stripping removes exactly the secret option values.
+    #[test]
+    fn strip_secret_options_removes_all_secret_keys() {
+        let mut policy = ManagementPolicy::default();
+        policy
+            .options
+            .insert("nemo-permanent-password".to_owned(), "s3cret".to_owned());
+        policy
+            .options
+            .insert("proxy-password".to_owned(), "p".to_owned());
+        policy
+            .options
+            .insert("view_only".to_owned(), "Y".to_owned());
+        assert_eq!(strip_secret_options(&mut policy), 2);
+        assert!(!policy.options.contains_key("nemo-permanent-password"));
+        assert!(!policy.options.contains_key("proxy-password"));
+        assert_eq!(policy.options.get("view_only").map(String::as_str), Some("Y"));
+        assert_eq!(strip_secret_options(&mut policy), 0);
+    }
+
+    fn now_secs() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    }
+
+    fn signed_for(sk: &sign::SecretKey, domain: &str, id: &str, ts: u64) -> String {
+        base64::encode(sign::sign(
+            format!("{}:{}:{}", domain, id, ts).as_bytes(),
+            sk,
+        ))
+    }
+
+    // S-DUALKEY + M1 + domain separation, against a key pinned in-memory.
+    #[test]
+    fn verify_device_signature_checks_pin_binding_domain_and_freshness() {
+        sodiumoxide::init().ok();
+        let (pk, sk) = sign::gen_keypair();
+        let pub_b64 = base64::encode(pk.as_ref());
+        let now = now_secs();
+
+        // Not pinned yet -> refused even with a valid signature.
+        assert!(!verify_device_signature(
+            &pub_b64,
+            &signed_for(&sk, "nemo-poll", "peer-a", now),
+            "nemo-poll",
+            "peer-a"
+        ));
+
+        // Pin it UNBOUND (legacy): any id verifies with a valid fresh signature.
+        integration::pin_device_key_for_test(integration::DeviceKey {
+            id: "testkey".to_owned(),
+            label: "test".to_owned(),
+            public_key: pub_b64.clone(),
+            created_at: String::new(),
+            peer_id: String::new(),
+        });
+        assert!(verify_device_signature(
+            &pub_b64,
+            &signed_for(&sk, "nemo-poll", "peer-a", now),
+            "nemo-poll",
+            "peer-a"
+        ));
+        // Domain separation: a poll signature is useless against the ab endpoint.
+        assert!(!verify_device_signature(
+            &pub_b64,
+            &signed_for(&sk, "nemo-poll", "peer-a", now),
+            "nemo-ab",
+            "peer-a"
+        ));
+        // Stale and non-numeric timestamps are refused (the old code silently
+        // skipped freshness when ts failed to parse).
+        assert!(!verify_device_signature(
+            &pub_b64,
+            &signed_for(&sk, "nemo-poll", "peer-a", now - 301),
+            "nemo-poll",
+            "peer-a"
+        ));
+        let non_numeric = base64::encode(sign::sign(b"nemo-poll:peer-a:soon", &sk));
+        assert!(!verify_device_signature(
+            &pub_b64,
+            &non_numeric,
+            "nemo-poll",
+            "peer-a"
+        ));
+        // Id mismatch between signature and claim.
+        assert!(!verify_device_signature(
+            &pub_b64,
+            &signed_for(&sk, "nemo-poll", "peer-a", now),
+            "nemo-poll",
+            "peer-b"
+        ));
+
+        // M1: re-pin BOUND to peer-a — only peer-a authenticates now.
+        integration::unpin_device_key_for_test(&pub_b64);
+        integration::pin_device_key_for_test(integration::DeviceKey {
+            id: "testkey".to_owned(),
+            label: "test".to_owned(),
+            public_key: pub_b64.clone(),
+            created_at: String::new(),
+            peer_id: "peer-a".to_owned(),
+        });
+        assert!(verify_device_signature(
+            &pub_b64,
+            &signed_for(&sk, "nemo-poll", "peer-a", now),
+            "nemo-poll",
+            "peer-a"
+        ));
+        assert!(!verify_device_signature(
+            &pub_b64,
+            &signed_for(&sk, "nemo-poll", "peer-b", now),
+            "nemo-poll",
+            "peer-b"
+        ));
+        integration::unpin_device_key_for_test(&pub_b64);
+    }
+
     #[test]
     fn validate_client_policy_request_matches_uuid() {
         let peer = RegisteredPeer {
@@ -3314,6 +3825,8 @@ mod tests {
             hostname: None,
             device_key_pub: None,
             device_key_sig: None,
+            sealed_token: None,
+            sealed: None,
         };
         assert!(validate_client_policy_request(&peer, &ok).is_ok());
         // Empty id.
@@ -3325,6 +3838,8 @@ mod tests {
             hostname: None,
             device_key_pub: None,
             device_key_sig: None,
+            sealed_token: None,
+            sealed: None,
         };
         assert_eq!(
             validate_client_policy_request(&peer, &no_id).unwrap_err().0,
@@ -3339,6 +3854,8 @@ mod tests {
             hostname: None,
             device_key_pub: None,
             device_key_sig: None,
+            sealed_token: None,
+            sealed: None,
         };
         assert_eq!(
             validate_client_policy_request(&peer, &bad_b64).unwrap_err().0,
@@ -3353,6 +3870,8 @@ mod tests {
             hostname: None,
             device_key_pub: None,
             device_key_sig: None,
+            sealed_token: None,
+            sealed: None,
         };
         assert_eq!(
             validate_client_policy_request(&peer, &mismatch).unwrap_err().0,
