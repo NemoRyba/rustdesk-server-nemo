@@ -569,6 +569,9 @@ struct PolicyResponse {
     log_history_limit: usize,
     require_device_key: bool,
     strip_unsealed_secrets: bool,
+    // Build id of the running hbbs (git hash + date), so the dashboard header can
+    // show which build is applied. GUI ships inside this same binary.
+    build_id: &'static str,
 }
 
 #[derive(Serialize)]
@@ -978,8 +981,10 @@ async fn api_tls_cert_info() -> Json<TlsCertInfo> {
     }))
 }
 
-async fn admin_gui() -> Html<&'static str> {
-    Html(include_str!("nemo_admin.html"))
+async fn admin_gui() -> Html<String> {
+    // Stamp the running build id into the page so the header can show the GUI's own
+    // build and detect a browser-cached (stale) page vs the live server build.
+    Html(include_str!("nemo_admin.html").replace("{{NEMO_BUILD_ID}}", nemo_build_id()))
 }
 
 // --------------------------------------------------------------------------
@@ -3124,6 +3129,12 @@ fn peer_policy_response(id: String, status: Option<i64>) -> PeerPolicyResponse {
     }
 }
 
+// Build id of the running hbbs (baked by build.rs). GUI is compiled into the same
+// binary, so this identifies both.
+pub(crate) fn nemo_build_id() -> &'static str {
+    option_env!("NEMO_BUILD_ID").unwrap_or("unknown")
+}
+
 fn policy_response() -> PolicyResponse {
     PolicyResponse {
         company_only: company_only(),
@@ -3133,6 +3144,7 @@ fn policy_response() -> PolicyResponse {
         log_history_limit: log_history_limit(),
         require_device_key: integration::require_device_key(),
         strip_unsealed_secrets: integration::strip_unsealed_secrets(),
+        build_id: nemo_build_id(),
     }
 }
 

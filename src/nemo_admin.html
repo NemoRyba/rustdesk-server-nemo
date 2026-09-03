@@ -4,6 +4,9 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>TBFDesk Admin</title>
+  <!-- Stamped by the server (admin_gui) with the running build id; identifies THIS
+       page's build so the header can flag a stale (browser-cached) page. -->
+  <script>window.__NEMO_GUI_BUILD = "{{NEMO_BUILD_ID}}";</script>
   <style>
     :root {
       color-scheme: light;
@@ -173,6 +176,21 @@
       gap: 7px;
       color: var(--muted);
       min-width: 100px;
+    }
+
+    .build-info {
+      font-size: 11px;
+      color: var(--muted);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      white-space: nowrap;
+      opacity: 0.85;
+    }
+
+    .build-info.stale {
+      color: #b45309;
+      font-weight: 600;
+      opacity: 1;
+      cursor: help;
     }
 
     .dot {
@@ -661,6 +679,7 @@
       </div>
       <div class="top-actions">
         <span class="status"><span id="healthDot" class="dot"></span><span id="healthText">Idle</span></span>
+        <span id="buildInfo" class="build-info"></span>
         <input id="token" class="token" type="password" autocomplete="off" placeholder="API token">
         <button id="saveToken">Save</button>
         <label class="switch"><input id="autoRefresh" type="checkbox" checked>Auto</label>
@@ -1597,6 +1616,7 @@
         state.stats = stats;
         state.events = events.events || [];
         setHealth("ok", "Online");
+        renderBuildInfo(health.build_id);
         renderSummary();
         renderPeers();
         renderDeviceKeyPeerList();
@@ -1612,6 +1632,28 @@
     function setHealth(kind, text) {
       $("healthDot").className = `dot ${kind === "ok" ? "ok" : kind === "bad" ? "bad" : ""}`;
       $("healthText").textContent = text;
+    }
+
+    // Show which build is applied. The GUI build is stamped into the page at serve
+    // time (window.__NEMO_GUI_BUILD); the server build comes from the live /health.
+    // They match normally (GUI is compiled into the binary); a mismatch means the
+    // browser is showing a cached page — prompt a hard refresh.
+    function renderBuildInfo(serverBuild) {
+      const el = $("buildInfo");
+      if (!el) return;
+      let gui = window.__NEMO_GUI_BUILD || "";
+      if (gui.indexOf("{{") === 0) gui = "";           // placeholder was not stamped
+      const server = serverBuild || "";
+      if (server && gui && server !== gui) {
+        el.className = "build-info stale";
+        el.textContent = `⚠ GUI ${gui} ≠ server ${server}`;
+        el.title = "This page was built from a different commit than the running server — your browser is showing a cached page. Hard-refresh (Ctrl+F5).";
+      } else {
+        el.className = "build-info";
+        const id = server || gui;
+        el.textContent = id ? `Build ${id}` : "";
+        el.title = "Build id (git hash + date) of the running hbbs. The dashboard GUI is compiled into this same build.";
+      }
     }
 
     function renderSummary() {
@@ -2551,6 +2593,7 @@
       }
     }
 
+    renderBuildInfo(null);
     schedule();
     loadAll();
   </script>
