@@ -28,6 +28,82 @@ use std::{
 use tokio::sync::RwLock;
 
 const EVENT_LIMIT: usize = 500;
+// SEC-9: nothing bounded a request body, so an UNAUTHENTICATED POST to a public
+// route (/api/login, /nemo/api/client/policy, /api/ab/get) was buffered and
+// JSON-parsed in full before the handler could reject it. The per-field caps
+// (MAX_NONCE_LEN, MAX_SEALED_REQUEST_B64) are checked inside the handler and so
+// came far too late to help.
+//
+// Two tiers, because the two groups of routes have nothing in common. The admin
+// tier is sized by the largest LEGITIMATE body -- a PUT of the whole permission
+// map, one entry per directory user. The public tier is sized by the sealed-login
+// envelope (MAX_SEALED_REQUEST_B64 is 16 KiB), which is the biggest thing a caller
+// with no token has any business sending.
+const MAX_REQUEST_BODY: usize = 4 * 1024 * 1024;
+const MAX_PUBLIC_REQUEST_BODY: usize = 64 * 1024;
+
+/// Routes reachable without the admin token. Everything here is sized for a client
+/// poll or a login, not for an administrative payload.
+fn request_body_cap(path: &str) -> usize {
+    let public = path.starts_with("/api/")
+        || path == "/nemo/api/client/policy"
+        || path == "/nemo/api/update/latest"
+        || path == "/nemo/api/health";
+    if public {
+        MAX_PUBLIC_REQUEST_BODY
+    } else {
+        MAX_REQUEST_BODY
+    }
+}
+
+/// SEC-9. Deliberately a hand-rolled middleware rather than a layer:
+/// `RequestBodyLimitLayer` lives in tower-http 0.4 and `http_body::Limited` in
+/// http-body 0.4.5, and this tree is pinned to tower-http 0.3.3 / http-body 0.4.4
+/// through axum 0.5. Pulling either forward to bound a body is a much bigger change
+/// than bounding it here.
+///
+/// Two stops: reject a declared Content-Length over the cap without reading
+/// anything, and cap the accumulation itself so a chunked body with no declared
+/// length cannot stream past it either.
+async fn limit_request_body(
+    req: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next<axum::body::Body>,
+) -> Result<axum::response::Response, StatusCode> {
+    use axum::body::HttpBody;
+    let cap = request_body_cap(req.uri().path());
+    if let Some(declared) = req
+        .headers()
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<usize>().ok())
+    {
+        if declared > cap {
+            log::warn!(
+                "Refused a {}-byte body on {} (cap {})",
+                declared,
+                req.uri().path(),
+                cap
+            );
+            return Err(StatusCode::PAYLOAD_TOO_LARGE);
+        }
+    }
+    let (parts, mut body) = req.into_parts();
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = body.data().await {
+        let chunk = chunk.map_err(|_| StatusCode::BAD_REQUEST)?;
+        if buf.len().saturating_add(chunk.len()) > cap {
+            log::warn!(
+                "Refused an undeclared body over {} bytes on {}",
+                cap,
+                parts.uri.path()
+            );
+            return Err(StatusCode::PAYLOAD_TOO_LARGE);
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    let req = axum::http::Request::from_parts(parts, axum::body::Body::from(buf));
+    Ok(next.run(req).await)
+}
 const MAX_MANAGEMENT_POLICY_VALUE_LEN: usize = 4096;
 const NEMO_SOURCE_PREFIX: &str = "nemo-source-v1:";
 const OPTION_NEMO_OUTBOUND_ENABLED: &str = "nemo-outbound-enabled";
@@ -928,7 +1004,10 @@ pub(crate) async fn spawn_hbbs_api(
         .route("/api/logout", post(api_logout))
         .route("/api/currentUser", post(api_current_user))
         .route("/api/ab/get", post(api_ab_get))
-        .layer(Extension(state));
+        .layer(Extension(state))
+        // SEC-9: applied last so it wraps every route above, including the
+        // unauthenticated ones, and runs before any extractor reads the body.
+        .layer(axum::middleware::from_fn(limit_request_body));
 
     // Nemo security: LDAP login credentials and managed secrets must never cross
     // the network in cleartext. Decide the transport, and refuse to serve this API
@@ -4225,6 +4304,36 @@ mod tests {
     // the controller's marker rides in RequestRelay.licence_key, NOT in a version
     // string. If the two field shapes parsed differently, adding the gate would have
     // refused every relayed session instead of only unauthorised ones.
+    // SEC-9: every route the admin token does NOT protect must land in the small
+    // tier. If a public path ever moves, this is what catches it.
+    #[test]
+    fn public_routes_get_the_small_body_cap() {
+        for public in [
+            "/api/login",
+            "/api/logout",
+            "/api/ab/get",
+            "/api/currentUser",
+            "/api/login-key",
+            "/api/tls-cert-info",
+            "/nemo/api/client/policy",
+            "/nemo/api/update/latest",
+            "/nemo/api/health",
+        ] {
+            assert_eq!(request_body_cap(public), MAX_PUBLIC_REQUEST_BODY, "{}", public);
+        }
+        for admin in [
+            "/nemo/api/integration/permissions",
+            "/nemo/api/policies",
+            "/nemo/api/update",
+            "/nemo/api/peers/delete",
+            "/nemo/admin",
+        ] {
+            assert_eq!(request_body_cap(admin), MAX_REQUEST_BODY, "{}", admin);
+        }
+        // The public tier still has room for a sealed login envelope.
+        assert!(MAX_PUBLIC_REQUEST_BODY > MAX_SEALED_REQUEST_B64);
+    }
+
     #[test]
     fn source_identity_is_identical_in_the_punch_and_relay_field_shapes() {
         let uuid = vec![4u8, 5, 6];
