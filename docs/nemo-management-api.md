@@ -13,10 +13,22 @@ unless explicitly enabled:
 cargo run --release -- --nemo-api Y --nemo-api-bind 127.0.0.1:21120
 ```
 
-When binding to a non-loopback address, a token is required:
+When binding to a non-loopback address, a token is required — and since SEC-12 the
+API also serves **HTTPS** there by default (self-signed unless you supply a
+certificate), because the admin bearer token and every managed secret cross that
+socket:
 
 ```powershell
 cargo run --release -- --nemo-api Y --nemo-api-bind 0.0.0.0:21120 --nemo-api-token "change-me"
+# -> https://<host>:21120/nemo/admin
+```
+
+Plaintext HTTP on a routable bind is refused at boot. To override it deliberately
+(a lab, or a bind already behind a TLS terminator) pass both:
+
+```powershell
+cargo run --release -- --nemo-api Y --nemo-api-bind 0.0.0.0:21120 --nemo-api-token "change-me" \
+    --nemo-api-tls off --nemo-api-allow-insecure Y
 ```
 
 Authenticated calls can use either header:
