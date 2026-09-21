@@ -178,6 +178,29 @@ enum LoopFailure {
     Listener,
 }
 
+/// An un-upgraded client hitting `--udp-registration=N` has NO fallback: start_udp never
+/// bails on silence, it just retries forever. With only a debug log on the server, such a
+/// machine goes silently dark and nothing on either end says why. So warn -- but throttle
+/// it, because that client retries every few seconds and would otherwise flood the log.
+fn warn_udp_refused_throttled(kind: &str, addr: SocketAddr) {
+    use std::sync::Mutex;
+    static LAST: Lazy<Mutex<Option<Instant>>> = Lazy::new(|| Mutex::new(None));
+    let mut last = LAST.lock().unwrap();
+    let due = last.map(|t| t.elapsed().as_secs() >= 60).unwrap_or(true);
+    if due {
+        *last = Some(Instant::now());
+        log::warn!(
+            "Refusing plaintext UDP {} from {} (udp-registration=N). That client is NOT \
+             online and has no fallback -- it needs disable-udp=Y. Further refusals are \
+             logged at most once a minute.",
+            kind,
+            addr
+        );
+    } else {
+        log::debug!("Refusing plaintext UDP {} from {}", kind, addr);
+    }
+}
+
 /// H5: a rendezvous connection whose peer proved, with a pinned device key, that it is a
 /// provisioned fleet member. `peer_id` is the id the proof is bound to, so the
 /// registration that follows can be held to it.
@@ -220,7 +243,7 @@ impl RendezvousServer {
         }
         KEY_EXCHANGE_MODE.store(key_exchange as u8, Ordering::SeqCst);
         log::info!("key-exchange={}", key_exchange.as_str());
-        let udp_registration = get_arg_or("udp-registration", "Y".to_owned())
+        let udp_registration = get_arg_or("udp-registration", "N".to_owned())
             .to_uppercase()
             .starts_with('Y');
         UDP_REGISTRATION.store(udp_registration, Ordering::SeqCst);
@@ -228,23 +251,25 @@ impl RendezvousServer {
         // Make the remaining plaintext path impossible to miss. --key-exchange only
         // covers TCP; as long as UDP registration is accepted, a client that has not
         // been switched to disable-udp=Y is still registering in the clear.
-        if udp_registration && key_exchange != KeyExchangeMode::Off {
+        if udp_registration {
+            // Inverted: N is the default now, so it is switching it back ON that deserves
+            // the warning.
             log::warn!(
-                "key-exchange={} protects the TCP rendezvous channel only. Plaintext UDP \
-                 registration is STILL ACCEPTED, so any client not yet on disable-udp=Y \
-                 registers in the clear. Rollout: push disable-udp=Y to the fleet, \
-                 confirm every peer is online, then restart with --udp-registration=N. \
-                 Note disable-udp only chooses the RENDEZVOUS transport -- it does not \
-                 turn off UDP hole punching, which is enable-udp-punch on the client.",
-                key_exchange.as_str()
+                "udp-registration=Y: plaintext UDP registration is ACCEPTED. UDP has no \
+                 key exchange and no device-key proof, so any client registering that way \
+                 does so in the clear and unauthenticated -- it bypasses both \
+                 --key-exchange and require-device-key. Only use this to recover a fleet \
+                 that cannot yet reach the TCP channel."
             );
         }
         if !udp_registration {
             log::info!(
-                "udp-registration=N: plaintext UDP registration is refused; clients must \
-                 use the KeyExchange-secured TCP channel (disable-udp=Y). Those clients \
-                 are reachable in both directions -- hbbs pushes punch and relay requests \
-                 over the peer's own rendezvous connection."
+                "udp-registration=N (default): plaintext UDP registration is refused, so \
+                 every client->server message is encrypted. Clients need disable-udp=Y, \
+                 which is now their default too, and are reachable in both directions -- \
+                 hbbs pushes punch and relay requests over the peer's own rendezvous \
+                 connection. NOTE this does not disable UDP hole punching, which is a \
+                 separate client switch (enable-udp-punch)."
             );
         }
         let nat_port = port - 1;
@@ -323,7 +348,21 @@ impl RendezvousServer {
                 "N"
             }
         );
-        if test_addr.to_lowercase() != "no" {
+        // test_hbbs sends itself a UDP RegisterPeer and exit(1)s if it goes unanswered.
+        // With udp-registration=N that arm refuses by design, so the self-test can only
+        // ever time out -- it would take the server down about 26 seconds after every
+        // boot, having already served clients happily over TCP in the meantime.
+        //
+        // Its stated purpose ("temp solution to solve udp socket failure") is moot when
+        // no peer registers over UDP, so skip it rather than carve out a loopback
+        // exemption that would reintroduce a plaintext path just to satisfy a probe.
+        if !udp_registration && test_addr.to_lowercase() != "no" {
+            log::info!(
+                "Skipping the UDP self-test: udp-registration=N means the arm it probes \
+                 refuses by design, so the probe could only ever time out."
+            );
+        }
+        if udp_registration && test_addr.to_lowercase() != "no" {
             let test_addr = if test_addr.is_empty() {
                 listener.local_addr()?
             } else {
@@ -485,7 +524,7 @@ impl RendezvousServer {
             match msg_in.union {
                 Some(rendezvous_message::Union::RegisterPeer(rp)) => {
                     if !UDP_REGISTRATION.load(Ordering::SeqCst) {
-                        log::debug!("Refusing plaintext UDP RegisterPeer from {}", addr);
+                        warn_udp_refused_throttled("RegisterPeer", addr);
                         return Ok(());
                     }
                     // B registered
@@ -518,7 +557,7 @@ impl RendezvousServer {
                 }
                 Some(rendezvous_message::Union::RegisterPk(rk)) => {
                     if !UDP_REGISTRATION.load(Ordering::SeqCst) {
-                        log::debug!("Refusing plaintext UDP RegisterPk from {}", addr);
+                        warn_udp_refused_throttled("RegisterPk", addr);
                         return Ok(());
                     }
                     if let Some(res) = self.register_pk_core(rk, addr).await {
@@ -1751,47 +1790,26 @@ impl RendezvousServer {
         let (push_tx, mut push_rx) = tokio::sync::mpsc::unbounded_channel::<RendezvousMessage>();
         let mut sink;
         if ws {
-            use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
-            let callback = |req: &Request, response: Response| {
-                let headers = req.headers();
-                let real_ip = headers
-                    .get("X-Real-IP")
-                    .or_else(|| headers.get("X-Forwarded-For"))
-                    .and_then(|header_value| header_value.to_str().ok());
-                if let Some(ip) = real_ip {
-                    if ip.contains('.') {
-                        addr = format!("{ip}:0").parse().unwrap_or(addr);
-                    } else {
-                        addr = format!("[{ip}]:0").parse().unwrap_or(addr);
-                    }
-                }
-                Ok(response)
-            };
-            let ws_stream = tokio_tungstenite::accept_hdr_async(stream, callback).await?;
-            let (a, mut b) = ws_stream.split();
-            sink = Some(Sink::Ws(a));
-            loop {
-                tokio::select! {
-                    res = timeout(30_000, b.next()) => {
-                        let Ok(Some(Ok(msg))) = res else { break };
-                        if let tungstenite::Message::Binary(bytes) = msg {
-                            // H5: the websocket rendezvous has no handshake at all, so it can prove
-                            // nothing. See the note in handle_listener_inner.
-                            if !self.handle_tcp(&bytes, &mut sink, addr, key, ws, &push_tx, None)
-                                .await {
-                                break;
-                            }
-                        }
-                    }
-                    // H43: something for this peer, written on its own connection.
-                    Some(msg) = push_rx.recv() => {
-                        if sink.is_none() {
-                            log::warn!("dropping a push to {:?}: this connection has no sink", addr);
-                        }
-                        Self::send_to_sink(&mut sink, msg).await;
-                    }
-                }
-            }
+            // H42/H5: REFUSED. This branch never ran a key exchange, never installed an
+            // Encrypt (Sink::Ws has no cipher slot) and passed `authed: None` -- so both
+            // --key-exchange=require and require_device_key were silently unenforced on
+            // this listener, and a keyless client could register, punch and relay with no
+            // Layer 1 proof at all. It was the one rendezvous plane with neither
+            // encryption nor device auth.
+            //
+            // Refusing rather than fixing, deliberately: nothing in this deployment uses
+            // ws rendezvous (21118/21119 are not even forwarded), the client already
+            // fails closed on plain ws:// for a bare IP, and "put TLS in front of it"
+            // cannot substitute -- TLS terminates upstream and cannot present a device
+            // key. Making it work means giving Sink::Ws an Option<Encrypt> and running
+            // the same KeyExchange + NemoClientAuth over it; until someone needs it, an
+            // unauthenticated plane is not worth keeping alive.
+            log::warn!(
+                "Refusing websocket rendezvous from {:?}: this transport carries no key \
+                 exchange and no device-key proof. Use the TCP rendezvous.",
+                addr
+            );
+            return Ok(());
         } else {
             let (a, mut b) = Framed::new(stream, BytesCodec::new()).split();
             sink = Some(Sink::TcpStream(a, None));
@@ -1867,9 +1885,15 @@ impl RendezvousServer {
                                         rx_enc = Some(Encrypt::new(sym));
                                         secured = true;
                                         log::debug!(
-                                            "Connection from {:?} secured and device-authenticated as peer {}",
+                                            "Connection from {:?} secured and device-authenticated \
+                                             as peer {} with key {}...",
                                             addr,
-                                            who.peer_id
+                                            who.peer_id,
+                                            // Short prefix only: enough to correlate with
+                                            // the pinned key in the registry, not enough
+                                            // to be worth logging in full.
+                                            &who.device_pub_b64
+                                                [..who.device_pub_b64.len().min(12)]
                                         );
                                         authed = Some(who);
                                     }

@@ -415,27 +415,22 @@ async fn make_pair(
     ws: bool,
 ) -> ResultType<()> {
     if ws {
-        use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
-        let callback = |req: &Request, response: Response| {
-            let headers = req.headers();
-            let real_ip = headers
-                .get("X-Real-IP")
-                .or_else(|| headers.get("X-Forwarded-For"))
-                .and_then(|header_value| header_value.to_str().ok());
-            if let Some(ip) = real_ip {
-                if ip.contains('.') {
-                    addr = format!("{ip}:0").parse().unwrap_or(addr);
-                } else {
-                    addr = format!("[{ip}]:0").parse().unwrap_or(addr);
-                }
-            }
-            Ok(response)
-        };
-        let ws_stream = tokio_tungstenite::accept_hdr_async(stream, callback).await?;
-        // The websocket relay port is expected to sit behind TLS termination (wss://),
-        // which already protects the control frame; double-encrypting it would be pure
-        // cost. Plain ws:// must not be exposed -- see the note in start().
-        make_pair_(ws_stream, addr, key, limiter).await;
+        // REFUSED, matching the hbbs rendezvous. This arm skipped relay_key_exchange
+        // entirely on the premise that the port "is expected to sit behind TLS
+        // termination" -- but nothing enforced that expectation, so plain ws:// on 21119
+        // relayed the control frame (the server licence key and both peer ids) in the
+        // clear. The raw-TCP arm right below has been fail-closed since the control-frame
+        // encryption landed; this one was the exception.
+        //
+        // Nothing in this deployment uses it: TOPOLOGY-DEPLOYMENT.md forwards 21117, not
+        // 21119. If wss relaying is ever wanted, run relay_key_exchange over it rather
+        // than trusting an upstream terminator.
+        log::warn!(
+            "Refusing websocket relay connection from {}: this transport skips the key \
+             exchange. Use the TCP relay port.",
+            addr
+        );
+        return Ok(());
     } else {
         let mut stream = FramedStream::from(stream, addr);
         // TBFDesk: encrypt the RequestRelay control frame. Without this the server
