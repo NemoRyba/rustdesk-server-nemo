@@ -930,38 +930,61 @@ pub(crate) async fn spawn_hbbs_api(
         .route("/api/ab/get", post(api_ab_get))
         .layer(Extension(state));
 
-    // Nemo security: LDAP login credentials and managed secrets must never
-    // cross the network in cleartext. Decide the transport, and refuse to serve
-    // LDAP login over plaintext HTTP on a routable address.
+    // Nemo security: LDAP login credentials and managed secrets must never cross
+    // the network in cleartext. Decide the transport, and refuse to serve this API
+    // over plaintext HTTP on a routable address.
     let ldap_enabled = crate::nemo_integration::ldap_config().enabled;
     let cert_path = get_arg("nemo-api-tls-cert");
     let key_path = get_arg("nemo-api-tls-key");
     let tls_mode = get_arg("nemo-api-tls"); // "auto" | "off" | "" (auto-decide)
     let explicit_cert = !cert_path.is_empty() && !key_path.is_empty();
+    let allow_insecure = is_truthy(&get_arg("nemo-api-allow-insecure"));
+    let routable = !addr.ip().is_loopback();
     let use_tls = if tls_mode == "off" {
         false
     } else if explicit_cert || tls_mode == "auto" {
         true
+    } else if allow_insecure {
+        // The operator has explicitly accepted plaintext on this bind, so do not
+        // then turn TLS on behind their back.
+        false
     } else {
-        // Default: turn TLS on automatically whenever LDAP login is enabled.
-        ldap_enabled
+        // SEC-12: the old default was `ldap_enabled`, which asked the wrong question.
+        // LDAP credentials are not the only secret on this socket -- the admin bearer
+        // token, every managed policy and the whole dashboard cross it too, and a
+        // stolen token can flip require_device_key for the entire fleet. So the
+        // trigger is the BIND, not the feature: anything routable gets TLS.
+        routable || ldap_enabled
     };
-    let allow_insecure = is_truthy(&get_arg("nemo-api-allow-insecure"));
     API_TLS_ACTIVE.store(use_tls, Ordering::SeqCst);
     API_BIND_LOOPBACK.store(addr.ip().is_loopback(), Ordering::SeqCst);
     API_ALLOW_INSECURE.store(allow_insecure, Ordering::SeqCst);
-    if ldap_enabled && !use_tls && !addr.ip().is_loopback() && !allow_insecure {
+    if !use_tls && routable && !allow_insecure {
         bail!(
-            "Refusing to serve LDAP login over plaintext HTTP on {}. Enable TLS \
-             (--nemo-api-tls auto, or --nemo-api-tls-cert/--nemo-api-tls-key), bind to \
-             loopback for an SSH tunnel, or set --nemo-api-allow-insecure Y to override.",
-            addr
+            "Refusing to serve the Nemo management API over plaintext HTTP on {}. The admin \
+             bearer token{} would cross the network in the clear. Enable TLS (--nemo-api-tls \
+             auto, or --nemo-api-tls-cert/--nemo-api-tls-key), bind to loopback and use an SSH \
+             tunnel, or set --nemo-api-allow-insecure Y to override.",
+            addr,
+            if ldap_enabled { " and every LDAP login" } else { "" },
         );
     }
-    if ldap_enabled && !use_tls {
+    if !use_tls && routable {
         log::warn!(
-            "Nemo LDAP login is enabled but the API is not using TLS ({}); credentials \
-             are sent in cleartext unless a tunnel protects this bind.",
+            "Nemo management API is serving PLAINTEXT HTTP on the routable address {} \
+             (--nemo-api-allow-insecure). The admin bearer token{} is exposed to anyone on \
+             the path unless a tunnel protects this bind.",
+            addr,
+            if ldap_enabled { ", every LDAP login and every managed secret" } else { " and every managed secret" },
+        );
+    }
+    if use_tls && routable && !explicit_cert && tls_mode.is_empty() && !ldap_enabled {
+        // Upgrade note: this bind used to default to plaintext. Say so plainly, or an
+        // operator whose clients are configured with http:// sees only silence.
+        log::warn!(
+            "Nemo management API now defaults to TLS on a routable bind ({}). Clients and \
+             the dashboard must use https:// -- update any api= URL that still says http://, \
+             or pass --nemo-api-tls off --nemo-api-allow-insecure Y to keep plaintext.",
             addr
         );
     }
