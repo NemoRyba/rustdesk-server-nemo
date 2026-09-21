@@ -23,6 +23,7 @@ fn main() -> ResultType<()> {
         -M, --rmem=[NUMBER(default={RMEM})] 'Sets UDP recv buffer size, set system rmem_max first, e.g., sudo sysctl -w net.core.rmem_max=52428800. vi /etc/sysctl.conf, net.core.rmem_max=52428800, sudo sysctl –p'
         , --mask=[MASK] 'Determine if the connection comes from LAN, e.g. 192.168.0.0/16'
         -k, --key=[KEY] 'Only allow the client with the same key'
+        , --key-exchange=[MODE(default=off)] 'Rendezvous TCP key exchange: off | offer | require. Needs a server key (-k or id_ed25519).'
         , --nemo-api=[BOOL(default=N)] 'Enable Nemo management API'
         , --nemo-api-bind=[ADDR(default=127.0.0.1:21120)] 'Sets Nemo management API bind address'
         , --nemo-api-token=[TOKEN] 'Requires Bearer or X-Nemo-Token auth for Nemo management API'
@@ -46,6 +47,12 @@ fn main() -> ResultType<()> {
     let rmem = get_arg("rmem").parse::<usize>().unwrap_or(RMEM);
     let serial: i32 = get_arg("serial").parse().unwrap_or(0);
     crate::common::check_software_update();
-    RendezvousServer::start(port, serial, &get_arg_or("key", "-".to_owned()), rmem)?;
+    RendezvousServer::start(
+        port,
+        serial,
+        &get_arg_or("key", "-".to_owned()),
+        rmem,
+        &get_arg_or("key-exchange", "off".to_owned()),
+    )?;
     Ok(())
 }

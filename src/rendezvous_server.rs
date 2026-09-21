@@ -16,7 +16,7 @@ use hbb_common::{
         register_pk_response::Result::{TOO_FREQUENT, UUID_MISMATCH},
         *,
     },
-    tcp::{listen_any, FramedStream},
+    tcp::{listen_any, Encrypt, FramedStream},
     timeout,
     tokio::{
         self,
@@ -31,11 +31,11 @@ use hbb_common::{
     AddrMangle, ResultType,
 };
 use ipnetwork::Ipv4Network;
-use sodiumoxide::crypto::sign;
+use sodiumoxide::crypto::{box_, secretbox, sign};
 use std::{
     collections::HashMap,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
-    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
     sync::Arc,
     time::Instant,
 };
@@ -54,7 +54,12 @@ const REG_TIMEOUT: i64 = 30_000;
 type TcpStreamSink = SplitSink<Framed<TcpStream, BytesCodec>, Bytes>;
 type WsSink = SplitSink<tokio_tungstenite::WebSocketStream<TcpStream>, tungstenite::Message>;
 enum Sink {
-    TcpStream(TcpStreamSink),
+    // C (--key-exchange): the cipher rides WITH the sink. A punch/relay sink is
+    // MOVED into `tcp_punch` and drained later from another task, so a
+    // per-connection local would not survive; `Encrypt` also carries monotonic
+    // send/recv counters (tcp.rs), so it must never be cloned or reset once the
+    // connection is secured. `None` = this connection is plaintext, i.e. today.
+    TcpStream(TcpStreamSink, Option<Encrypt>),
     Ws(WsSink),
 }
 type Sender = mpsc::UnboundedSender<Data>;
@@ -63,6 +68,59 @@ static ROTATION_RELAY_SERVER: AtomicUsize = AtomicUsize::new(0);
 type RelayServers = Vec<String>;
 const CHECK_RELAY_TIMEOUT: u64 = 3_000;
 static ALWAYS_USE_RELAY: AtomicBool = AtomicBool::new(false);
+
+// C (--key-exchange): server half of the rendezvous handshake the client already
+// speaks (client common.rs::secure_tcp_impl). Process-global like
+// ALWAYS_USE_RELAY above, resolved once in `start` before anything listens.
+static KEY_EXCHANGE_MODE: AtomicU8 = AtomicU8::new(KeyExchangeMode::Off as u8);
+// The client answers our offer immediately, so a peer that says nothing is a peer
+// that does not speak this handshake; do not hold the task for the full read window.
+const KEY_EXCHANGE_TIMEOUT: u64 = 3_000;
+
+/// C: how this server treats the rendezvous key exchange. `Off` is the default and
+/// sends nothing at all, i.e. byte-for-byte today's stream for a deployed fleet.
+#[repr(u8)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum KeyExchangeMode {
+    Off = 0,
+    /// Offer the handshake; a client that does not complete it stays plaintext.
+    Offer = 1,
+    /// Offer the handshake and close the connection when it does not complete.
+    Require = 2,
+}
+
+impl KeyExchangeMode {
+    fn parse(v: &str) -> ResultType<Self> {
+        match v.trim().to_lowercase().as_str() {
+            "" | "off" => Ok(Self::Off),
+            "offer" => Ok(Self::Offer),
+            "require" => Ok(Self::Require),
+            // A typo must not silently downgrade a security flag to off; an
+            // operator only ever sees this by having set the flag explicitly.
+            other => bail!(
+                "Invalid --key-exchange={}, expected off|offer|require",
+                other
+            ),
+        }
+    }
+
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Offer => "offer",
+            Self::Require => "require",
+        }
+    }
+}
+
+#[inline]
+fn key_exchange_mode() -> KeyExchangeMode {
+    match KEY_EXCHANGE_MODE.load(Ordering::SeqCst) {
+        x if x == KeyExchangeMode::Offer as u8 => KeyExchangeMode::Offer,
+        x if x == KeyExchangeMode::Require as u8 => KeyExchangeMode::Require,
+        _ => KeyExchangeMode::Off,
+    }
+}
 
 // Store punch hole requests
 use once_cell::sync::Lazy;
@@ -102,10 +160,37 @@ enum LoopFailure {
 
 impl RendezvousServer {
     #[tokio::main(flavor = "multi_thread")]
-    pub async fn start(port: i32, serial: i32, key: &str, rmem: usize) -> ResultType<()> {
+    pub async fn start(
+        port: i32,
+        serial: i32,
+        key: &str,
+        rmem: usize,
+        key_exchange: &str,
+    ) -> ResultType<()> {
         let (key, sk) = Self::get_server_sk(key);
         #[cfg(feature = "nemo-management-api")]
         let nemo_server_secret_key = sk.clone();
+        // C (--key-exchange): resolve the mode before anything listens, and log it
+        // like ALWAYS_USE_RELAY below so the effective mode is readable straight out
+        // of the boot log. The offer is signed with the server key, so without one
+        // no client can verify it.
+        let mut key_exchange = KeyExchangeMode::parse(key_exchange)?;
+        if key_exchange != KeyExchangeMode::Off && sk.is_none() {
+            if key_exchange == KeyExchangeMode::Require {
+                // require-with-no-key refuses every TCP accept, i.e. a total outage.
+                // Fail at boot rather than after the fleet has reconnected.
+                bail!("--key-exchange=require needs a server signing key: pass -k <private key> or put id_ed25519 next to hbbs");
+            }
+            // Degrade loudly: a silent offer no client can verify shows up on the
+            // client only as the 18s READ_TIMEOUT of secure_tcp, with no server hint.
+            log::warn!(
+                "--key-exchange={} has no server signing key to sign the offer with (pass -k <private key> or put id_ed25519 next to hbbs); degrading to off",
+                key_exchange.as_str()
+            );
+            key_exchange = KeyExchangeMode::Off;
+        }
+        KEY_EXCHANGE_MODE.store(key_exchange as u8, Ordering::SeqCst);
+        log::info!("key-exchange={}", key_exchange.as_str());
         let nat_port = port - 1;
         let ws_port = port + 2;
         let pm = PeerMap::new().await?;
@@ -371,104 +456,10 @@ impl RendezvousServer {
                     }
                 }
                 Some(rendezvous_message::Union::RegisterPk(rk)) => {
-                    if rk.uuid.is_empty() || rk.pk.is_empty() {
-                        return Ok(());
+                    if let Some(res) = self.register_pk_core(rk, addr).await {
+                        return send_rk_res(socket, addr, res).await;
                     }
-                    let id = rk.id;
-                    let ip = addr.ip().to_string();
-                    #[cfg(feature = "nemo-management-api")]
-                    if crate::nemo_management::is_peer_blocked(&self.pm, &id).await {
-                        crate::nemo_management::record_register_pk(&id, addr, false).await;
-                        crate::nemo_management::record_policy_rejection(
-                            &id,
-                            addr,
-                            "peer is blocked",
-                        )
-                        .await;
-                        return send_rk_res(socket, addr, TOO_FREQUENT).await;
-                    }
-                    if id.len() < 6 {
-                        return send_rk_res(socket, addr, UUID_MISMATCH).await;
-                    } else if !self.check_ip_blocker(&ip, &id).await {
-                        return send_rk_res(socket, addr, TOO_FREQUENT).await;
-                    }
-                    let peer = self.pm.get_or(&id).await;
-                    let (changed, ip_changed) = {
-                        let peer = peer.read().await;
-                        if peer.uuid.is_empty() {
-                            (true, false)
-                        } else {
-                            if peer.uuid == rk.uuid {
-                                if peer.info.ip != ip && peer.pk != rk.pk {
-                                    log::warn!(
-                                        "Peer {} ip/pk mismatch: {}/{:?} vs {}/{:?}",
-                                        id,
-                                        ip,
-                                        rk.pk,
-                                        peer.info.ip,
-                                        peer.pk,
-                                    );
-                                    drop(peer);
-                                    return send_rk_res(socket, addr, UUID_MISMATCH).await;
-                                }
-                            } else {
-                                log::warn!(
-                                    "Peer {} uuid mismatch: {:?} vs {:?}",
-                                    id,
-                                    rk.uuid,
-                                    peer.uuid
-                                );
-                                drop(peer);
-                                return send_rk_res(socket, addr, UUID_MISMATCH).await;
-                            }
-                            let ip_changed = peer.info.ip != ip;
-                            (
-                                peer.uuid != rk.uuid || peer.pk != rk.pk || ip_changed,
-                                ip_changed,
-                            )
-                        }
-                    };
-                    let mut req_pk = peer.read().await.reg_pk;
-                    if req_pk.1.elapsed().as_secs() > 6 {
-                        req_pk.0 = 0;
-                    } else if req_pk.0 > 2 {
-                        return send_rk_res(socket, addr, TOO_FREQUENT).await;
-                    }
-                    req_pk.0 += 1;
-                    req_pk.1 = Instant::now();
-                    peer.write().await.reg_pk = req_pk;
-                    if ip_changed {
-                        let mut lock = IP_CHANGES.lock().await;
-                        if let Some((tm, ips)) = lock.get_mut(&id) {
-                            if tm.elapsed().as_secs() > IP_CHANGE_DUR {
-                                *tm = Instant::now();
-                                ips.clear();
-                                ips.insert(ip.clone(), 1);
-                            } else if let Some(v) = ips.get_mut(&ip) {
-                                *v += 1;
-                            } else {
-                                ips.insert(ip.clone(), 1);
-                            }
-                        } else {
-                            lock.insert(
-                                id.clone(),
-                                (Instant::now(), HashMap::from([(ip.clone(), 1)])),
-                            );
-                        }
-                    }
-                    #[cfg(feature = "nemo-management-api")]
-                    let nemo_id = id.clone();
-                    if changed {
-                        self.pm.update_pk(id, peer, addr, rk.uuid, rk.pk, ip).await;
-                    }
-                    #[cfg(feature = "nemo-management-api")]
-                    crate::nemo_management::record_register_pk(&nemo_id, addr, true).await;
-                    let mut msg_out = RendezvousMessage::new();
-                    msg_out.set_register_pk_response(RegisterPkResponse {
-                        result: register_pk_response::Result::OK.into(),
-                        ..Default::default()
-                    });
-                    socket.send(&msg_out, addr).await?
+                    return Ok(());
                 }
                 Some(rendezvous_message::Union::PunchHoleRequest(_ph)) => {
                     // Upstream security port (80d3a50, rustdesk-server #670): UDP
@@ -666,14 +657,63 @@ impl RendezvousServer {
                     msg_out.set_test_nat_response(res);
                     Self::send_to_sink(sink, msg_out).await;
                 }
-                Some(rendezvous_message::Union::RegisterPk(_)) => {
-                    let res = register_pk_response::Result::NOT_SUPPORT;
-                    let mut msg_out = RendezvousMessage::new();
-                    msg_out.set_register_pk_response(RegisterPkResponse {
-                        result: res.into(),
-                        ..Default::default()
-                    });
-                    Self::send_to_sink(sink, msg_out).await;
+                Some(rendezvous_message::Union::RegisterPeer(rp)) => {
+                    // TBFDesk: the periodic presence heartbeat over TCP/WS. Without this
+                    // arm a client running with disable-udp=Y could register its key but
+                    // would never come online, because RegisterPeer only had a UDP path.
+                    if !rp.id.is_empty() {
+                        #[cfg(feature = "nemo-management-api")]
+                        {
+                            crate::nemo_management::record_peer_seen(&rp.id, addr).await;
+                            if crate::nemo_management::is_peer_blocked(&self.pm, &rp.id).await {
+                                crate::nemo_management::record_policy_rejection(
+                                    &rp.id,
+                                    addr,
+                                    "peer is blocked",
+                                )
+                                .await;
+                                return false;
+                            }
+                        }
+                        log::trace!("New peer registered over tcp: {:?} {:?}", &rp.id, &addr);
+                        let request_pk = self.update_addr_core(&rp.id, addr).await;
+                        let mut msg_out = RendezvousMessage::new();
+                        msg_out.set_register_peer_response(RegisterPeerResponse {
+                            request_pk,
+                            ..Default::default()
+                        });
+                        Self::send_to_sink(sink, msg_out).await;
+                        if self.inner.serial > rp.serial {
+                            let mut msg_out = RendezvousMessage::new();
+                            msg_out.set_configure_update(ConfigUpdate {
+                                serial: self.inner.serial,
+                                rendezvous_servers: (*self.rendezvous_servers).clone(),
+                                ..Default::default()
+                            });
+                            Self::send_to_sink(sink, msg_out).await;
+                        }
+                    }
+                    // Keep the connection: returning false makes the read loop break, and
+                    // a rendezvous client has to hold this socket open for its heartbeat.
+                    return true;
+                }
+                Some(rendezvous_message::Union::RegisterPk(rk)) => {
+                    // TBFDesk: registration over TCP/WS is supported so a client can run
+                    // with disable-udp=Y and register over the KeyExchange-secured TCP
+                    // channel instead of the plaintext UDP one. Same core as the UDP path,
+                    // so the blocked-peer, id-length, ip-blocker, uuid/pk-mismatch and
+                    // rate-limit checks all still apply. A malformed request gets the same
+                    // silence it gets over UDP.
+                    if let Some(res) = self.register_pk_core(rk, addr).await {
+                        let mut msg_out = RendezvousMessage::new();
+                        msg_out.set_register_pk_response(RegisterPkResponse {
+                            result: res.into(),
+                            ..Default::default()
+                        });
+                        Self::send_to_sink(sink, msg_out).await;
+                    }
+                    // Keep the connection open (see the RegisterPeer arm).
+                    return true;
                 }
                 _ => {}
             }
@@ -681,14 +721,118 @@ impl RendezvousServer {
         false
     }
 
-    #[inline]
-    async fn update_addr(
+    // TBFDesk: the RegisterPk core, shared by the UDP path and the TCP/WS path.
+    // It was previously inlined in the UDP arm only, which is why registering over
+    // TCP answered NOT_SUPPORT and a client could never run with disable-udp=Y --
+    // and therefore could never do its registration over the KeyExchange-secured
+    // TCP channel. Returns the result code to send back, or None for a malformed
+    // request that deserves no reply. The caller writes it to whichever sink it owns.
+    async fn register_pk_core(
         &mut self,
-        id: String,
-        socket_addr: SocketAddr,
-        socket: &mut FramedSocket,
-    ) -> ResultType<()> {
-        let (request_pk, ip_change) = if let Some(old) = self.pm.get_in_memory(&id).await {
+        rk: RegisterPk,
+        addr: SocketAddr,
+    ) -> Option<register_pk_response::Result> {
+                if rk.uuid.is_empty() || rk.pk.is_empty() {
+                    return None;
+                }
+                let id = rk.id;
+                let ip = addr.ip().to_string();
+                #[cfg(feature = "nemo-management-api")]
+                if crate::nemo_management::is_peer_blocked(&self.pm, &id).await {
+                    crate::nemo_management::record_register_pk(&id, addr, false).await;
+                    crate::nemo_management::record_policy_rejection(
+                        &id,
+                        addr,
+                        "peer is blocked",
+                    )
+                    .await;
+                    return Some(TOO_FREQUENT);
+                }
+                if id.len() < 6 {
+                    return Some(UUID_MISMATCH);
+                } else if !self.check_ip_blocker(&ip, &id).await {
+                    return Some(TOO_FREQUENT);
+                }
+                let peer = self.pm.get_or(&id).await;
+                let (changed, ip_changed) = {
+                    let peer = peer.read().await;
+                    if peer.uuid.is_empty() {
+                        (true, false)
+                    } else {
+                        if peer.uuid == rk.uuid {
+                            if peer.info.ip != ip && peer.pk != rk.pk {
+                                log::warn!(
+                                    "Peer {} ip/pk mismatch: {}/{:?} vs {}/{:?}",
+                                    id,
+                                    ip,
+                                    rk.pk,
+                                    peer.info.ip,
+                                    peer.pk,
+                                );
+                                drop(peer);
+                                return Some(UUID_MISMATCH);
+                            }
+                        } else {
+                            log::warn!(
+                                "Peer {} uuid mismatch: {:?} vs {:?}",
+                                id,
+                                rk.uuid,
+                                peer.uuid
+                            );
+                            drop(peer);
+                            return Some(UUID_MISMATCH);
+                        }
+                        let ip_changed = peer.info.ip != ip;
+                        (
+                            peer.uuid != rk.uuid || peer.pk != rk.pk || ip_changed,
+                            ip_changed,
+                        )
+                    }
+                };
+                let mut req_pk = peer.read().await.reg_pk;
+                if req_pk.1.elapsed().as_secs() > 6 {
+                    req_pk.0 = 0;
+                } else if req_pk.0 > 2 {
+                    return Some(TOO_FREQUENT);
+                }
+                req_pk.0 += 1;
+                req_pk.1 = Instant::now();
+                peer.write().await.reg_pk = req_pk;
+                if ip_changed {
+                    let mut lock = IP_CHANGES.lock().await;
+                    if let Some((tm, ips)) = lock.get_mut(&id) {
+                        if tm.elapsed().as_secs() > IP_CHANGE_DUR {
+                            *tm = Instant::now();
+                            ips.clear();
+                            ips.insert(ip.clone(), 1);
+                        } else if let Some(v) = ips.get_mut(&ip) {
+                            *v += 1;
+                        } else {
+                            ips.insert(ip.clone(), 1);
+                        }
+                    } else {
+                        lock.insert(
+                            id.clone(),
+                            (Instant::now(), HashMap::from([(ip.clone(), 1)])),
+                        );
+                    }
+                }
+                #[cfg(feature = "nemo-management-api")]
+                let nemo_id = id.clone();
+                if changed {
+                    self.pm.update_pk(id, peer, addr, rk.uuid, rk.pk, ip).await;
+                }
+                #[cfg(feature = "nemo-management-api")]
+                crate::nemo_management::record_register_pk(&nemo_id, addr, true).await;
+        Some(register_pk_response::Result::OK)
+    }
+
+    #[inline]
+    // TBFDesk: the address bookkeeping of update_addr, split out so the TCP/WS path
+    // can reuse it. Returns `request_pk`, i.e. whether the server still wants this
+    // peer's public key. The caller sends the RegisterPeerResponse on its own sink.
+    async fn update_addr_core(&mut self, id: &str, socket_addr: SocketAddr) -> bool {
+        let (request_pk, ip_change) = if let Some(old) = self.pm.get_in_memory(id).await {
             let mut old = old.write().await;
             let ip = socket_addr.ip();
             let ip_change = if old.socket_addr.port() != 0 {
@@ -717,6 +861,16 @@ impl RendezvousServer {
         if let Some(old) = ip_change {
             log::info!("IP change of {} from {} to {}", id, old, socket_addr);
         }
+        request_pk
+    }
+
+    async fn update_addr(
+        &mut self,
+        id: String,
+        socket_addr: SocketAddr,
+        socket: &mut FramedSocket,
+    ) -> ResultType<()> {
+        let request_pk = self.update_addr_core(&id, socket_addr).await;
         let mut msg_out = RendezvousMessage::new();
         msg_out.set_register_peer_response(RegisterPeerResponse {
             request_pk,
@@ -755,6 +909,11 @@ impl RendezvousServer {
             socket_addr: AddrMangle::encode(addr).into(),
             pk: self.get_pk(&phs.version, phs.id).await,
             relay_server: phs.relay_server.clone(),
+            // B's v6 endpoint and UPnP port, reported by B in PunchHoleSent. Both fields
+            // were missing from the server proto, so B sent them and the server dropped
+            // them -- A only ever learned B's IPv4 address.
+            socket_addr_v6: phs.socket_addr_v6.clone(),
+            upnp_port: phs.upnp_port,
             ..Default::default()
         };
         if let Ok(t) = phs.nat_type.enum_value() {
@@ -794,6 +953,8 @@ impl RendezvousServer {
             socket_addr: la.local_addr.clone(),
             pk: self.get_pk(&la.version, la.id).await,
             relay_server: la.relay_server,
+            // Same for the intranet path: carry B's v6 local address through.
+            socket_addr_v6: la.socket_addr_v6.clone(),
             ..Default::default()
         };
         p.set_is_local(true);
@@ -926,7 +1087,11 @@ impl RendezvousServer {
             let mut relay_server = self.get_relay_server(addr.ip(), peer_addr.ip());
             #[cfg(feature = "nemo-management-api")]
             let mut forced_relay = false;
-            if ALWAYS_USE_RELAY.load(Ordering::SeqCst) || (peer_is_lan ^ is_lan) {
+            // `ph.force_relay` is the client saying "do not try direct" (set when it is
+            // proxied, on websocket, or told to by its own peer config). The field did not
+            // exist in the server proto, so that request was silently ignored and the
+            // server still answered with a direct path the client would not use.
+            if ALWAYS_USE_RELAY.load(Ordering::SeqCst) || ph.force_relay || (peer_is_lan ^ is_lan) {
                 #[cfg(feature = "nemo-management-api")]
                 {
                     forced_relay = true;
@@ -968,6 +1133,10 @@ impl RendezvousServer {
                 msg_out.set_fetch_local_addr(FetchLocalAddr {
                     socket_addr,
                     relay_server,
+                    // Carry the caller's IPv6 address through. The server proto used to
+                    // lack this field entirely, so protobuf dropped it silently and the
+                    // v6 path could never be attempted.
+                    socket_addr_v6: ph.socket_addr_v6.clone(),
                     ..Default::default()
                 });
             } else {
@@ -981,6 +1150,16 @@ impl RendezvousServer {
                     socket_addr,
                     nat_type: ph.nat_type,
                     relay_server,
+                    // These four were absent from the server proto, so the client sent
+                    // them and protobuf discarded them. The target therefore always saw
+                    // udp_port == 0 and never took the UDP punch arm -- traversal was
+                    // TCP-only, IPv6 was unreachable, UPnP was unused, and a client
+                    // asking for relay was ignored. They are pass-through: the server
+                    // decides nothing here, it only has to stop losing them.
+                    udp_port: ph.udp_port,
+                    upnp_port: ph.upnp_port,
+                    socket_addr_v6: ph.socket_addr_v6.clone(),
+                    force_relay: ph.force_relay,
                     ..Default::default()
                 });
             }
@@ -1037,7 +1216,15 @@ impl RendezvousServer {
         if let Some(sink) = sink.as_mut() {
             if let Ok(bytes) = msg.write_to_bytes() {
                 match sink {
-                    Sink::TcpStream(s) => {
+                    Sink::TcpStream(s, cipher) => {
+                        // C (--key-exchange): the one funnel every TCP reply goes
+                        // through, so sealing here covers every call site with no
+                        // edit of its own. `cipher` is None unless this connection
+                        // completed the handshake -- that is today's behaviour.
+                        let bytes = match cipher.as_mut() {
+                            Some(cipher) => cipher.enc(&bytes),
+                            None => bytes,
+                        };
                         allow_err!(s.send(Bytes::from(bytes)).await);
                     }
                     Sink::Ws(ws) => {
@@ -1278,7 +1465,11 @@ impl RendezvousServer {
                     } else {
                         ALWAYS_USE_RELAY.store(false, Ordering::SeqCst);
                     }
-                    self.tx.send(Data::RelayServers0(rs.to_owned())).ok();
+                    // Do NOT forward this argument to RelayServers0: it is the Y/N flag,
+                    // not a relay address. Upstream did, so `aur Y` silently replaced the
+                    // whole relay-server list with the literal string "Y" (leaving it
+                    // empty) and an operator enabling always-use-relay lost their relay
+                    // configuration. Only `relay-servers`/`rs` may set that list.
                 } else {
                     let _ = writeln!(
                         res,
@@ -1392,8 +1583,95 @@ impl RendezvousServer {
             }
         } else {
             let (a, mut b) = Framed::new(stream, BytesCodec::new()).split();
-            sink = Some(Sink::TcpStream(a));
-            while let Ok(Some(Ok(bytes))) = timeout(30_000, b.next()).await {
+            sink = Some(Sink::TcpStream(a, None));
+            // C (--key-exchange): offer the rendezvous handshake before the read loop
+            // takes over the stream. `off` sends nothing and leaves both `rx_enc` and
+            // `pending` None, so the loop below is byte-for-byte today's behaviour.
+            let mode = key_exchange_mode();
+            // Recv half of the connection cipher; the send half rides with the sink.
+            let mut rx_enc: Option<Encrypt> = None;
+            // A frame read while waiting for the handshake, replayed into the loop.
+            let mut pending: Option<BytesMut> = None;
+            if mode != KeyExchangeMode::Off {
+                if let Some(sk) = self.inner.sk.as_ref() {
+                    let (msg_out, our_sk_b) = Self::key_exchange_offer_msg(sk);
+                    // The offer goes out in the clear -- the sink's cipher is still
+                    // None, and send_to_sink is what would otherwise seal it.
+                    Self::send_to_sink(&mut sink, msg_out).await;
+                    let mut secured = false;
+                    // Exactly one bounded read: the client replies immediately, and a
+                    // client that never learned this handshake replies with its real
+                    // first request (or with nothing at all).
+                    if let Ok(Some(Ok(bytes))) = timeout(KEY_EXCHANGE_TIMEOUT, b.next()).await {
+                        match RendezvousMessage::parse_from_bytes(&bytes)
+                            .ok()
+                            .and_then(|msg_in| msg_in.union)
+                        {
+                            Some(rendezvous_message::Union::KeyExchange(ex)) => {
+                                match Self::key_exchange_open(&ex, &our_sk_b) {
+                                    Ok(sym) => {
+                                        // One derived key, two `Encrypt`: `enc` and
+                                        // `dec` count on separate fields (tcp.rs), so
+                                        // a send-only instance riding with the sink
+                                        // plus a recv-only instance staying here
+                                        // reproduce exactly the nonce sequence of the
+                                        // client's single FramedStream cipher. Neither
+                                        // is ever cloned or reset afterwards.
+                                        if let Some(Sink::TcpStream(_, cipher)) = sink.as_mut() {
+                                            *cipher = Some(Encrypt::new(sym.clone()));
+                                        }
+                                        rx_enc = Some(Encrypt::new(sym));
+                                        secured = true;
+                                        log::debug!("Connection from {:?} secured", addr);
+                                    }
+                                    Err(err) => {
+                                        // The peer ran `conn.set_key` the moment it
+                                        // sent this (client common.rs), so it encrypts
+                                        // from here on: falling back to plaintext
+                                        // would only yield garbage. Close either mode.
+                                        log::debug!(
+                                            "Key exchange from {:?} failed: {}",
+                                            addr,
+                                            err
+                                        );
+                                        return Ok(());
+                                    }
+                                }
+                            }
+                            // A client that does not know this handshake sends its
+                            // real first request instead. Replay it rather than
+                            // swallow it, so `offer` really is today's behaviour
+                            // for the clients already in the field.
+                            _ => pending = Some(bytes),
+                        }
+                    }
+                    if !secured && mode == KeyExchangeMode::Require {
+                        log::debug!(
+                            "Refusing {:?}: --key-exchange=require and the peer did not complete the handshake",
+                            addr
+                        );
+                        return Ok(());
+                    }
+                } else if mode == KeyExchangeMode::Require {
+                    // Unreachable: start() refuses to boot on require-with-no-key.
+                    // Fail closed anyway rather than silently serving plaintext.
+                    return Ok(());
+                }
+            }
+            loop {
+                let mut bytes = match pending.take() {
+                    Some(bytes) => bytes,
+                    None => match timeout(30_000, b.next()).await {
+                        Ok(Some(Ok(bytes))) => bytes,
+                        _ => break,
+                    },
+                };
+                if let Some(rx_enc) = rx_enc.as_mut() {
+                    if let Err(err) = rx_enc.dec(&mut bytes) {
+                        log::debug!("Failed to decrypt from {:?}: {}", addr, err);
+                        break;
+                    }
+                }
                 if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
                     break;
                 }
@@ -1404,6 +1682,39 @@ impl RendezvousServer {
         }
         log::debug!("Tcp connection from {:?} closed", addr);
         Ok(())
+    }
+
+    /// C (--key-exchange), server half of the client's `secure_tcp_impl`: build the
+    /// offer it waits for. The client opens it with `sign::verify(&keys[0], rs_pk)`
+    /// and then requires exactly 32 bytes inside, so the signature must cover the raw
+    /// ephemeral X25519 pubkey and nothing else, in a message carrying exactly one
+    /// key. The matching secret never leaves the accepting task.
+    fn key_exchange_offer_msg(sk: &sign::SecretKey) -> (RendezvousMessage, box_::SecretKey) {
+        let (our_pk_b, our_sk_b) = box_::gen_keypair();
+        let mut msg_out = RendezvousMessage::new();
+        msg_out.set_key_exchange(KeyExchange {
+            keys: vec![Bytes::from(sign::sign(&our_pk_b.0, sk))],
+            ..Default::default()
+        });
+        (msg_out, our_sk_b)
+    }
+
+    /// C: open the client's reply. The client sends `keys = [its X25519 pubkey, the
+    /// symmetric key sealed to ours]` (client `create_symmetric_key_msg`), while
+    /// `Encrypt::decode` takes them in the OTHER order -- (symmetric, their_pk,
+    /// our_sk). Swapping the two is silent until a real client connects, so the order
+    /// is pinned by `key_exchange_opens_the_clients_reply` in the tests below.
+    fn key_exchange_open(
+        ex: &KeyExchange,
+        our_sk_b: &box_::SecretKey,
+    ) -> ResultType<secretbox::Key> {
+        if ex.keys.len() != 2 {
+            bail!(
+                "Key exchange reply carries {} keys, expected 2",
+                ex.keys.len()
+            );
+        }
+        Encrypt::decode(&ex.keys[1], &ex.keys[0], our_sk_b)
     }
 
     #[inline]
@@ -1668,6 +1979,109 @@ mod tests {
             }
             _ => None,
         }
+    }
+
+    /// C (--key-exchange): drives the handshake end to end against the production
+    /// helpers with a real `sign::gen_keypair()`, standing in for the client half
+    /// (`common.rs::secure_tcp_impl` + `create_symmetric_key_msg`). It exists to catch
+    /// the `Encrypt::decode(symmetric, their_pk, our_sk)` argument-order swap, which is
+    /// silent until a real client connects, and to pin the split of one derived key
+    /// across a send-only and a recv-only `Encrypt`.
+    #[test]
+    fn key_exchange_opens_the_clients_reply() {
+        let (rs_pk, rs_sk) = sign::gen_keypair();
+
+        // Server: the offer exactly as handle_listener_inner puts it on the wire.
+        let (msg_out, our_sk_b) = RendezvousServer::key_exchange_offer_msg(&rs_sk);
+        let offered = match msg_out.union {
+            Some(rendezvous_message::Union::KeyExchange(ex)) => ex.keys,
+            other => panic!("expected KeyExchange, got {other:?}"),
+        };
+        assert_eq!(offered.len(), 1, "the client bails unless keys.len() == 1");
+
+        // Client: verify the signature, then seal a fresh symmetric key to us.
+        let their_pk_b = sign::verify(&offered[0], &rs_pk).expect("offer signature verifies");
+        assert_eq!(
+            their_pk_b.len(),
+            box_::PUBLICKEYBYTES,
+            "the client's get_pk() requires exactly 32 signed bytes"
+        );
+        let mut server_pk = [0u8; box_::PUBLICKEYBYTES];
+        server_pk.copy_from_slice(&their_pk_b);
+        let (client_pk_b, client_sk_b) = box_::gen_keypair();
+        let symmetric = secretbox::gen_key();
+        let sealed = box_::seal(
+            &symmetric.0,
+            &box_::Nonce([0u8; box_::NONCEBYTES]),
+            &box_::PublicKey(server_pk),
+            &client_sk_b,
+        );
+        let reply = KeyExchange {
+            keys: vec![
+                Bytes::from(client_pk_b.0.to_vec()),
+                Bytes::from(sealed.clone()),
+            ],
+            ..Default::default()
+        };
+
+        // Server: open it. keys[0]/keys[1] the wrong way round fails right here.
+        let opened =
+            RendezvousServer::key_exchange_open(&reply, &our_sk_b).expect("sealed key opens");
+        assert_eq!(
+            opened, symmetric,
+            "server derived a different symmetric key"
+        );
+
+        // ... and the swapped order must not accidentally succeed.
+        let swapped = KeyExchange {
+            keys: vec![reply.keys[1].clone(), reply.keys[0].clone()],
+            ..Default::default()
+        };
+        assert!(
+            RendezvousServer::key_exchange_open(&swapped, &our_sk_b).is_err(),
+            "(their_pk, symmetric) must not open -- argument order is load bearing"
+        );
+        let short = KeyExchange {
+            keys: vec![reply.keys[0].clone()],
+            ..Default::default()
+        };
+        assert!(
+            RendezvousServer::key_exchange_open(&short, &our_sk_b).is_err(),
+            "a reply that is not [pk, sealed] is not a completed handshake"
+        );
+
+        // One derived key, two `Encrypt`: the sink's is send-only and the read loop's
+        // is recv-only, so together they match the client's single FramedStream cipher.
+        let mut sink_enc = Encrypt::new(opened.clone());
+        let mut loop_dec = Encrypt::new(opened);
+        let mut client = Encrypt::new(symmetric);
+        let mut from_server = BytesMut::from(&sink_enc.enc(b"punch-hole-response")[..]);
+        client
+            .dec(&mut from_server)
+            .expect("client decrypts our reply");
+        assert_eq!(&from_server[..], &b"punch-hole-response"[..]);
+        let mut from_client = BytesMut::from(&client.enc(b"punch-hole-request")[..]);
+        loop_dec
+            .dec(&mut from_client)
+            .expect("server decrypts the request");
+        assert_eq!(&from_client[..], &b"punch-hole-request"[..]);
+    }
+
+    /// C: the flag parser. `off` is the default and every unknown value is refused at
+    /// boot rather than silently downgraded.
+    #[test]
+    fn key_exchange_mode_parses_the_three_documented_values() {
+        assert_eq!(KeyExchangeMode::parse("").unwrap(), KeyExchangeMode::Off);
+        assert_eq!(KeyExchangeMode::parse("off").unwrap(), KeyExchangeMode::Off);
+        assert_eq!(
+            KeyExchangeMode::parse("Offer").unwrap(),
+            KeyExchangeMode::Offer
+        );
+        assert_eq!(
+            KeyExchangeMode::parse(" require ").unwrap(),
+            KeyExchangeMode::Require
+        );
+        assert!(KeyExchangeMode::parse("requrie").is_err());
     }
 
     #[test]

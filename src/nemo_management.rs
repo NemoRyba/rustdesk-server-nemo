@@ -439,6 +439,12 @@ struct PolicyRequest {
     require_device_key: Option<bool>,
     #[serde(default)]
     strip_unsealed_secrets: Option<bool>,
+    /// S-B (scope b): the two fail-closed switches for encrypted client requests.
+    /// Option, like the rest: a PUT that omits them leaves them untouched.
+    #[serde(default)]
+    require_sealed_login: Option<bool>,
+    #[serde(default)]
+    require_sealed_request: Option<bool>,
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -500,7 +506,17 @@ struct ClientPolicyPayload {
     /// no replay protection; the signed timestamp inside the seal is what does).
     #[serde(default)]
     issued_ts: u64,
+    /// Session revocation order for this peer: it must terminate every session it
+    /// currently holds when this value is newer than the one it last honoured. Sits
+    /// inside the signed (and, when sealed, encrypted) payload, so it cannot be
+    /// forged or stripped by a MITM. 0 = nothing to revoke.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    terminate_sessions_before: u64,
     policy: ManagementPolicy,
+}
+
+fn is_zero_u64(v: &u64) -> bool {
+    *v == 0
 }
 
 #[derive(Serialize)]
@@ -569,6 +585,10 @@ struct PolicyResponse {
     log_history_limit: usize,
     require_device_key: bool,
     strip_unsealed_secrets: bool,
+    // S-B (scope b): both ship false, so the dashboard shows "off" on a fleet that
+    // has not been updated yet.
+    require_sealed_login: bool,
+    require_sealed_request: bool,
     // Build id of the running hbbs (git hash + date), so the dashboard header can
     // show which build is applied. GUI ships inside this same binary.
     build_id: &'static str,
@@ -673,6 +693,48 @@ fn persist_log_history_limit(value: usize) {
 
 fn log_history_limit() -> usize {
     LOG_HISTORY_LIMIT.load(Ordering::SeqCst)
+}
+
+// Per-peer session revocation: "terminate any session open on this peer as of this
+// epoch second". Persisted, because a revocation must survive a server restart --
+// direct sessions do not die with the server, so forgetting the order would silently
+// un-revoke them.
+static PEER_TERMINATE: Lazy<std::sync::RwLock<HashMap<String, u64>>> =
+    Lazy::new(|| std::sync::RwLock::new(load_peer_terminate()));
+
+fn peer_terminate_path() -> String {
+    get_arg_or("nemo-peer-terminate-file", "nemo_peer_terminate.json".to_owned())
+}
+
+fn load_peer_terminate() -> HashMap<String, u64> {
+    std::fs::read_to_string(peer_terminate_path())
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+/// Order the peer to drop every session it currently has. Monotonic: the stored value
+/// only ever moves forward, so a clock wobble cannot un-revoke.
+fn set_peer_terminate(id: &str) -> u64 {
+    let now = now_epoch_secs();
+    let snapshot = {
+        let mut map = PEER_TERMINATE.write().unwrap();
+        let slot = map.entry(id.to_owned()).or_insert(0);
+        if now > *slot {
+            *slot = now;
+        }
+        map.clone()
+    };
+    if let Ok(text) = serde_json::to_string(&snapshot) {
+        if let Err(err) = std::fs::write(peer_terminate_path(), text) {
+            log::error!("failed to persist session revocation for {}: {}", id, err);
+        }
+    }
+    snapshot.get(id).copied().unwrap_or(now)
+}
+
+fn peer_terminate_before(id: &str) -> u64 {
+    PEER_TERMINATE.read().unwrap().get(id).copied().unwrap_or(0)
 }
 
 fn peer_hostnames_path() -> String {
@@ -836,6 +898,11 @@ pub(crate) async fn spawn_hbbs_api(
         )
         .route("/nemo/api/connections", get(get_connections))
         .route("/nemo/api/connections/cut", post(cut_connection))
+        // Auto-update: the client-facing signed manifest (unauthenticated — every
+        // client polls it) and the admin publish / withdraw endpoints.
+        .route("/nemo/api/update/latest", get(get_update_latest))
+        .route("/nemo/api/update", post(put_update_manifest))
+        .route("/nemo/api/update/delete", post(delete_update_manifest))
         // RustDesk-client-facing login + server-driven address book.
         .route("/api/login-key", get(api_login_key).post(api_login_key))
         .route(
@@ -1065,6 +1132,22 @@ struct SealedLogin {
     /// older clients (absent = timestamp window only, logged).
     #[serde(default)]
     nonce: String,
+    /// S-B (scope b): base64 of an EPHEMERAL X25519 public key the client generated
+    /// for this one login. It rides INSIDE the seal, so a MITM can neither read nor
+    /// swap it. Present = the session token comes back sealed to it instead of in the
+    /// clear; absent (older client) = exactly today's response.
+    #[serde(default)]
+    reply_pk: String,
+    /// Layer 1: the client's device proof for THIS sign-in — base64 Ed25519 public
+    /// key and base64 attached signature over "nemo-login:{id}:{ts}" (the client's
+    /// nemo_device_sign, the same shape the poll sends as "nemo-poll"). It rides
+    /// INSIDE the seal so a MITM can neither read nor strip it. Optional on the wire
+    /// so an older sealed client still parses; whether its absence is fatal is
+    /// decided by require_device_key in api_login, not here.
+    #[serde(default)]
+    device_key_pub: String,
+    #[serde(default)]
+    device_key_sig: String,
 }
 
 #[derive(Serialize)]
@@ -1081,6 +1164,12 @@ struct LoginUser {
 struct LoginResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     access_token: Option<String>,
+    /// S-B (scope b): base64(sealedbox(session token, the client's `reply_pk`)).
+    /// Sent INSTEAD OF the cleartext `access_token` when the sealed login carried a
+    /// reply key, so a MITM recording the response cannot lift a usable session.
+    /// Skipped when absent, so an old client sees an unchanged response shape.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sealed_access_token: Option<String>,
     #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
     kind: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1093,6 +1182,7 @@ impl LoginResult {
     fn err(message: impl Into<String>) -> Self {
         Self {
             access_token: None,
+            sealed_access_token: None,
             kind: None,
             user: None,
             error: Some(message.into()),
@@ -1125,6 +1215,14 @@ const SEALED_LOGIN_MAX_SKEW_SECS: u64 = 60;
 // without bound. The retain() below already prunes by time; this bounds memory under a
 // burst by evicting the oldest entry when full (the ts window still caps replay).
 const MAX_SEEN_NONCES: usize = 100_000;
+// Review finding (memory exhaustion): the cap above bounds the NUMBER of entries, not
+// their size, and the nonce is an attacker-chosen string that arrives before any peer
+// lookup happens. A 1 MB nonce x 100_000 entries is an unauthenticated OOM. Both
+// clients emit base64(16 bytes) = 24 chars, so anything longer is not a real client.
+const MAX_NONCE_LEN: usize = 64;
+// Upper bound on the base64 envelope itself (see resolve_request_body). 16 KiB is far
+// above any real request body this fork sends and far below what hurts.
+const MAX_SEALED_REQUEST_B64: usize = 16 * 1024;
 
 // Pure replay guard for a sealed login: freshness window on ts (a ts of 0 — the
 // old "legacy client" bypass — is now REJECTED) and at-most-once nonces within the
@@ -1141,6 +1239,11 @@ fn sealed_login_guard(
         return Err("sealed credential expired; please retry".to_owned());
     }
     let nonce = nonce.trim();
+    if nonce.len() > MAX_NONCE_LEN {
+        // Rejected BEFORE retain()/insert() so an oversized nonce costs neither the
+        // allocation nor the O(n) eviction scan.
+        return Err("sealed credential nonce is too long".to_owned());
+    }
     if nonce.is_empty() {
         // Older client without a nonce: the timestamp window is the only replay
         // bound. Accepted (fleet transition), but visible in the log.
@@ -1168,9 +1271,47 @@ fn sealed_login_guard(
     Ok(())
 }
 
-// S-B: open a sealed login credential to (username, password). Fails closed on any
-// decode/parse/replay error.
-fn decode_sealed_login(state: &HbbsApiState, sealed_b64: &str) -> Result<(String, String), String> {
+// S-B (scope b): nonces seen on sealed REQUEST envelopes. Deliberately a SEPARATE
+// cache from SEEN_LOGIN_NONCES: both are bounded by MAX_SEEN_NONCES, so one shared
+// map would let a flood of poll nonces evict the login nonces (and vice versa) and
+// re-open a replay window on the other endpoint.
+static SEEN_REQUEST_NONCES: Lazy<std::sync::Mutex<HashMap<String, u64>>> =
+    Lazy::new(|| std::sync::Mutex::new(HashMap::new()));
+
+// S-B (scope b): replay guard for a sealed request envelope. Same freshness window
+// and at-most-once rule as a sealed login — sealed_login_guard does that work, here
+// against the separate cache above — with one difference: a nonce is MANDATORY. The
+// envelope is new wire format and the client always inserts a nonce, so there is no
+// older sender to be lenient to, and accepting an empty nonce would leave a captured
+// envelope replayable for the whole ts window.
+fn sealed_request_guard(
+    ts: u64,
+    nonce: &str,
+    now: u64,
+    seen: &mut HashMap<String, u64>,
+) -> Result<(), String> {
+    if nonce.trim().is_empty() {
+        return Err("sealed request envelope without a nonce".to_owned());
+    }
+    sealed_login_guard(ts, nonce, now, seen)
+}
+
+// What a login request resolves to once the seal (if any) is open. A struct rather
+// than a growing tuple: Layer 1 makes the device proof the fourth thing api_login
+// needs out of it. A plaintext login builds one with an EMPTY proof, so the single
+// Layer 1 gate in api_login covers both paths.
+struct OpenedLogin {
+    username: String,
+    password: String,
+    reply_pk: Option<box_::PublicKey>,
+    /// Both empty when the client sent no device proof (older client / no key).
+    device_key_pub: String,
+    device_key_sig: String,
+}
+
+// S-B: open a sealed login credential to (username, password, reply key, device
+// proof). Fails closed on any decode/parse/replay error.
+fn decode_sealed_login(state: &HbbsApiState, sealed_b64: &str) -> Result<OpenedLogin, String> {
     let ciphertext =
         base64::decode(sealed_b64.trim()).map_err(|_| "invalid sealed credential".to_owned())?;
     let plain = sealedbox::open(&ciphertext, &state.login_enc_pk, &state.login_enc_sk)
@@ -1182,8 +1323,49 @@ fn decode_sealed_login(state: &HbbsApiState, sealed_b64: &str) -> Result<(String
         .map(|d| d.as_secs())
         .unwrap_or(0);
     sealed_login_guard(s.ts, &s.nonce, now, &mut SEEN_LOGIN_NONCES.lock().unwrap())?;
-    Ok((s.username.trim().to_owned(), s.password))
+    // S-B (scope b): the client's ephemeral X25519 reply key, raw (NOT an Ed25519
+    // device key, so no to_curve25519_pk here). Present-but-unparseable is a client
+    // bug and not an attack — the key is inside the authenticated seal, so nobody can
+    // corrupt it in flight — and we fail closed rather than fall back to returning the
+    // session token in the clear (the same rule as seal_to_device_key: never send the
+    // plaintext you meant to seal).
+    let reply_pk = match s.reply_pk.trim() {
+        "" => None,
+        raw => Some(
+            base64::decode(raw)
+                .ok()
+                .and_then(|b| box_::PublicKey::from_slice(&b))
+                .ok_or_else(|| "invalid reply key in sealed credential".to_owned())?,
+        ),
+    };
+    Ok(OpenedLogin {
+        username: s.username.trim().to_owned(),
+        password: s.password,
+        reply_pk,
+        device_key_pub: s.device_key_pub.trim().to_owned(),
+        device_key_sig: s.device_key_sig.trim().to_owned(),
+    })
 }
+
+// Layer 1: the login's device proof, checked exactly like the poll's ("nemo-poll")
+// and the address book's ("nemo-ab") — pinned key, M1 binding to the claimed id,
+// fresh signature — under its own domain so a captured poll signature cannot be
+// replayed as a login. `id` is the OUTER request's client id: it is not inside the
+// seal, but the signature binds it, so a swapped id simply fails to verify.
+fn login_device_key_ok(opened: &OpenedLogin, id: &str) -> bool {
+    !opened.device_key_pub.is_empty()
+        && !opened.device_key_sig.is_empty()
+        && verify_device_signature(
+            &opened.device_key_pub,
+            &opened.device_key_sig,
+            "nemo-login",
+            id,
+        )
+}
+
+// Layer 1: what a user sees when their machine is not provisioned. Names the fix
+// (import the key) rather than the mechanism.
+const LOGIN_DEVICE_KEY_REQUIRED: &str = "This server only accepts sign-ins from a provisioned computer. Import the device key your administrator issued for this computer (or ask your administrator for one) and sign in again.";
 
 async fn api_login(
     Extension(state): Extension<HbbsApiState>,
@@ -1191,13 +1373,67 @@ async fn api_login(
 ) -> Json<LoginResult> {
     // S-B: prefer a sealed credential (confidential regardless of TLS); fall back
     // to plaintext fields for backward compatibility.
-    let (username, password) = match &req.sealed {
+    let opened = match &req.sealed {
         Some(sealed) if !sealed.trim().is_empty() => match decode_sealed_login(&state, sealed) {
             Ok(v) => v,
             Err(e) => return Json(LoginResult::err(e)),
         },
-        _ => (req.username.trim().to_owned(), req.password.clone()),
+        _ => {
+            // S-B (scope b): a client still POSTing its password in the clear. ALWAYS
+            // logged (never gated) so an operator can grep the fleet for stragglers
+            // BEFORE turning require_sealed_login on.
+            log::warn!(
+                "Nemo login with a CLEARTEXT credential: user='{}' from client id={} uuid={} - update this client before enabling require-sealed-login",
+                req.username.trim(),
+                if req.id.trim().is_empty() { "?" } else { req.id.trim() },
+                if req.uuid.trim().is_empty() { "?" } else { req.uuid.trim() },
+            );
+            // Default false = today's behaviour exactly; only an operator flip changes it.
+            if integration::require_sealed_login() {
+                return Json(LoginResult::err(
+                    "This server only accepts encrypted logins. This TBFDesk client is too old to encrypt your password - please update it (or ask your administrator to) and sign in again.",
+                ));
+            }
+            // Layer 1: a plaintext login carries NO device proof (the proof rides
+            // inside the seal), so it reaches the gate below with an empty one and
+            // is refused there whenever require_device_key is on.
+            OpenedLogin {
+                username: req.username.trim().to_owned(),
+                password: req.password.clone(),
+                reply_pk: None,
+                device_key_pub: String::new(),
+                device_key_sig: String::new(),
+            }
+        }
     };
+    // Layer 1 BEFORE Layer 2: the machine proves it is a fleet member before the
+    // directory is even consulted, so an unprovisioned machine cannot probe LDAP
+    // credentials (and never reaches the failure backoff). ALWAYS logged, like the
+    // cleartext line above, so an operator can find the stragglers on a fleet whose
+    // stored require_device_key is still false (R3: upgrades keep the stored value).
+    let client_id = req.id.trim();
+    if !login_device_key_ok(&opened, client_id) {
+        log::warn!(
+            "Nemo login WITHOUT a valid pinned device key: user='{}' from client id={} uuid={} (proof {}) - provision this machine before enabling require-device-key",
+            opened.username,
+            if client_id.is_empty() { "?" } else { client_id },
+            if req.uuid.trim().is_empty() { "?" } else { req.uuid.trim() },
+            if opened.device_key_pub.is_empty() || opened.device_key_sig.is_empty() {
+                "missing"
+            } else {
+                "not valid for a pinned key"
+            },
+        );
+        if integration::require_device_key() {
+            return Json(LoginResult::err(LOGIN_DEVICE_KEY_REQUIRED));
+        }
+    }
+    let OpenedLogin {
+        username,
+        password,
+        reply_pk,
+        ..
+    } = opened;
     if username.is_empty() || password.is_empty() {
         return Json(LoginResult::err("Username and password required"));
     }
@@ -1233,8 +1469,21 @@ async fn api_login(
                 if req.id.trim().is_empty() { "?" } else { req.id.trim() },
                 if req.uuid.trim().is_empty() { "?" } else { req.uuid.trim() },
             );
+            // S-B (scope b): when the sealed login carried a reply key the session
+            // token goes back sealed to it and the cleartext field is OMITTED, so a
+            // MITM that records the response cannot lift a valid session. This needs
+            // no flag — the client's own request selects the shape, and a client that
+            // sent no reply_pk gets exactly today's response.
+            let (access_token, sealed_access_token) = match &reply_pk {
+                Some(pk) => (
+                    None,
+                    Some(base64::encode(sealedbox::seal(token.as_bytes(), pk))),
+                ),
+                None => (Some(token), None),
+            };
             Json(LoginResult {
-                access_token: Some(token),
+                access_token,
+                sealed_access_token,
                 kind: Some("access_token".to_owned()),
                 user: Some(LoginUser {
                     name: user.username,
@@ -1352,15 +1601,37 @@ struct AbGetRequest {
 async fn api_ab_get(
     Extension(state): Extension<HbbsApiState>,
     headers: HeaderMap,
-    body: Option<Json<AbGetRequest>>,
+    // S-B (scope b): the body is either today's AbGetRequest or a sealed envelope, so
+    // it arrives untyped and is deserialized after resolve_request_body has picked
+    // (and authenticated) the right one. Still Option<..>: the stock client posts `{}`
+    // or no body at all.
+    body: Option<Json<serde_json::Value>>,
 ) -> Json<AbResult> {
-    let Some(token) = bearer_token(&headers) else {
-        return Json(AbResult::err("Invalid token"));
+    let raw = body.map(|Json(b)| b).unwrap_or_else(|| serde_json::json!({}));
+    let raw = match resolve_request_body(&state, raw) {
+        Ok(v) => v,
+        Err(e) => {
+            log::warn!("address book request rejected: {}", e);
+            return Json(AbResult::err(e));
+        }
+    };
+    // Review finding: sealing the login RESPONSE bought nothing while the very next
+    // request put the same token back on the wire as a cleartext `Authorization:
+    // Bearer`. A client that sealed its envelope carries the token INSIDE it instead,
+    // so prefer that and fall back to the header for every other (older) client.
+    let token = match raw.get("access_token").and_then(|v| v.as_str()) {
+        Some(t) if !t.trim().is_empty() => t.trim().to_owned(),
+        _ => match bearer_token(&headers) {
+            Some(t) => t,
+            None => return Json(AbResult::err("Invalid token")),
+        },
     };
     let Some(session) = integration::session_for_token(&token) else {
         return Json(AbResult::err("Invalid token"));
     };
-    let req = body.map(|Json(b)| b).unwrap_or_default();
+    // As before, a body that is not shaped like an AbGetRequest falls back to the
+    // defaults rather than failing the request.
+    let req: AbGetRequest = serde_json::from_value(raw).unwrap_or_default();
     let device_key_ok = !req.device_key_pub.is_empty()
         && !req.device_key_sig.is_empty()
         && verify_device_signature(&req.device_key_pub, &req.device_key_sig, "nemo-ab", &req.id);
@@ -1796,10 +2067,248 @@ async fn delete_device_key(
     let removed = integration::remove_device_key(&id);
     Ok(Json(serde_json::json!({ "removed": removed })))
 }
+
+// ---- Auto-update manifest (a Layer 1 consumer) ----
+//
+// The stock updater is unreachable from this fork (no api.rustdesk.com; the stock
+// `allow-auto-update` policy key is denied on the client). Updates come ONLY from
+// this server: the operator places {"version","url","sha256"} in nemo_update.json
+// (working directory, --nemo-update-file to relocate, or the dashboard's POST) and
+// GET /nemo/api/update/latest serves it PLUS `sig`, computed at request time with
+// the management secret key over "version|url|sha256". The client verifies `sig`
+// with its pinned management public key, checks `url` is on this server's origin
+// and the artifact's SHA-256, and only then runs the installer. A manifest the
+// server cannot sign is never served.
+
+fn update_manifest_path() -> String {
+    get_arg_or("nemo-update-file", "nemo_update.json".to_owned())
+}
+
+// Bounds on what goes into the signed string; both are generous for real values
+// and keep an admin-supplied manifest from becoming a large per-poll response.
+const MAX_UPDATE_VERSION_LEN: usize = 128;
+const MAX_UPDATE_URL_LEN: usize = 2048;
+
+/// The operator-authored manifest, exactly as stored on disk (no `sig` — that is
+/// never persisted; it is recomputed per request, so nothing on disk goes stale
+/// if the management key is ever rotated).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct UpdateManifest {
+    #[serde(default)]
+    version: String,
+    #[serde(default)]
+    url: String,
+    #[serde(default)]
+    sha256: String,
+}
+
+/// What GET /nemo/api/update/latest returns: the manifest plus its signature.
+#[derive(Serialize)]
+struct SignedUpdateManifest {
+    version: String,
+    url: String,
+    sha256: String,
+    /// base64 of the DETACHED Ed25519 signature (64 bytes) over
+    /// update_manifest_message() — the cross-fork contract with the client's
+    /// nemo_verify_update_manifest.
+    sig: String,
+}
+
+// The exact byte string both sides sign/verify. validate_update_manifest forbids
+// '|' (and whitespace/control characters) in version and url, so the joined string
+// cannot be re-split into a different (version, url, sha256) triple under the same
+// signature.
+fn update_manifest_message(m: &UpdateManifest) -> String {
+    format!("{}|{}|{}", m.version, m.url, m.sha256)
+}
+
+fn sign_update_manifest(m: &UpdateManifest, sk: &sign::SecretKey) -> SignedUpdateManifest {
+    let sig = sign::sign_detached(update_manifest_message(m).as_bytes(), sk);
+    SignedUpdateManifest {
+        version: m.version.clone(),
+        url: m.url.clone(),
+        sha256: m.sha256.clone(),
+        sig: base64::encode(sig.as_ref()),
+    }
+}
+
+// Canonicalise and validate what the operator wrote: trimmed, non-empty version;
+// an http(s) url; sha256 of exactly 64 hex digits, lower-cased so the signed
+// string is the same however it was pasted. Returns the canonical manifest — the
+// form that is stored, signed and served.
+fn validate_update_manifest(m: &UpdateManifest) -> Result<UpdateManifest, String> {
+    let version = m.version.trim().to_owned();
+    let url = m.url.trim().to_owned();
+    let sha256 = m.sha256.trim().to_ascii_lowercase();
+    let clean = |s: &str| !s.chars().any(|c| c == '|' || c.is_whitespace() || c.is_control());
+    if version.is_empty() || version.len() > MAX_UPDATE_VERSION_LEN || !clean(&version) {
+        return Err(
+            "update manifest: version must be non-empty, without '|' or whitespace".to_owned(),
+        );
+    }
+    let host_and_path = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .unwrap_or("");
+    if host_and_path.is_empty() || url.len() > MAX_UPDATE_URL_LEN || !clean(&url) {
+        return Err("update manifest: url must be an http(s) URL".to_owned());
+    }
+    if sha256.len() != 64 || !sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("update manifest: sha256 must be 64 hex digits".to_owned());
+    }
+    // Origin pin. The dashboard tells the operator the URL "must be on this server's
+    // origin" and the CLIENT does enforce that, but the server used to accept and
+    // SIGN any origin -- so an off-origin manifest was reported as published and then
+    // silently discarded by every client. Refuse it here instead, so the operator gets
+    // told at save time and the management key never signs a foreign download URL.
+    if let Some(expected) = global_policy().options.get("api-server") {
+        let expected = expected.trim();
+        if !expected.is_empty() {
+            match (url_origin(&url), url_origin(expected)) {
+                (Some(got), Some(want)) if got != want => {
+                    return Err(format!(
+                        "update manifest: url must be on this server's origin ({want}), got {got}"
+                    ));
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(UpdateManifest {
+        version,
+        url,
+        sha256,
+    })
+}
+
+/// scheme://host[:port] of an http(s) URL, lowercased. None if it is not http(s).
+/// Compared as a parsed origin rather than a prefix, so `https://evil.com/?x=https://good`
+/// and `https://good.example.com.evil.com` cannot slip through.
+fn url_origin(url: &str) -> Option<String> {
+    let (scheme, rest) = if let Some(r) = url.strip_prefix("https://") {
+        ("https", r)
+    } else if let Some(r) = url.strip_prefix("http://") {
+        ("http", r)
+    } else {
+        return None;
+    };
+    let authority = rest
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or("")
+        .rsplit('@') // drop any userinfo
+        .next()
+        .unwrap_or("");
+    if authority.is_empty() {
+        return None;
+    }
+    Some(format!("{scheme}://{}", authority.to_ascii_lowercase()))
+}
+
+// Read the operator's manifest. Ok(None) = nothing published (the file is absent);
+// Err = the file exists but is unusable, an operator error that is surfaced as such
+// rather than hidden behind a 404.
+fn read_update_manifest(path: &std::path::Path) -> Result<Option<UpdateManifest>, String> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("cannot read {}: {}", path.display(), e)),
+    };
+    let raw: UpdateManifest = serde_json::from_str(&text)
+        .map_err(|e| format!("{} is not a valid update manifest: {}", path.display(), e))?;
+    validate_update_manifest(&raw).map(Some)
+}
+
+// Public data (every client fetches it unauthenticated), so unlike
+// nemo_integration.json this gets no restrict_file: there is nothing to hide.
+fn write_update_manifest(path: &std::path::Path, m: &UpdateManifest) -> Result<(), String> {
+    let text = serde_json::to_string_pretty(m).map_err(|e| e.to_string())?;
+    std::fs::write(path, text).map_err(|e| format!("cannot write {}: {}", path.display(), e))
+}
+
+// GET /nemo/api/update/latest — deliberately NO require_auth: every client polls
+// it. Signed at request time; 404 when nothing is published.
+async fn get_update_latest(
+    Extension(state): Extension<HbbsApiState>,
+) -> ApiResult<SignedUpdateManifest> {
+    let path = std::path::PathBuf::from(update_manifest_path());
+    let manifest = read_update_manifest(&path)
+        .map_err(|e| {
+            log::error!("update manifest not served: {}", e);
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "the update manifest on the server is invalid; ask your administrator to re-publish it",
+            )
+        })?
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "no update published"))?;
+    // Never serve a manifest the server cannot sign: no client would accept it, and
+    // an unsigned shape on the wire only invites a client-side "fix" that accepts it.
+    let Some(secret_key) = state.server_secret_key.as_ref() else {
+        return Err(api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "server has no signing key; cannot sign the update manifest",
+        ));
+    };
+    Ok(Json(sign_update_manifest(&manifest, secret_key)))
+}
+
+// POST /nemo/api/update (admin): publish a manifest from the dashboard. Validated
+// and canonicalised before it touches disk; answers with the signed form so the
+// operator sees exactly what clients will receive.
+async fn put_update_manifest(
+    Extension(state): Extension<HbbsApiState>,
+    headers: HeaderMap,
+    Json(req): Json<UpdateManifest>,
+) -> ApiResult<SignedUpdateManifest> {
+    require_auth(&headers, &state.token)?;
+    let manifest =
+        validate_update_manifest(&req).map_err(|e| api_error(StatusCode::BAD_REQUEST, &e))?;
+    // Refuse up front rather than publish something no client will ever accept.
+    let Some(secret_key) = state.server_secret_key.as_ref() else {
+        return Err(api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "server has no signing key; cannot sign the update manifest",
+        ));
+    };
+    let path = std::path::PathBuf::from(update_manifest_path());
+    write_update_manifest(&path, &manifest).map_err(|e| {
+        log::error!("failed to persist update manifest: {}", e);
+        server_error(e)
+    })?;
+    log::info!(
+        "Nemo update manifest published: version={} url={}",
+        manifest.version,
+        manifest.url
+    );
+    Ok(Json(sign_update_manifest(&manifest, secret_key)))
+}
+
+// POST /nemo/api/update/delete (admin): withdraw a published update (a bad build
+// must be pullable without shell access to the server). Idempotent.
+async fn delete_update_manifest(
+    Extension(state): Extension<HbbsApiState>,
+    headers: HeaderMap,
+) -> ApiResult<serde_json::Value> {
+    require_auth(&headers, &state.token)?;
+    let path = std::path::PathBuf::from(update_manifest_path());
+    let removed = match std::fs::remove_file(&path) {
+        Ok(()) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => {
+            log::error!("failed to remove update manifest {}: {}", path.display(), e);
+            return Err(server_error(e));
+        }
+    };
+    if removed {
+        log::info!("Nemo update manifest withdrawn");
+    }
+    Ok(Json(serde_json::json!({ "removed": removed })))
+}
+
 // Verify a client's device-key signature over "{domain}:{id}:{ts}" (domain is
-// "nemo-poll" for the policy poll, "nemo-ab" for the address-book fetch — distinct
-// domains so a captured poll signature cannot be replayed against another
-// endpoint). True only if the public key is pinned, its M1 binding (if any)
+// "nemo-poll" for the policy poll, "nemo-ab" for the address-book fetch and, Layer
+// 1, "nemo-login" for the sign-in — distinct domains so a captured signature for
+// one cannot be replayed against another endpoint). True only if the public key is pinned, its M1 binding (if any)
 // matches the claimed peer id, the signature is valid, the id matches, and the ts
 // is fresh (replay window). A non-numeric ts is REJECTED (it used to silently skip
 // the freshness check).
@@ -1875,6 +2384,85 @@ fn open_sealed_to_mgmt_key(state: &HbbsApiState, sealed_b64: &str) -> Option<Vec
     let curve_pk = sign::to_curve25519_pk(&pk).ok()?;
     let ciphertext = base64::decode(sealed_b64.trim()).ok()?;
     sealedbox::open(&ciphertext, &curve_pk, &curve_sk).ok()
+}
+
+// S-B (scope b): the pure half of the sealed request envelope — parse the opened
+// plaintext and apply the freshness/replay rules. Split out exactly like
+// sealed_login_guard so the wire contract is unit-testable without an HbbsApiState.
+// Returns the inner JSON object: the body this request would have been today, plus
+// the envelope's own "ts"/"nonce" (harmless - none of the typed request structs deny
+// unknown fields).
+fn parse_sealed_request(
+    plain: &[u8],
+    now: u64,
+    seen: &mut HashMap<String, u64>,
+) -> Result<serde_json::Value, String> {
+    let inner: serde_json::Value =
+        serde_json::from_slice(plain).map_err(|_| "invalid sealed request payload".to_owned())?;
+    // A missing or non-numeric ts stays 0, which the guard rejects — fail closed.
+    let ts = inner.get("ts").and_then(|v| v.as_u64()).unwrap_or(0);
+    let nonce = inner.get("nonce").and_then(|v| v.as_str()).unwrap_or("");
+    sealed_request_guard(ts, nonce, now, seen)?;
+    Ok(inner)
+}
+
+// S-B (scope b): what to do with a body that carries NO envelope. Pure (and so
+// testable) because this is the R3 default path: require_sealed_request ships false,
+// and then today's plaintext body is passed through byte-identical.
+fn unsealed_request_body(
+    body: serde_json::Value,
+    require_sealed: bool,
+) -> Result<serde_json::Value, String> {
+    if require_sealed {
+        return Err(
+            "this server requires an encrypted request; please update TBFDesk on this computer"
+                .to_owned(),
+        );
+    }
+    Ok(body)
+}
+
+// S-B (scope b): the ONE envelope entry point, shared by the policy poll and
+// /api/ab/get. A seal-capable client replaces its whole POST body with
+// {"sealed_request": "<base64 sealedbox to the management key>"}, so nothing it sends
+// is readable on the wire. Returns the body the caller should continue with:
+//   * envelope present -> the opened inner JSON. The OUTER body is attacker-writable and
+//     is never merged into it. NOTE: a sealedbox is ANONYMOUS — anyone holding the
+//     management PUBLIC key can produce a valid envelope, so opening one proves
+//     confidentiality, NOT sender identity. Callers must still authenticate the request
+//     on its own terms (the poll via validate_client_policy_request, /api/ab/get via the
+//     session token and verify_device_signature). Do not treat "it opened" as "it is
+//     from a legitimate client".
+//   * no envelope -> today's plaintext body, unless the operator turned on
+//     require_sealed_request, in which case this fails closed.
+fn resolve_request_body(
+    state: &HbbsApiState,
+    body: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let sealed = body
+        .get("sealed_request")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_owned();
+    if sealed.is_empty() {
+        return unsealed_request_body(body, integration::require_sealed_request());
+    }
+    // Review finding (memory/CPU exhaustion): this runs BEFORE any peer lookup, so it is
+    // unauthenticated work. A real envelope is a sealedbox over a small JSON object; cap
+    // it so an attacker cannot make us base64-decode and open a huge blob per request.
+    // (The whole-body limit belongs on the router, but axum 0.5's RequestBodyLimitLayer
+    // changes the body type for every handler — tracked separately.)
+    if sealed.len() > MAX_SEALED_REQUEST_B64 {
+        return Err("sealed request envelope is too large".to_owned());
+    }
+    let plain = open_sealed_to_mgmt_key(state, &sealed)
+        .ok_or_else(|| "sealed request could not be opened (wrong management key?)".to_owned())?;
+    parse_sealed_request(
+        &plain,
+        now_epoch_secs(),
+        &mut SEEN_REQUEST_NONCES.lock().unwrap(),
+    )
 }
 
 // A1: the effective session token for this poll — prefer the sealed one (confidential
@@ -2102,17 +2690,27 @@ async fn cut_connection(
     Json(req): Json<CutConnectionRequest>,
 ) -> ApiResult<PeerPolicyResponse> {
     require_auth(&headers, &state.token)?;
-    // The reliable server-side lever is to block the target so it stops
-    // negotiating/accepting NEW connections. Active *direct* sessions have no
-    // server-side data path to interrupt (that is the point of a direct
-    // connection); they end when the session closes or the peer re-checks policy.
+    // Two levers, both needed:
+    //   1. block the target so it stops accepting NEW connections, and
+    //   2. issue a session revocation it will honour on its next management poll.
+    // (2) is what actually ends a session already in progress. A direct session has
+    // no server-side data path to interrupt, so the teardown has to be performed by
+    // the controlled machine itself -- which is the right place anyway, since that is
+    // the asset the operator owns and the controller cannot veto it.
     let resp = set_peer_policy(&state.pm, &req.target_id, Some(0)).await?;
+    let terminate_ts = set_peer_terminate(&req.target_id);
     {
         let mut store = STATS.write().await;
         store.connections.retain(|c| c.target_id != req.target_id);
         let detail = match &req.source_id {
-            Some(s) => format!("blocked target {} (source {}) from dashboard", req.target_id, s),
-            None => format!("blocked target {} from dashboard", req.target_id),
+            Some(s) => format!(
+                "blocked target {} (source {}) from dashboard; sessions revoked as of {}",
+                req.target_id, s, terminate_ts
+            ),
+            None => format!(
+                "blocked target {} from dashboard; sessions revoked as of {}",
+                req.target_id, terminate_ts
+            ),
         };
         record_event_locked(&mut store, "connection-cut", Some(&req.target_id), None, detail);
     }
@@ -2701,8 +3299,21 @@ async fn update_peer_management_policy(
 
 async fn client_policy(
     Extension(state): Extension<HbbsApiState>,
-    Json(request): Json<ClientPolicyRequest>,
+    // S-B (scope b): ClientPolicyRequest's `id`/`uuid` are not #[serde(default)], so a
+    // typed extractor would reject a sealed envelope with "missing field id" before
+    // this handler ever ran. Take the body as a Value, resolve the envelope, then
+    // deserialize the inner (seal-authenticated) object.
+    Json(raw): Json<serde_json::Value>,
 ) -> ApiResult<ClientPolicyResponse> {
+    let body = resolve_request_body(&state, raw).map_err(|e| {
+        log::warn!("client policy poll rejected: {}", e);
+        api_error(StatusCode::FORBIDDEN, &e)
+    })?;
+    // UNPROCESSABLE_ENTITY, not BAD_REQUEST: that is exactly what axum's typed Json
+    // extractor returned for a wrong-shaped body until now, so a malformed request
+    // still gets the status it got today.
+    let request: ClientPolicyRequest = serde_json::from_value(body)
+        .map_err(|e| api_error(StatusCode::UNPROCESSABLE_ENTITY, &e.to_string()))?;
     let peer = state
         .pm
         .get_registered(&request.id)
@@ -2830,6 +3441,7 @@ async fn client_policy(
         id: peer.id.clone(),
         issued_at: now_iso(),
         issued_ts: now_epoch_secs(),
+        terminate_sessions_before: peer_terminate_before(&peer.id),
         policy,
     };
     let payload_bytes = serde_json::to_vec(&payload).map_err(server_error)?;
@@ -2991,6 +3603,17 @@ async fn update_policy(
     if let Some(strip) = request.strip_unsealed_secrets {
         integration::set_strip_unsealed_secrets(strip);
     }
+    // S-B (scope b): these lock out any client that has not been updated, so they are
+    // logged at the moment an operator flips them — that log line is what explains a
+    // sudden wave of refused logins/polls afterwards.
+    if let Some(require) = request.require_sealed_login {
+        log::info!("Nemo require-sealed-login set to {}", require);
+        integration::set_require_sealed_login(require);
+    }
+    if let Some(require) = request.require_sealed_request {
+        log::info!("Nemo require-sealed-request set to {}", require);
+        integration::set_require_sealed_request(require);
+    }
     Ok(Json(policy_response()))
 }
 
@@ -3144,6 +3767,8 @@ fn policy_response() -> PolicyResponse {
         log_history_limit: log_history_limit(),
         require_device_key: integration::require_device_key(),
         strip_unsealed_secrets: integration::strip_unsealed_secrets(),
+        require_sealed_login: integration::require_sealed_login(),
+        require_sealed_request: integration::require_sealed_request(),
         build_id: nemo_build_id(),
     }
 }
@@ -3678,6 +4303,290 @@ mod tests {
         // Junk public key -> None, never a bogus seal.
         assert!(seal_to_device_key("!!!", b"x").is_none());
         assert!(seal_to_device_key(&base64::encode([1u8; 7]), b"x").is_none());
+    }
+
+    // S-B (scope b): the sealed REQUEST envelope. The wire rules live in the pure
+    // core, so they are exercised against a LOCAL nonce cache — never the process
+    // global SEEN_REQUEST_NONCES, which the parallel test runner would share.
+    #[test]
+    fn sealed_request_envelope_opens_to_the_inner_request() {
+        let now = 1_700_000_000u64;
+        let mut seen = HashMap::new();
+        let plain = serde_json::json!({
+            "id": "peer-a",
+            "uuid": base64::encode([10u8, 20, 30]),
+            "access_token": "tok",
+            "ts": now - 5,
+            "nonce": "n1",
+        })
+        .to_string();
+        let inner = parse_sealed_request(plain.as_bytes(), now, &mut seen).expect("opens");
+        // The typed struct ignores the envelope-only ts/nonce (nothing here denies
+        // unknown fields), so the handler continues through its existing logic.
+        let request: ClientPolicyRequest = serde_json::from_value(inner).expect("inner shape");
+        assert_eq!(request.id, "peer-a");
+        assert_eq!(request.access_token.as_deref(), Some("tok"));
+    }
+
+    #[test]
+    fn sealed_request_envelope_refuses_replay_and_stale_ts() {
+        let now = 1_700_000_000u64;
+        let mut seen = HashMap::new();
+        let body = |ts: u64, nonce: &str| {
+            serde_json::json!({ "id": "peer-a", "uuid": "", "ts": ts, "nonce": nonce }).to_string()
+        };
+        assert!(parse_sealed_request(body(now - 5, "n1").as_bytes(), now, &mut seen).is_ok());
+        // The same nonce inside the window is a replay.
+        assert!(parse_sealed_request(body(now - 5, "n1").as_bytes(), now, &mut seen).is_err());
+        // Expired, too far in the future, and the ts==0 bypass.
+        assert!(parse_sealed_request(body(now - 301, "n2").as_bytes(), now, &mut seen).is_err());
+        assert!(parse_sealed_request(body(now + 61, "n3").as_bytes(), now, &mut seen).is_err());
+        assert!(parse_sealed_request(body(0, "n4").as_bytes(), now, &mut seen).is_err());
+        // Unlike a sealed LOGIN, an envelope without a nonce is REFUSED: there is no
+        // legacy envelope sender to be lenient to.
+        assert!(parse_sealed_request(body(now - 5, "").as_bytes(), now, &mut seen).is_err());
+        // Garbage inside the seal fails closed too.
+        assert!(parse_sealed_request(b"not json", now, &mut seen).is_err());
+        // Login and request nonces live in separate caches, so the same string is
+        // spendable once on each endpoint and neither can evict the other.
+        let mut login_seen = HashMap::new();
+        assert!(sealed_login_guard(now - 5, "n1", now, &mut login_seen).is_ok());
+    }
+
+    // R3: with no envelope and the operator setting at its shipped default (false),
+    // today's plaintext body passes through byte-identical.
+    #[test]
+    fn unsealed_request_body_defaults_to_todays_plaintext_path() {
+        let raw = serde_json::json!({ "id": "peer-a", "uuid": base64::encode([1u8, 2, 3]) });
+        let out = unsealed_request_body(raw.clone(), false).expect("plaintext accepted");
+        assert_eq!(out, raw);
+        let request: ClientPolicyRequest = serde_json::from_value(out).expect("today's shape");
+        assert_eq!(request.id, "peer-a");
+        assert!(request.sealed_token.is_none());
+        // Only once an operator turns it on is the same body refused, with a message
+        // the end user can act on.
+        let err = unsealed_request_body(raw, true).expect_err("refused when required");
+        assert!(err.contains("encrypted request"), "{}", err);
+    }
+
+    // S-B (scope b): the login reply key. The session token is sealed to the EPHEMERAL
+    // X25519 key the client put inside its sealed login, so only that client can open
+    // it — a MITM replaying the response has no usable session. Cross-fork contract:
+    // the key is base64 of the RAW box_ public key (NOT an Ed25519 device key), which
+    // is what decode_sealed_login parses back with box_::PublicKey::from_slice.
+    #[test]
+    fn access_token_seals_to_the_client_reply_key() {
+        sodiumoxide::init().ok();
+        let (pk, sk) = box_::gen_keypair();
+        let sealed = base64::encode(sealedbox::seal(b"session-token", &pk));
+        let opened = sealedbox::open(&base64::decode(&sealed).unwrap(), &pk, &sk).expect("open");
+        assert_eq!(opened, b"session-token");
+        // Another keypair cannot open it.
+        let (pk2, sk2) = box_::gen_keypair();
+        assert!(sealedbox::open(&base64::decode(&sealed).unwrap(), &pk2, &sk2).is_err());
+        // Wire round trip of the key itself.
+        let wire = base64::encode(pk.as_ref());
+        assert_eq!(
+            box_::PublicKey::from_slice(&base64::decode(&wire).unwrap()),
+            Some(pk)
+        );
+    }
+
+    // R3: a client that sent no reply_pk sees the response it sees today — the new
+    // field is skipped entirely rather than serialized as null.
+    #[test]
+    fn login_result_without_reply_key_keeps_todays_shape() {
+        let json = serde_json::to_value(&LoginResult {
+            access_token: Some("tok".to_owned()),
+            sealed_access_token: None,
+            kind: Some("access_token".to_owned()),
+            user: None,
+            error: None,
+        })
+        .expect("serialize");
+        assert_eq!(json.get("access_token").and_then(|v| v.as_str()), Some("tok"));
+        assert!(json.get("sealed_access_token").is_none());
+        // And the error shape keeps carrying neither token.
+        let err = serde_json::to_value(&LoginResult::err("nope")).expect("serialize");
+        assert!(err.get("access_token").is_none());
+        assert!(err.get("sealed_access_token").is_none());
+    }
+
+    // Layer 1: the sealed login's device proof is optional ON THE WIRE (an older
+    // sealed client still parses) and lands as empty strings, which the gate treats
+    // as "no proof".
+    #[test]
+    fn sealed_login_parses_with_and_without_device_proof() {
+        let old: SealedLogin =
+            serde_json::from_str(r#"{"username":"alice","password":"pw","ts":1,"nonce":"n"}"#)
+                .expect("older sealed client shape");
+        assert!(old.device_key_pub.is_empty());
+        assert!(old.device_key_sig.is_empty());
+        let new: SealedLogin = serde_json::from_str(
+            r#"{"username":"alice","password":"pw","ts":1,"nonce":"n","reply_pk":"","device_key_pub":"PK","device_key_sig":"SIG"}"#,
+        )
+        .expect("provisioned client shape");
+        assert_eq!(new.device_key_pub, "PK");
+        assert_eq!(new.device_key_sig, "SIG");
+    }
+
+    // Layer 1: the login gate accepts only a fresh "nemo-login" signature from a
+    // PINNED key — a poll signature for the same key/id is refused (domain
+    // separation), and an empty proof (the plaintext-login case) never passes.
+    #[test]
+    fn login_device_key_ok_requires_pinned_key_under_login_domain() {
+        sodiumoxide::init().ok();
+        let (pk, sk) = sign::gen_keypair();
+        let pub_b64 = base64::encode(pk.as_ref());
+        let now = now_secs();
+        let opened = |pub_b64: &str, sig: &str| OpenedLogin {
+            username: "alice".to_owned(),
+            password: "pw".to_owned(),
+            reply_pk: None,
+            device_key_pub: pub_b64.to_owned(),
+            device_key_sig: sig.to_owned(),
+        };
+        // No proof at all (what a plaintext login resolves to).
+        assert!(!login_device_key_ok(&opened("", ""), "peer-a"));
+        // Valid signature, key NOT pinned -> refused.
+        let login_sig = signed_for(&sk, "nemo-login", "peer-a", now);
+        assert!(!login_device_key_ok(
+            &opened(&pub_b64, &login_sig),
+            "peer-a"
+        ));
+        integration::pin_device_key_for_test(integration::DeviceKey {
+            id: "logintestkey".to_owned(),
+            label: "test".to_owned(),
+            public_key: pub_b64.clone(),
+            created_at: String::new(),
+            peer_id: "peer-a".to_owned(),
+        });
+        assert!(login_device_key_ok(&opened(&pub_b64, &login_sig), "peer-a"));
+        // A captured POLL signature is useless as a login proof.
+        let poll_sig = signed_for(&sk, "nemo-poll", "peer-a", now);
+        assert!(!login_device_key_ok(&opened(&pub_b64, &poll_sig), "peer-a"));
+        // M1: the key is bound to peer-a, so another claimed id fails.
+        assert!(!login_device_key_ok(
+            &opened(&pub_b64, &login_sig),
+            "peer-b"
+        ));
+        // Half a proof is no proof.
+        assert!(!login_device_key_ok(&opened(&pub_b64, ""), "peer-a"));
+        integration::unpin_device_key_for_test(&pub_b64);
+    }
+
+    // Auto-update: the signed manifest is the cross-fork contract with the client's
+    // nemo_verify_update_manifest — a DETACHED Ed25519 signature by the management
+    // key over exactly "version|url|sha256", base64 on the wire.
+    #[test]
+    fn update_manifest_signature_is_detached_over_pipe_joined_fields() {
+        sodiumoxide::init().ok();
+        let (pk, sk) = sign::gen_keypair();
+        let m = UpdateManifest {
+            version: "1.4.7".to_owned(),
+            url: "https://tbf.example.com:21114/dl/tbfdesk-1.4.7.exe".to_owned(),
+            sha256: "ab".repeat(32),
+        };
+        let signed = sign_update_manifest(&m, &sk);
+        assert_eq!(signed.version, m.version);
+        assert_eq!(signed.url, m.url);
+        assert_eq!(signed.sha256, m.sha256);
+        let sig_bytes = base64::decode(&signed.sig).expect("base64 sig");
+        assert_eq!(sig_bytes.len(), sign::SIGNATUREBYTES);
+        let sig = sign::Signature::from_bytes(&sig_bytes).expect("64-byte signature");
+        let expected_msg = format!("1.4.7|{}|{}", m.url, "ab".repeat(32));
+        assert!(sign::verify_detached(&sig, expected_msg.as_bytes(), &pk));
+        // Any field change, or another key, breaks it.
+        let tampered = expected_msg.replace("1.4.7", "1.4.8");
+        assert!(!sign::verify_detached(&sig, tampered.as_bytes(), &pk));
+        let (other_pk, _) = sign::gen_keypair();
+        assert!(!sign::verify_detached(
+            &sig,
+            expected_msg.as_bytes(),
+            &other_pk
+        ));
+        // Wire shape: exactly {version, url, sha256, sig}, nothing else (in
+        // particular no key material).
+        let json = serde_json::to_value(&signed).expect("serialize");
+        let obj = json.as_object().expect("object");
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["sha256", "sig", "url", "version"]);
+    }
+
+    #[test]
+    fn update_manifest_validation_canonicalises_and_refuses_bad_fields() {
+        let ok_url = "https://tbf.example.com/dl/x.exe";
+        let ok_sha = "AB".repeat(32);
+        let m = validate_update_manifest(&UpdateManifest {
+            version: " 1.4.7 ".to_owned(),
+            url: format!(" {} ", ok_url),
+            sha256: ok_sha.clone(),
+        })
+        .expect("valid manifest");
+        assert_eq!(m.version, "1.4.7");
+        assert_eq!(m.url, ok_url);
+        assert_eq!(m.sha256, "ab".repeat(32), "sha256 is lower-cased");
+        let bad = |version: &str, url: &str, sha256: &str| {
+            validate_update_manifest(&UpdateManifest {
+                version: version.to_owned(),
+                url: url.to_owned(),
+                sha256: sha256.to_owned(),
+            })
+            .is_err()
+        };
+        assert!(bad("", ok_url, &ok_sha));
+        assert!(bad("1|2", ok_url, &ok_sha), "'|' would re-split the signed string");
+        assert!(bad("1 2", ok_url, &ok_sha));
+        assert!(bad("1.0", "ftp://tbf.example.com/x", &ok_sha));
+        assert!(bad("1.0", "https://", &ok_sha));
+        assert!(bad("1.0", "https://tbf.example.com/x y", &ok_sha));
+        assert!(bad("1.0", "https://tbf.example.com/x|y", &ok_sha));
+        assert!(bad("1.0", ok_url, "abc"));
+        assert!(bad("1.0", ok_url, &"zz".repeat(32)));
+        assert!(bad("1.0", ok_url, ""));
+        assert!(bad(&"9".repeat(MAX_UPDATE_VERSION_LEN + 1), ok_url, &ok_sha));
+    }
+
+    // Round trip through the operator's file, against a temp path: absent = Ok(None)
+    // (the 404 case), present = the canonical manifest, mangled = Err (never a
+    // silent 404).
+    #[test]
+    fn update_manifest_file_roundtrip_and_absent_file() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let path = std::env::temp_dir().join(format!(
+            "nemo_update_test_{}_{}.json",
+            std::process::id(),
+            nanos
+        ));
+        assert_eq!(
+            read_update_manifest(&path).expect("absent is not an error"),
+            None
+        );
+        let m = UpdateManifest {
+            version: "1.4.7".to_owned(),
+            url: "https://tbf.example.com/dl/x.exe".to_owned(),
+            sha256: "cd".repeat(32),
+        };
+        write_update_manifest(&path, &m).expect("write");
+        // On disk: the three fields and NO sig (it is computed per request).
+        let on_disk: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read back"))
+                .expect("json");
+        assert!(on_disk.get("sig").is_none());
+        assert_eq!(
+            read_update_manifest(&path).expect("readable"),
+            Some(m.clone())
+        );
+        std::fs::write(&path, "{not json").expect("mangle");
+        assert!(read_update_manifest(&path).is_err());
+        std::fs::write(&path, r#"{"version":"1","url":"ftp://x","sha256":""}"#)
+            .expect("bad fields");
+        assert!(read_update_manifest(&path).is_err());
+        let _ = std::fs::remove_file(&path);
     }
 
     // A1: what the CLIENT seals to the server's mgmt key (Ed25519 pub -> Curve25519),

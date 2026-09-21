@@ -191,16 +191,33 @@ pub struct IntegrationConfig {
     /// half into the client, so the client can prove its identity to the server.
     #[serde(default)]
     pub device_keys: Vec<DeviceKey>,
-    /// When true, only clients that sign their poll with a PINNED device key are
-    /// accepted; clients with just the server's public key are refused.
-    #[serde(default)]
+    /// Layer 1: when true, a poll, address-book or login request that is not signed
+    /// with a PINNED device key is refused; a client with just the server's public
+    /// key is not a member of the fleet. ON by default — the device key is mandatory.
+    /// `default_true` (not the type default) so a config file that OMITS the field is
+    /// treated like a fresh install, while a file that stores an explicit `false`
+    /// keeps it (Rollout: the operator's stored choice is the guard; an upgrade never
+    /// flips it).
+    #[serde(default = "default_true")]
     pub require_device_key: bool,
-    /// H4: when true, secret policy values (managed password etc.) are STRIPPED from
-    /// any policy response that cannot be sealed to a verified device key, instead of
-    /// being sent in plaintext authenticated only by id+uuid. Off by default so an
-    /// unprovisioned fleet keeps working; turn on once every client has a device key.
-    #[serde(default)]
+    /// H4 / Layer 1: when true, secret policy values (managed password etc.) are
+    /// STRIPPED from any policy response that cannot be sealed to a verified device
+    /// key, instead of being sent in plaintext authenticated only by id+uuid. ON by
+    /// default for the same reason as `require_device_key`, with the same upgrade
+    /// rule: an explicit stored `false` survives, an omitted field becomes `true`.
+    #[serde(default = "default_true")]
     pub strip_unsealed_secrets: bool,
+    /// S-B: when true, an /api/login request that carries no sealed credential is
+    /// rejected instead of being accepted with a readable password. Off by default so
+    /// a fleet that has not been updated yet keeps logging in; turn it on once every
+    /// client seals its login.
+    #[serde(default)]
+    pub require_sealed_login: bool,
+    /// S-B: when true, the policy poll and the address-book request must arrive as a
+    /// sealed request envelope; a plaintext body is rejected. Off by default for the
+    /// same reason — an un-updated client is only locked out when the operator flips this.
+    #[serde(default)]
+    pub require_sealed_request: bool,
 }
 
 /// A provisioned client device key (public half pinned server-side).
@@ -257,8 +274,12 @@ impl Default for IntegrationConfig {
             default_policy_name: None,
             admin_policy: default_admin_policy(),
             device_keys: Vec::new(),
-            require_device_key: false,
-            strip_unsealed_secrets: false,
+            // Layer 1 / Rollout step 3: a fresh install is fail-closed. An upgraded
+            // server keeps whatever its nemo_integration.json stores (field docs above).
+            require_device_key: true,
+            strip_unsealed_secrets: true,
+            require_sealed_login: false,
+            require_sealed_request: false,
         }
     }
 }
@@ -428,7 +449,10 @@ impl From<&LdapConfig> for LdapConfigView {
 }
 
 /// Fields accepted from the dashboard when updating LDAP config. `bind_password`
-/// is optional so the UI can leave it blank to keep the stored value.
+/// is optional so the UI can leave it blank to keep the stored value; because of
+/// that, a blank field can never *remove* a stored password, so
+/// `clear_bind_password` exists to say so explicitly (same two-state pattern the
+/// pinned CA certificate uses).
 #[derive(Clone, Debug, Deserialize)]
 pub struct LdapConfigUpdate {
     pub enabled: Option<bool>,
@@ -437,6 +461,10 @@ pub struct LdapConfigUpdate {
     pub base_dn: Option<String>,
     pub bind_dn: Option<String>,
     pub bind_password: Option<String>,
+    /// `true` wipes the stored service-account password. Without this there was no
+    /// way to remove a credential once saved, short of editing nemo_integration.json
+    /// on the server and restarting it.
+    pub clear_bind_password: Option<bool>,
     pub user_search_filter: Option<String>,
     pub tls_verify: Option<bool>,
     pub ca_cert: Option<String>,
@@ -470,8 +498,13 @@ pub fn update_ldap_config(update: LdapConfigUpdate) -> LdapConfigView {
     if let Some(v) = update.bind_dn {
         ldap.bind_dn = v.trim().to_owned();
     }
-    // Only overwrite the password when a non-empty value is supplied.
-    if let Some(v) = update.bind_password {
+    // An explicit clear wins over everything: it is the only way to remove a stored
+    // credential, and it must not be defeated by a blank field arriving beside it.
+    if update.clear_bind_password.unwrap_or(false) {
+        ldap.bind_password.clear();
+    } else if let Some(v) = update.bind_password {
+        // Otherwise only overwrite when a non-empty value is supplied, so the UI can
+        // leave the field blank to keep what is stored.
         if !v.is_empty() {
             ldap.bind_password = v;
         }
@@ -813,6 +846,28 @@ pub fn strip_unsealed_secrets() -> bool {
 pub fn set_strip_unsealed_secrets(v: bool) {
     let mut cfg = CONFIG.lock().unwrap();
     cfg.strip_unsealed_secrets = v;
+    persist(&cfg);
+}
+
+/// S-B: fail closed on a login that was not sealed to the management key — an
+/// attacker on the wire never sees a readable password, but only once the whole
+/// fleet seals. False = today's behaviour (a plaintext login is still accepted).
+pub fn require_sealed_login() -> bool {
+    CONFIG.lock().unwrap().require_sealed_login
+}
+pub fn set_require_sealed_login(v: bool) {
+    let mut cfg = CONFIG.lock().unwrap();
+    cfg.require_sealed_login = v;
+    persist(&cfg);
+}
+/// S-B: fail closed on a poll / address-book request that arrived unsealed.
+/// False = today's behaviour (a plaintext request body is still accepted).
+pub fn require_sealed_request() -> bool {
+    CONFIG.lock().unwrap().require_sealed_request
+}
+pub fn set_require_sealed_request(v: bool) {
+    let mut cfg = CONFIG.lock().unwrap();
+    cfg.require_sealed_request = v;
     persist(&cfg);
 }
 
@@ -1853,6 +1908,32 @@ mod tests {
         assert_eq!(ldap_tls_verify_effective(true, true), Ok(true));
         assert_eq!(ldap_tls_verify_effective(false, true), Ok(false));
         assert!(ldap_tls_verify_effective(false, false).is_err());
+    }
+
+    // Layer 1 / Rollout: the device key is mandatory, so a FRESH config (no file, or
+    // a file that omits the field) is fail-closed, while a deployed file that stores
+    // an explicit choice keeps it on upgrade — the stored value is the rollout guard.
+    #[test]
+    fn device_key_switches_default_true_and_keep_stored_false() {
+        let fresh = IntegrationConfig::default();
+        assert!(fresh.require_device_key);
+        assert!(fresh.strip_unsealed_secrets);
+        // Field omitted (file last written by a build that predates it) == fresh.
+        let omitted: IntegrationConfig = serde_json::from_str("{}").unwrap();
+        assert!(omitted.require_device_key);
+        assert!(omitted.strip_unsealed_secrets);
+        // An explicit stored `false` survives the upgrade untouched.
+        let stored: IntegrationConfig = serde_json::from_str(
+            r#"{"require_device_key": false, "strip_unsealed_secrets": false}"#,
+        )
+        .unwrap();
+        assert!(!stored.require_device_key);
+        assert!(!stored.strip_unsealed_secrets);
+        // persist() serializes every field, so a file written by this build always
+        // carries both keys explicitly; the omitted-field rule cannot apply to it.
+        let text = serde_json::to_string(&fresh).unwrap();
+        assert!(text.contains("\"require_device_key\":true"));
+        assert!(text.contains("\"strip_unsealed_secrets\":true"));
     }
 
     #[test]

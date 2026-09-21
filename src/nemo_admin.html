@@ -725,6 +725,7 @@
                 <th title="Friendly name (alias) for this machine, if set via its management policy.">Alias</th>
                 <th title="online = registered and seen within the last ~30s; otherwise offline.">State</th>
                 <th title="Admission decision: allowed (can be connected to), blocked (refused), or open/unapproved.">Access</th>
+                <th title="Which key this client used on its last settings poll: its own provisioned device key, or only the shared server key. Rollout: every peer must read 'device key' before you rely on the device-key requirement — 'server key only' is a machine that gets locked out.">Key<br>auth</th>
                 <th title="The named policy applied to this device (session settings). A logged-in user's own policy overrides it. Assign it in the peer's detail panel or in ACL &amp; Policy.">Policy</th>
                 <th title="The network address the peer registered from, as the server sees it.">Registered IP</th>
                 <th title="The public IP:port the server hands out to other peers for hole punching to reach this machine.">Public<br>Addr</th>
@@ -855,14 +856,14 @@
           <h2 class="panel-title">Device keys</h2>
         </div>
         <div style="padding:12px 16px;display:flex;flex-direction:column;gap:12px;">
-          <div style="font-size:12px;opacity:0.75;line-height:1.4;max-width:900px;">Generate a per-client key here, then <b>import the private key into that client</b> (the client's &ldquo;Import device key&rdquo; dialog). The server pins the public half; the client then proves its identity with its <b>own</b> key instead of only the shared server key. <b>The private key is shown once &mdash; copy it immediately.</b></div>
+          <div style="font-size:12px;opacity:0.75;line-height:1.4;max-width:900px;"><b>A device key is mandatory.</b> A client without one is not a member of the fleet: it starts into the <b>provisioning gate</b> only &mdash; the &ldquo;Import device key&rdquo; dialog and the licence-name hint, no ID panel, no connect field, no address book &mdash; and this server refuses its settings poll, address book and login. Generate a per-client key here, then <b>import the private key into that client</b> (that dialog). The server pins the public half; the client then proves its identity with its <b>own</b> key on every request to this server. <b>The private key is shown once &mdash; copy it immediately.</b></div>
           <label style="display:flex;gap:10px;align-items:flex-start;cursor:pointer;max-width:760px;">
             <input id="requireDeviceKey" type="checkbox" style="margin-top:3px;flex:0 0 auto;">
-            <span><span style="font-weight:600;">Require a provisioned device key</span><span style="display:block;font-size:12px;opacity:0.7;margin-top:3px;line-height:1.4;">Reject any client that does not sign its poll with a pinned device key (clients with only the shared server key are refused).</span></span>
+            <span><span style="font-weight:600;">Require a provisioned device key</span><span style="display:block;font-size:12px;opacity:0.7;margin-top:3px;line-height:1.4;">Refuse any settings poll, address-book fetch or login that is not signed with a pinned device key (a client with only the shared server key is refused). <b>On by default.</b> Untick it only as the rollout escape hatch: a peer whose <b>Key auth</b> column still reads <i>server key only</i> is not provisioned yet and is locked out while this is on. A server that already saved a choice here keeps it on upgrade.</span></span>
           </label>
           <label style="display:flex;gap:10px;align-items:flex-start;cursor:pointer;max-width:760px;">
             <input id="stripUnsealedSecrets" type="checkbox" style="margin-top:3px;flex:0 0 auto;">
-            <span><span style="font-weight:600;">Only deliver secrets sealed to a device key</span><span style="display:block;font-size:12px;opacity:0.7;margin-top:3px;line-height:1.4;">Strip managed passwords from any policy response that cannot be encrypted to a verified device key. Turn on once every client has an imported device key &mdash; a client without one then stops receiving the pushed access password (everything else still works).</span></span>
+            <span><span style="font-weight:600;">Only deliver secrets sealed to a device key</span><span style="display:block;font-size:12px;opacity:0.7;margin-top:3px;line-height:1.4;">Strip managed passwords from any policy response that cannot be encrypted to a verified device key. <b>On by default.</b> A client without an imported device key never receives the pushed access password in readable form (everything else still works); with the requirement above on, such a client is refused before this matters.</span></span>
           </label>
           <div style="display:flex;gap:8px;align-items:center;">
             <button id="reqDeviceKeySave" class="primary">Save requirement</button>
@@ -882,6 +883,50 @@
               <tbody id="deviceKeysBody"></tbody>
             </table>
             <div id="deviceKeysEmpty" class="empty">No device keys yet.</div>
+          </div>
+        </div>
+      </section>
+      <section class="panel" data-panel-id="sealed-requests">
+        <div class="panel-head">
+          <h2 class="panel-title">Encrypted client requests</h2>
+        </div>
+        <div style="padding:12px 16px;display:flex;flex-direction:column;gap:12px;">
+          <div style="font-size:12px;opacity:0.75;line-height:1.4;max-width:900px;">Updated clients encrypt what they send to this server, so a password or an address book can no longer be read off the wire. Both switches are <b>off</b> until you turn them on, and the server keeps accepting the old, readable requests until then. <b>Roll the client update out first</b> &mdash; the server log lists the clients that are still sending readable requests, by TBFDesk ID, so you can chase the stragglers before you switch anything on.</div>
+          <label style="display:flex;gap:10px;align-items:flex-start;cursor:pointer;max-width:760px;">
+            <input id="requireSealedLogin" type="checkbox" style="margin-top:3px;flex:0 0 auto;">
+            <span><span style="font-weight:600;">Require encrypted logins</span><span style="display:block;font-size:12px;opacity:0.7;margin-top:3px;line-height:1.4;">Refuse any sign-in that still sends the password in readable form. <b>Turning this on locks out every client that has not been updated</b> &mdash; those users cannot log in at all until their client is updated. The server log names each client it turned away.</span></span>
+          </label>
+          <label style="display:flex;gap:10px;align-items:flex-start;cursor:pointer;max-width:760px;">
+            <input id="requireSealedRequest" type="checkbox" style="margin-top:3px;flex:0 0 auto;">
+            <span><span style="font-weight:600;">Require encrypted policy &amp; address-book requests</span><span style="display:block;font-size:12px;opacity:0.7;margin-top:3px;line-height:1.4;">Refuse a settings poll or an address-book fetch that is not encrypted. <b>Turning this on locks out every client that has not been updated</b> &mdash; those clients stop receiving settings and their address book. The server log names each client it turned away.</span></span>
+          </label>
+          <div style="display:flex;gap:8px;align-items:center;">
+            <button id="sealedReqSave" class="primary">Save requirement</button>
+            <span id="sealedReqMsg" style="font-size:12px;opacity:0.8;"></span>
+          </div>
+        </div>
+      </section>
+      <section class="panel" data-panel-id="software-update">
+        <div class="panel-head">
+          <h2 class="panel-title">Software update</h2>
+        </div>
+        <div class="col-grid" style="padding:14px 16px;">
+          <div class="span-all" style="font-size:12px;opacity:0.75;line-height:1.4;max-width:900px;">This server is the <b>only</b> update source clients accept; the stock RustDesk updater is disabled on every client. Publish the current client build here: its version, the download URL &mdash; it must be on this server's origin, the client refuses any other host &mdash; and the SHA-256 of the file. <b>The server signs the manifest with its management key</b> each time a client asks for it; the client verifies that signature against its pinned management public key, then the file hash, and only then installs.</div>
+          <div class="fld">
+            <label for="updVersion">Version</label>
+            <input id="updVersion" type="text" placeholder="1.4.2" autocomplete="off">
+          </div>
+          <div class="fld span-all">
+            <label for="updUrl">Download URL (on this server)</label>
+            <input id="updUrl" type="text" placeholder="https://&lt;this server's api-server origin&gt;/tbfdesk-1.4.2-setup.exe" autocomplete="off" spellcheck="false">
+          </div>
+          <div class="fld span-all">
+            <label for="updSha256">SHA-256 of the file (hex)</label>
+            <input id="updSha256" type="text" placeholder="64 hex characters" autocomplete="off" spellcheck="false" class="mono">
+          </div>
+          <div class="span-all" style="display:flex;gap:10px;align-items:center;">
+            <button id="updSave" class="primary">Save update</button>
+            <span id="updMsg" style="font-size:12px;opacity:0.8;"></span>
           </div>
         </div>
       </section>
@@ -1193,7 +1238,7 @@
         document.querySelectorAll(".view").forEach((v) => { v.hidden = v.id !== "view-" + view; });
         if (view === "integration") loadIntegration();
         if (view === "acl") loadIntegration();
-        if (view === "settings") { refreshGlobalPolicy(); loadDeviceKeys(); }
+        if (view === "settings") { refreshGlobalPolicy(); loadDeviceKeys(); loadUpdateManifest(); }
         // Connections now live under the Log view (#6): load + auto-refresh there.
         if (view === "log") { loadConnections(); startConnTimer(); } else { stopConnTimer(); }
       });
@@ -1560,6 +1605,51 @@
         setMsg("reqDeviceKeyMsg", "Saved", true);
       } catch (e) { setMsg("reqDeviceKeyMsg", e.message, false); }
     });
+    // S-B: the two fail-closed switches for encrypted client requests. Sent on their
+    // own PUT — every field of the policy request is optional, so the device-key
+    // switches above are left untouched.
+    $("sealedReqSave").addEventListener("click", async () => {
+      try {
+        await api("/nemo/api/policy", { method: "PUT", body: JSON.stringify({
+          require_sealed_login: $("requireSealedLogin").checked,
+          require_sealed_request: $("requireSealedRequest").checked,
+        }) });
+        setMsg("sealedReqMsg", "Saved", true);
+      } catch (e) { setMsg("sealedReqMsg", e.message, false); }
+    });
+    // Auto-update: the operator publishes {version,url,sha256}; the server stores it as
+    // nemo_update.json and signs "version|url|sha256" with its management key at serve
+    // time (GET /nemo/api/update/latest), so a manifest it cannot sign is never served.
+    // Only shape checks here — the server owns the real validation.
+    $("updSave").addEventListener("click", async () => {
+      const version = $("updVersion").value.trim();
+      const url = $("updUrl").value.trim();
+      const sha256 = $("updSha256").value.trim().toLowerCase();
+      if (!version) { setMsg("updMsg", "Version is required", false); return; }
+      if (!/^https?:\/\//i.test(url)) { setMsg("updMsg", "URL must start with http:// or https://", false); return; }
+      if (!/^[0-9a-f]{64}$/.test(sha256)) { setMsg("updMsg", "SHA-256 must be 64 hex characters", false); return; }
+      try {
+        await api("/nemo/api/update", { method: "POST", body: JSON.stringify({ version, url, sha256 }) });
+        $("updSha256").value = sha256;
+        setMsg("updMsg", "Saved — clients now see version " + version, true);
+      } catch (e) { setMsg("updMsg", e.message, false); }
+    });
+    // Prefill the form with what clients currently get. The endpoint answers 404 while
+    // nothing is published — that is the empty state, not an error, so it is fetched
+    // directly instead of through api(), which throws on any non-2xx.
+    async function loadUpdateManifest() {
+      if (!$("updVersion")) return;
+      try {
+        const res = await fetch("/nemo/api/update/latest", { headers: headers() });
+        if (res.status === 404) { setMsg("updMsg", "No update published yet"); return; }
+        if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+        const m = await res.json();
+        if (document.activeElement !== $("updVersion")) $("updVersion").value = m.version || "";
+        if (document.activeElement !== $("updUrl")) $("updUrl").value = m.url || "";
+        if (document.activeElement !== $("updSha256")) $("updSha256").value = m.sha256 || "";
+        setMsg("updMsg", "Published: version " + (m.version || "?"));
+      } catch (e) { setMsg("updMsg", e.message, false); }
+    }
     $("autoRefresh").addEventListener("change", schedule);
 
     function headers() {
@@ -1608,6 +1698,12 @@
         }
         if (health.strip_unsealed_secrets != null && $("stripUnsealedSecrets") && document.activeElement !== $("stripUnsealedSecrets")) {
           $("stripUnsealedSecrets").checked = !!health.strip_unsealed_secrets;
+        }
+        if (health.require_sealed_login != null && $("requireSealedLogin") && document.activeElement !== $("requireSealedLogin")) {
+          $("requireSealedLogin").checked = !!health.require_sealed_login;
+        }
+        if (health.require_sealed_request != null && $("requireSealedRequest") && document.activeElement !== $("requireSealedRequest")) {
+          $("requireSealedRequest").checked = !!health.require_sealed_request;
         }
         state.peers = peers.peers || [];
         const currentIds = new Set(state.peers.map((peer) => peer.id));
@@ -1708,6 +1804,7 @@
           <td>${escapeHtml(peerAlias(peer))}</td>
           <td>${badge(peer.online ? "online" : "offline")}</td>
           <td>${badge(peer.policy)}</td>
+          <td>${peer.auth_mode === 'device-key' ? '<span style="color:#1a7a34;font-weight:600">device key</span>' : (peer.auth_mode === 'default' ? '<span style="color:#8a6d1a">server key only</span>' : '<span style="opacity:0.5">unknown</span>')}</td>
           <td>${((integ.devicePolicies || {})[peer.id]) ? escapeHtml(integ.devicePolicies[peer.id]) : '<span style="opacity:0.4">—</span>'}</td>
           <td class="mono">${escapeHtml(peer.registered_ip || "")}</td>
           <td class="mono">${escapeHtml(peer.public_addr || "")}</td>
@@ -2525,7 +2622,11 @@
 
     function startConnTimer() {
       stopConnTimer();
-      if ($("connAutoRefresh").checked && !$("view-connections").hidden) {
+      // The Connections board lives inside the Log view; there is no #view-connections
+      // element, so this guard used to throw on null and the timer was never set --
+      // i.e. the Auto checkbox did nothing and the board only updated on a manual
+      // Refresh or a view switch.
+      if ($("connAutoRefresh").checked && !$("view-log").hidden) {
         connTimer = setInterval(loadConnections, 3000);
       }
     }

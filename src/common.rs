@@ -104,11 +104,49 @@ pub fn now() -> u64 {
         .unwrap_or_default()
 }
 
+// Review finding (HIGH): `id_ed25519` holds the rendezvous signing secret — the trust
+// anchor the client verifies the --key-exchange offer with, and the same key the S-B
+// sealing work is built on. It used to be written with File::create, i.e. mode 0644, so
+// any local account on the hbbs host could read it and the compromise would be silent.
+// Created 0600 now, and an existing key is tightened on every start (the same
+// "fix a previously world-readable key" pattern used for the TLS key).
+#[cfg(unix)]
+fn restrict_key_file(path: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Ok(md) = std::fs::metadata(path) {
+        if md.permissions().mode() & 0o077 != 0 {
+            if std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).is_ok() {
+                println!("Tightened permissions on {path} to 0600.");
+            }
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn restrict_key_file(_path: &str) {}
+
+#[cfg(unix)]
+fn create_private_file(path: &str) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn create_private_file(path: &str) -> std::io::Result<std::fs::File> {
+    std::fs::File::create(path)
+}
+
 pub fn gen_sk(wait: u64) -> (String, Option<sign::SecretKey>) {
     let sk_file = "id_ed25519";
     if wait > 0 && !std::path::Path::new(sk_file).exists() {
         std::thread::sleep(std::time::Duration::from_millis(wait));
     }
+    restrict_key_file(sk_file);
     if let Ok(mut file) = std::fs::File::open(sk_file) {
         let mut contents = String::new();
         if file.read_to_string(&mut contents).is_ok() {
@@ -141,7 +179,7 @@ pub fn gen_sk(wait: u64) -> (String, Option<sign::SecretKey>) {
         let pub_file = format!("{sk_file}.pub");
         if let Ok(mut f) = std::fs::File::create(&pub_file) {
             f.write_all(pk.as_bytes()).ok();
-            if let Ok(mut f) = std::fs::File::create(sk_file) {
+            if let Ok(mut f) = create_private_file(sk_file) {
                 let s = base64::encode(&sk);
                 if f.write_all(s.as_bytes()).is_ok() {
                     log::info!("Private/public key written to {}/{}", sk_file, pub_file);

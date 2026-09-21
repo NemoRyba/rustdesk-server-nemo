@@ -8,7 +8,7 @@ use hbb_common::{
     protobuf::Message as _,
     rendezvous_proto::*,
     sleep,
-    tcp::{listen_any, FramedStream},
+    tcp::{listen_any, Encrypt, FramedStream},
     timeout,
     tokio::{
         self,
@@ -19,7 +19,8 @@ use hbb_common::{
     },
     ResultType,
 };
-use sodiumoxide::crypto::sign;
+use once_cell::sync::Lazy;
+use sodiumoxide::crypto::{box_, secretbox, sign};
 use std::{
     collections::{HashMap, HashSet},
     io::prelude::*,
@@ -42,12 +43,28 @@ static DOWNGRADE_START_CHECK: AtomicUsize = AtomicUsize::new(1_800_000); // in m
 static LIMIT_SPEED: AtomicUsize = AtomicUsize::new(32 * 1024 * 1024); // in bit/s
 static TOTAL_BANDWIDTH: AtomicUsize = AtomicUsize::new(1024 * 1024 * 1024); // in bit/s
 static SINGLE_BANDWIDTH: AtomicUsize = AtomicUsize::new(128 * 1024 * 1024); // in bit/s
+// TBFDesk: the signing secret, so hbbr can offer the same authenticated KeyExchange
+// as hbbs. A static mirrors how the rendezvous server holds KEY_EXCHANGE_MODE, and
+// avoids threading an Option<SecretKey> through io_loop/handle_connection/make_pair.
+static RELAY_SK: Lazy<std::sync::RwLock<Option<sign::SecretKey>>> =
+    Lazy::new(|| std::sync::RwLock::new(None));
 const BLACKLIST_FILE: &str = "blacklist.txt";
 const BLOCKLIST_FILE: &str = "blocklist.txt";
 
 #[tokio::main(flavor = "multi_thread")]
 pub async fn start(port: &str, key: &str) -> ResultType<()> {
-    let key = get_server_sk(key);
+    let (key, sk) = get_server_keypair(key);
+    // TBFDesk: hbbr used to keep only the PUBLIC half, because the only thing it did
+    // with the key was compare it to RequestRelay.licence_key. That left the control
+    // frame in the clear -- server licence key and both peer ids -- on every relayed
+    // session. Keeping the secret lets hbbr run the same signed KeyExchange hbbs does.
+    *RELAY_SK.write().unwrap() = sk;
+    if RELAY_SK.read().unwrap().is_none() {
+        log::warn!(
+            "No signing key: the RequestRelay control frame cannot be encrypted. \
+             Pass -k <private key> or put id_ed25519 next to hbbr."
+        );
+    }
     if let Ok(mut file) = std::fs::File::open(BLACKLIST_FILE) {
         let mut contents = String::new();
         if file.read_to_string(&mut contents).is_ok() {
@@ -415,10 +432,58 @@ async fn make_pair(
             Ok(response)
         };
         let ws_stream = tokio_tungstenite::accept_hdr_async(stream, callback).await?;
+        // The websocket relay port is expected to sit behind TLS termination (wss://),
+        // which already protects the control frame; double-encrypting it would be pure
+        // cost. Plain ws:// must not be exposed -- see the note in start().
         make_pair_(ws_stream, addr, key, limiter).await;
     } else {
-        make_pair_(FramedStream::from(stream, addr), addr, key, limiter).await;
+        let mut stream = FramedStream::from(stream, addr);
+        // TBFDesk: encrypt the RequestRelay control frame. Without this the server
+        // licence key and both peer ids crossed the wire in the clear on every
+        // relayed session. Only the control frame is covered -- the relayed payload
+        // stays untouched because it is already end-to-end encrypted peer-to-peer.
+        if let Err(err) = relay_key_exchange(&mut stream).await {
+            log::warn!("Refusing relay connection from {}: {}", addr, err);
+            return Ok(());
+        }
+        make_pair_(stream, addr, key, limiter).await;
     }
+    Ok(())
+}
+
+/// Offer the same signed KeyExchange hbbs offers, then install the session key so
+/// the RequestRelay frame that follows arrives encrypted. Fails closed: a client
+/// that will not complete the handshake does not get relayed.
+async fn relay_key_exchange(stream: &mut FramedStream) -> ResultType<()> {
+    let sk = match RELAY_SK.read().unwrap().clone() {
+        Some(sk) => sk,
+        // No signing key configured: there is nothing to authenticate the offer with,
+        // so refuse rather than silently relaying in the clear.
+        None => bail!("relay has no signing key; cannot secure the control frame"),
+    };
+    let (our_pk_b, our_sk_b) = box_::gen_keypair();
+    let mut msg_out = RendezvousMessage::new();
+    msg_out.set_key_exchange(KeyExchange {
+        keys: vec![Bytes::from(sign::sign(&our_pk_b.0, &sk))],
+        ..Default::default()
+    });
+    timeout(3_000, stream.send(&msg_out)).await??;
+    let bytes = match timeout(3_000, stream.next()).await? {
+        Some(Ok(bytes)) => bytes,
+        _ => bail!("no reply to the key exchange offer"),
+    };
+    let msg_in = RendezvousMessage::parse_from_bytes(&bytes)?;
+    let Some(rendezvous_message::Union::KeyExchange(ex)) = msg_in.union else {
+        bail!("expected a KeyExchange reply");
+    };
+    if ex.keys.len() != 2 {
+        bail!("key exchange reply carries {} keys, expected 2", ex.keys.len());
+    }
+    // Same argument order as the rendezvous server: the client sends
+    // [its X25519 pubkey, the symmetric key sealed to ours], Encrypt::decode takes
+    // them the other way round.
+    let key: secretbox::Key = Encrypt::decode(&ex.keys[1], &ex.keys[0], &our_sk_b)?;
+    stream.set_key(key);
     Ok(())
 }
 
@@ -427,6 +492,9 @@ async fn make_pair_(stream: impl StreamTrait, addr: SocketAddr, key: &str, limit
     if let Ok(Some(Ok(bytes))) = timeout(30_000, stream.recv()).await {
         if let Ok(msg_in) = RendezvousMessage::parse_from_bytes(&bytes) {
             if let Some(rendezvous_message::Union::RequestRelay(rf)) = msg_in.union {
+                // The control frame is the only thing we encrypt; from here on the
+                // bytes belong to the two peers and are already end-to-end encrypted.
+                stream.clear_key();
                 if !key.is_empty() && rf.licence_key != key {
                     log::warn!("Relay authentication failed from {} - invalid key", addr);
                     return;
@@ -565,25 +633,32 @@ async fn relay(
     Ok(())
 }
 
-fn get_server_sk(key: &str) -> String {
+/// The public half (compared against `RequestRelay.licence_key`) AND the signing
+/// secret, which hbbr needs in order to sign its KeyExchange offer.
+fn get_server_keypair(key: &str) -> (String, Option<sign::SecretKey>) {
     let mut key = key.to_owned();
-    if let Ok(sk) = base64::decode(&key) {
-        if sk.len() == sign::SECRETKEYBYTES {
+    let mut sk = None;
+    if let Ok(raw) = base64::decode(&key) {
+        if raw.len() == sign::SECRETKEYBYTES {
             log::info!("The key is a crypto private key");
-            key = base64::encode(&sk[(sign::SECRETKEYBYTES / 2)..]);
+            let mut tmp = [0u8; sign::SECRETKEYBYTES];
+            tmp[..].copy_from_slice(&raw);
+            sk = Some(sign::SecretKey(tmp));
+            key = base64::encode(&raw[(sign::SECRETKEYBYTES / 2)..]);
         }
     }
 
     if key == "-" || key == "_" {
-        let (pk, _) = crate::common::gen_sk(300);
+        let (pk, gen) = crate::common::gen_sk(300);
         key = pk;
+        sk = gen;
     }
 
     if !key.is_empty() {
         log::info!("Key: {}", key);
     }
 
-    key
+    (key, sk)
 }
 
 #[async_trait]
@@ -592,6 +667,10 @@ trait StreamTrait: Send + Sync + 'static {
     async fn send_raw(&mut self, bytes: Bytes) -> ResultType<()>;
     fn is_ws(&self) -> bool;
     fn set_raw(&mut self);
+    /// Drop the control-frame cipher, keeping the codec framing. Called once the
+    /// RequestRelay frame has been read, so the relayed payload is passed through
+    /// byte-for-byte instead of being decrypted as if it were ours.
+    fn clear_key(&mut self);
 }
 
 #[async_trait]
@@ -610,6 +689,10 @@ impl StreamTrait for FramedStream {
 
     fn set_raw(&mut self) {
         self.set_raw();
+    }
+
+    fn clear_key(&mut self) {
+        self.clear_key();
     }
 }
 
@@ -644,4 +727,7 @@ impl StreamTrait for tokio_tungstenite::WebSocketStream<TcpStream> {
     }
 
     fn set_raw(&mut self) {}
+
+    // No cipher is installed on the websocket path (see make_pair), so nothing to clear.
+    fn clear_key(&mut self) {}
 }
