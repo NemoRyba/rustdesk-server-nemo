@@ -1,4 +1,5 @@
 use crate::common::*;
+use hbb_common::nemo_device_auth_payload;
 use crate::peer::*;
 use hbb_common::{
     allow_err, bail,
@@ -175,6 +176,15 @@ enum LoopFailure {
     Listener3,
     Listener2,
     Listener,
+}
+
+/// H5: a rendezvous connection whose peer proved, with a pinned device key, that it is a
+/// provisioned fleet member. `peer_id` is the id the proof is bound to, so the
+/// registration that follows can be held to it.
+#[derive(Clone, Debug)]
+pub(crate) struct AuthedDevice {
+    pub device_pub_b64: String,
+    pub peer_id: String,
 }
 
 impl RendezvousServer {
@@ -579,6 +589,10 @@ impl RendezvousServer {
         // H43: the handle for pushing INTO this connection. Registered against the
         // peer id when it registers, so hbbs can later reach a TCP/WS-only peer.
         push_tx: &PeerPush,
+        // H5: who this connection proved to be with its device key, if anyone. The
+        // handshake cannot know which id the client will register as, so the binding is
+        // enforced here, where that id finally appears.
+        authed: Option<&AuthedDevice>,
     ) -> bool {
         if let Ok(msg_in) = RendezvousMessage::parse_from_bytes(bytes) {
             match msg_in.union {
@@ -771,6 +785,20 @@ impl RendezvousServer {
                                 return false;
                             }
                         }
+                        // H5: a device key bound to one machine must not be able to
+                        // heartbeat as another.
+                        if let Some(who) = authed {
+                            if who.peer_id != rp.id {
+                                log::warn!(
+                                    "Refusing {:?}: device key proved peer {} but it \
+                                     heartbeats as {}",
+                                    addr,
+                                    who.peer_id,
+                                    rp.id
+                                );
+                                return false;
+                            }
+                        }
                         log::trace!("New peer registered over tcp: {:?} {:?}", &rp.id, &addr);
                         // H43: this connection is now how we reach this peer.
                         self.register_peer_push(&rp.id, push_tx).await;
@@ -806,6 +834,21 @@ impl RendezvousServer {
                     // H43: register the push handle too -- a client whose key is not yet
                     // confirmed sends only RegisterPk, so without this it would stay
                     // unreachable until its first heartbeat.
+                    // H5: THIS is what closes the gap. The handshake proves the machine
+                    // is a fleet member; this proves it is registering as the id its key
+                    // is bound to. Without it a single leaked device key would
+                    // authenticate a connection that then claims any id it likes.
+                    if let Some(who) = authed {
+                        if who.peer_id != rk.id {
+                            log::warn!(
+                                "Refusing {:?}: device key proved peer {} but it registers as {}",
+                                addr,
+                                who.peer_id,
+                                rk.id
+                            );
+                            return false;
+                        }
+                    }
                     let pk_id = rk.id.clone();
                     self.register_peer_push(&pk_id, push_tx).await;
                     if let Some(res) = self.register_pk_core(rk, addr).await {
@@ -1732,7 +1775,10 @@ impl RendezvousServer {
                     res = timeout(30_000, b.next()) => {
                         let Ok(Some(Ok(msg))) = res else { break };
                         if let tungstenite::Message::Binary(bytes) = msg {
-                            if !self.handle_tcp(&bytes, &mut sink, addr, key, ws, &push_tx).await {
+                            // H5: the websocket rendezvous has no handshake at all, so it can prove
+                            // nothing. See the note in handle_listener_inner.
+                            if !self.handle_tcp(&bytes, &mut sink, addr, key, ws, &push_tx, None)
+                                .await {
                                 break;
                             }
                         }
@@ -1755,11 +1801,13 @@ impl RendezvousServer {
             let mode = key_exchange_mode();
             // Recv half of the connection cipher; the send half rides with the sink.
             let mut rx_enc: Option<Encrypt> = None;
+            // H5: who this connection proved to be, if anyone.
+            let mut authed: Option<AuthedDevice> = None;
             // A frame read while waiting for the handshake, replayed into the loop.
             let mut pending: Option<BytesMut> = None;
             if mode != KeyExchangeMode::Off {
                 if let Some(sk) = self.inner.sk.as_ref() {
-                    let (msg_out, our_sk_b) = Self::key_exchange_offer_msg(sk);
+                    let (msg_out, our_pk_b, our_sk_b) = Self::key_exchange_offer_msg(sk);
                     // The offer goes out in the clear -- the sink's cipher is still
                     // None, and send_to_sink is what would otherwise seal it.
                     Self::send_to_sink(&mut sink, msg_out).await;
@@ -1807,12 +1855,67 @@ impl RendezvousServer {
                                     }
                                 }
                             }
+                            // H5: the authenticated reply. Same two values as the
+                            // KeyExchange arm above, plus the device-key proof.
+                            #[cfg(feature = "nemo-management-api")]
+                            Some(rendezvous_message::Union::NemoClientAuth(auth)) => {
+                                match Self::nemo_client_auth_open(&auth, &our_pk_b, &our_sk_b) {
+                                    Ok((sym, who)) => {
+                                        if let Some(Sink::TcpStream(_, cipher)) = sink.as_mut() {
+                                            *cipher = Some(Encrypt::new(sym.clone()));
+                                        }
+                                        rx_enc = Some(Encrypt::new(sym));
+                                        secured = true;
+                                        log::debug!(
+                                            "Connection from {:?} secured and device-authenticated as peer {}",
+                                            addr,
+                                            who.peer_id
+                                        );
+                                        authed = Some(who);
+                                    }
+                                    Err(err) => {
+                                        // Refuse rather than fall back: the peer already
+                                        // installed its key, so plaintext would be
+                                        // garbage, and a failed proof is exactly what we
+                                        // are here to stop.
+                                        log::warn!(
+                                            "Refusing {:?}: device-key handshake failed: {}",
+                                            addr,
+                                            err
+                                        );
+                                        return Ok(());
+                                    }
+                                }
+                            }
                             // A client that does not know this handshake sends its
                             // real first request instead. Replay it rather than
                             // swallow it, so `offer` really is today's behaviour
                             // for the clients already in the field.
                             _ => pending = Some(bytes),
                         }
+                    }
+                    // H5: Layer 1 at the transport, with the SAME semantics the
+                    // management API already uses -- one flag, one concept. With
+                    // require_device_key on, a connection that proved nothing does not
+                    // get to register, punch or relay. With it off the connection is
+                    // allowed and the straggler is named, which is what makes a staged
+                    // rollout possible: provision, then flip the flag.
+                    #[cfg(feature = "nemo-management-api")]
+                    if authed.is_none() {
+                        if crate::nemo_integration::require_device_key() {
+                            log::warn!(
+                                "Refusing {:?}: require-device-key is on and this client \
+                                 presented no valid device key",
+                                addr
+                            );
+                            return Ok(());
+                        }
+                        log::warn!(
+                            "Rendezvous connection from {:?} carries NO device key \
+                             (Layer 1 unproven). Provision this machine before turning \
+                             require-device-key on.",
+                            addr
+                        );
                     }
                     if !secured && mode == KeyExchangeMode::Require {
                         log::debug!(
@@ -1857,7 +1960,7 @@ impl RendezvousServer {
                         break;
                     }
                 }
-                if !self.handle_tcp(&bytes, &mut sink, addr, key, ws, &push_tx).await {
+                if !self.handle_tcp(&bytes, &mut sink, addr, key, ws, &push_tx, authed.as_ref()).await {
                     break;
                 }
             }
@@ -1874,14 +1977,18 @@ impl RendezvousServer {
     /// and then requires exactly 32 bytes inside, so the signature must cover the raw
     /// ephemeral X25519 pubkey and nothing else, in a message carrying exactly one
     /// key. The matching secret never leaves the accepting task.
-    fn key_exchange_offer_msg(sk: &sign::SecretKey) -> (RendezvousMessage, box_::SecretKey) {
+    fn key_exchange_offer_msg(
+        sk: &sign::SecretKey,
+    ) -> (RendezvousMessage, box_::PublicKey, box_::SecretKey) {
         let (our_pk_b, our_sk_b) = box_::gen_keypair();
         let mut msg_out = RendezvousMessage::new();
         msg_out.set_key_exchange(KeyExchange {
             keys: vec![Bytes::from(sign::sign(&our_pk_b.0, sk))],
             ..Default::default()
         });
-        (msg_out, our_sk_b)
+        // H5: the PUBLIC half goes back too. It is fresh per connection, and the client's
+        // device signature covers it -- that is what makes the proof unreplayable.
+        (msg_out, our_pk_b, our_sk_b)
     }
 
     /// C: open the client's reply. The client sends `keys = [its X25519 pubkey, the
@@ -1900,6 +2007,63 @@ impl RendezvousServer {
             );
         }
         Encrypt::decode(&ex.keys[1], &ex.keys[0], our_sk_b)
+    }
+
+    /// H5: open the client's AUTHENTICATED reply and verify the device-key proof.
+    ///
+    /// Order matters for cost: the registry lookup is a cheap linear scan, the Ed25519
+    /// verify is not, so an unknown key is rejected before any signature work. Otherwise
+    /// an unauthenticated peer could use this as a CPU amplifier.
+    ///
+    /// The payload the signature covers is built by the shared helper so the two ends
+    /// cannot drift -- the SEC-14 argument-order bug is the standing reminder.
+    #[cfg(feature = "nemo-management-api")]
+    fn nemo_client_auth_open(
+        auth: &NemoClientAuth,
+        server_eph_pk: &box_::PublicKey,
+        our_sk_b: &box_::SecretKey,
+    ) -> ResultType<(hbb_common::tcp::SessionKey, AuthedDevice)> {
+        let device_pub_b64 = base64::encode(&auth.device_pub[..]);
+        if !crate::nemo_integration::is_device_key_pinned(&device_pub_b64) {
+            bail!("device key is not pinned on this server");
+        }
+        // Bound-peer check, the same rule the management API applies: a key registered
+        // against one machine must not authenticate another. An unbound key (empty
+        // binding) authenticates any id, which is the documented meaning of leaving the
+        // binding blank.
+        match crate::nemo_integration::device_key_binding(&device_pub_b64) {
+            Some(bound) if !bound.is_empty() && bound != auth.peer_id => {
+                bail!(
+                    "device key is bound to peer {} but the client claims {}",
+                    bound,
+                    auth.peer_id
+                );
+            }
+            Some(_) => {}
+            None => bail!("device key vanished from the registry mid-handshake"),
+        }
+        let Some(device_pk) = sign::PublicKey::from_slice(&auth.device_pub) else {
+            bail!("device public key is not a valid Ed25519 key");
+        };
+        let payload = nemo_device_auth_payload(
+            &server_eph_pk.0,
+            &auth.client_box_pk,
+            &auth.sealed_key,
+            &auth.peer_id,
+        );
+        let opened = sign::verify(&auth.sig, &device_pk)
+            .map_err(|_| hbb_common::anyhow::anyhow!("device signature does not verify"))?;
+        if opened != payload {
+            bail!("device signature covers the wrong payload");
+        }
+        let session = Encrypt::decode(&auth.sealed_key, &auth.client_box_pk, our_sk_b)?;
+        Ok((
+            session,
+            AuthedDevice {
+                device_pub_b64,
+                peer_id: auth.peer_id.clone(),
+            },
+        ))
     }
 
     #[inline]
@@ -2181,7 +2345,7 @@ mod tests {
         let (rs_pk, rs_sk) = sign::gen_keypair();
 
         // Server: the offer exactly as handle_listener_inner puts it on the wire.
-        let (msg_out, our_sk_b) = RendezvousServer::key_exchange_offer_msg(&rs_sk);
+        let (msg_out, _our_pk_b, our_sk_b) = RendezvousServer::key_exchange_offer_msg(&rs_sk);
         let offered = match msg_out.union {
             Some(rendezvous_message::Union::KeyExchange(ex)) => ex.keys,
             other => panic!("expected KeyExchange, got {other:?}"),
@@ -2311,6 +2475,110 @@ mod tests {
             RendezvousServer::key_exchange_open(&v2_reply, &our_sk_b).is_err(),
             "an unknown session key version must not be accepted"
         );
+    }
+
+    /// H5. The rendezvous used to be anonymous: anyone holding the server's PUBLIC key --
+    /// which is not a secret, it ships in every client config and inside the
+    /// host=..,key=.. licence name -- completed the handshake and could then register.
+    /// These assert the four ways a forged or replayed proof must fail, and that an
+    /// honest one succeeds.
+    #[cfg(feature = "nemo-management-api")]
+    #[test]
+    fn device_auth_binds_the_key_to_the_connection_and_to_the_peer_id() {
+        use crate::nemo_integration::{pin_device_key_for_test, unpin_device_key_for_test, DeviceKey};
+
+        let (device_pk, device_sk) = sign::gen_keypair();
+        let device_pub_b64 = base64::encode(device_pk.as_ref());
+        pin_device_key_for_test(DeviceKey {
+            id: "t1".to_owned(),
+            label: "test".to_owned(),
+            public_key: device_pub_b64.clone(),
+            created_at: String::new(),
+            peer_id: "111111111".to_owned(),
+        });
+
+        // The server's per-connection ephemeral, and a second one standing in for a
+        // DIFFERENT connection.
+        let (server_pk, server_sk) = box_::gen_keypair();
+        let (other_server_pk, other_server_sk) = box_::gen_keypair();
+
+        let build = |peer_id: &str, eph: &box_::PublicKey| {
+            let (client_box_pk, sealed_key, _key) = {
+                let (cpk, csk) = box_::gen_keypair();
+                let sym = secretbox::gen_key();
+                let mut payload = sym.0.to_vec();
+                payload.push(hbb_common::tcp::SESSION_KEY_V1);
+                let sealed = box_::seal(
+                    &payload,
+                    &box_::Nonce([0u8; box_::NONCEBYTES]),
+                    eph,
+                    &csk,
+                );
+                (
+                    Bytes::from(cpk.0.to_vec()),
+                    Bytes::from(sealed),
+                    sym,
+                )
+            };
+            let sig = sign::sign(
+                &nemo_device_auth_payload(&eph.0, &client_box_pk, &sealed_key, peer_id),
+                &device_sk,
+            );
+            NemoClientAuth {
+                client_box_pk,
+                sealed_key,
+                device_pub: Bytes::from(device_pk.as_ref().to_vec()),
+                peer_id: peer_id.to_owned(),
+                sig: Bytes::from(sig),
+                ..Default::default()
+            }
+        };
+
+        // Honest proof for the bound peer opens, and reports who it is.
+        let good = build("111111111", &server_pk);
+        let (_session, who) =
+            RendezvousServer::nemo_client_auth_open(&good, &server_pk, &server_sk)
+                .expect("an honest proof must open");
+        assert_eq!(who.peer_id, "111111111");
+        assert_eq!(who.device_pub_b64, device_pub_b64);
+
+        // Bound to peer A, claiming peer B: refused. This is what stops one leaked key
+        // authenticating the whole fleet.
+        let wrong_peer = build("222222222", &server_pk);
+        // SessionKey is deliberately not Debug (it holds key material), so match rather
+        // than unwrap_err().
+        let err = match RendezvousServer::nemo_client_auth_open(&wrong_peer, &server_pk, &server_sk) {
+            Ok(_) => panic!("a key bound to another peer must not authenticate"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("bound to peer"), "{}", err);
+
+        // REPLAY into another connection: the same bytes against a different server
+        // ephemeral. This is the property the whole design rests on -- freshness comes
+        // from the server's per-connection key, not from a clock.
+        assert!(
+            RendezvousServer::nemo_client_auth_open(&good, &other_server_pk, &other_server_sk)
+                .is_err(),
+            "a captured proof must not open against a different connection"
+        );
+
+        // Tampered signature.
+        let mut tampered = build("111111111", &server_pk);
+        let mut sig = tampered.sig.to_vec();
+        sig[0] ^= 0xff;
+        tampered.sig = Bytes::from(sig);
+        assert!(
+            RendezvousServer::nemo_client_auth_open(&tampered, &server_pk, &server_sk).is_err()
+        );
+
+        // Unpinned key: refused before any signature work, so an unknown key cannot be
+        // used as a CPU amplifier.
+        unpin_device_key_for_test(&device_pub_b64);
+        let err = match RendezvousServer::nemo_client_auth_open(&good, &server_pk, &server_sk) {
+            Ok(_) => panic!("an unpinned device key must not authenticate"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("not pinned"), "{}", err);
     }
 
     /// C: the flag parser. `off` is the default and every unknown value is refused at
