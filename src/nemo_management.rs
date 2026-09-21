@@ -4198,6 +4198,38 @@ mod tests {
         assert_eq!(got, uuid);
     }
 
+    // H9/H32: the relay arm now runs the same per-user gate the punch arm does, but
+    // the controller's marker rides in RequestRelay.licence_key, NOT in a version
+    // string. If the two field shapes parsed differently, adding the gate would have
+    // refused every relayed session instead of only unauthorised ones.
+    #[test]
+    fn source_identity_is_identical_in_the_punch_and_relay_field_shapes() {
+        let uuid = vec![4u8, 5, 6];
+        let marker = format!("{}:tok-xyz", source_field("peer-c", &uuid));
+        // Punch: "<version> <marker>" (PunchHoleRequest.version).
+        let punch = controller_source_identity(&format!("1.4.6 {}", marker)).unwrap();
+        // Relay: the bare marker (RequestRelay.licence_key).
+        let relay = controller_source_identity(&marker).unwrap();
+        assert_eq!(punch, relay);
+        assert_eq!(relay.0, "peer-c");
+        assert_eq!(relay.1, uuid);
+        assert_eq!(relay.2.as_deref(), Some("tok-xyz"));
+    }
+
+    // Fail-closed shape: an unparseable field and a forged token must both land on
+    // the "not logged in" branch, so choosing the relay path cannot be a way around
+    // require-login. (Whether that branch refuses depends on require_login, which is
+    // operator state; what is asserted here is that the two are indistinguishable.)
+    #[test]
+    fn relay_gate_treats_a_missing_marker_and_a_forged_token_alike() {
+        assert!(controller_source_identity("1.4.6").is_none());
+        assert!(nemo_user_rejection_from_field("1.4.6", "target").is_none() == !integration::require_login());
+        assert_eq!(
+            nemo_user_connection_rejection(None, "target"),
+            nemo_user_connection_rejection(Some("not-a-real-session-token"), "target"),
+        );
+    }
+
     #[test]
     fn source_identity_parses_optional_user_token() {
         let uuid = vec![1u8, 2, 3];

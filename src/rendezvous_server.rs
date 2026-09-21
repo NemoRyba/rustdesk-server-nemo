@@ -622,6 +622,34 @@ impl RendezvousServer {
                         allow_err!(self.send_to_tcp_sync(msg_out, addr).await);
                         return true;
                     }
+                    // H9/H32: the per-user ACL + require-login gate, which until now
+                    // ran ONLY on the punch path. A registered but logged-out client
+                    // that asked for a relay instead of punching reached its target
+                    // while require_login was on. The controller's identity rides in
+                    // licence_key here, not version -- same marker, different field.
+                    #[cfg(feature = "nemo-management-api")]
+                    if let Some((controller_id, reason)) =
+                        crate::nemo_management::nemo_user_rejection_from_field(
+                            &rf.licence_key,
+                            &nemo_id,
+                        )
+                    {
+                        crate::nemo_management::record_policy_rejection(
+                            &controller_id,
+                            addr,
+                            &reason,
+                        )
+                        .await;
+                        let mut rr = RelayResponse {
+                            refuse_reason: reason,
+                            ..Default::default()
+                        };
+                        rr.set_id(nemo_id);
+                        let mut msg_out = RendezvousMessage::new();
+                        msg_out.set_relay_response(rr);
+                        allow_err!(self.send_to_tcp_sync(msg_out, addr).await);
+                        return true;
+                    }
                     #[cfg(feature = "nemo-management-api")]
                     let mut nemo_forwarded = false;
                     if let Some(peer) = self.pm.get_in_memory(&rf.id).await {
