@@ -4,7 +4,7 @@ use crate::{
     peer::{PeerInfo, PeerMap},
 };
 use axum::{
-    extract::{Extension, Path, Query},
+    extract::{ConnectInfo, Extension, Path, Query},
     http::{header::AUTHORIZATION, HeaderMap, StatusCode},
     response::Html,
     routing::{get, post},
@@ -973,7 +973,7 @@ pub(crate) async fn spawn_hbbs_api(
             log::info!("Nemo management API listening on https://{}", addr);
             tokio::spawn(async move {
                 if let Err(err) = axum_server::bind_rustls(addr, config)
-                    .serve(app.into_make_service())
+                    .serve(app.into_make_service_with_connect_info::<SocketAddr>())
                     .await
                 {
                     log::error!("Nemo management API (TLS) failed: {}", err);
@@ -990,7 +990,7 @@ pub(crate) async fn spawn_hbbs_api(
     log::info!("Nemo management API listening on http://{}", addr);
     tokio::spawn(async move {
         if let Err(err) = axum::Server::bind(&addr)
-            .serve(app.into_make_service())
+            .serve(app.into_make_service_with_connect_info::<SocketAddr>())
             .await
         {
             log::error!("Nemo management API failed: {}", err);
@@ -1384,8 +1384,14 @@ const LOGIN_DEVICE_KEY_REQUIRED: &str = "This server only accepts sign-ins from 
 
 async fn api_login(
     Extension(state): Extension<HbbsApiState>,
+    // SEC-10: the source address drives the pre-bind spray limiter. Optional so a
+    // build or serve path that cannot supply it degrades to the global tripwire
+    // instead of failing every login outright.
+    peer: Option<ConnectInfo<SocketAddr>>,
     Json(req): Json<LoginRequest>,
 ) -> Json<LoginResult> {
+    let source_ip = peer.map(|ConnectInfo(addr)| addr.ip().to_string());
+    let source_ip = source_ip.as_deref();
     // S-B: prefer a sealed credential (confidential regardless of TLS); fall back
     // to plaintext fields for backward compatibility.
     let opened = match &req.sealed {
@@ -1452,6 +1458,18 @@ async fn api_login(
     if username.is_empty() || password.is_empty() {
         return Json(LoginResult::err("Username and password required"));
     }
+    // SEC-10: refuse BEFORE the directory bind. The per-username backoff further
+    // down runs only once the DC has already been asked, so on its own it lets a
+    // sprayer walk the whole directory and lock accounts out; this is the gate that
+    // actually keeps those binds from happening.
+    if let Some(reason) = integration::login_spray_block(source_ip) {
+        log::warn!(
+            "Nemo login refused before the directory bind (spray limiter): user='{}' from {}",
+            username,
+            source_ip.unwrap_or("?"),
+        );
+        return Json(LoginResult::err(reason));
+    }
     let cfg = integration::ldap_config();
     match integration::authenticate_ldap(&cfg, &username, &password).await {
         Ok(user) => {
@@ -1516,6 +1534,7 @@ async fn api_login(
             // Per-username exponential backoff: slows online brute force / credential
             // stuffing hard, but never hard-locks (a correct password succeeds
             // instantly and clears the counter, so real users are never blocked).
+            integration::note_login_spray(source_ip, &username);
             let failures = integration::note_login_failure(&username);
             let delay = integration::login_backoff_ms(failures);
             if delay > 0 {

@@ -15,7 +15,7 @@
 use hbb_common::log;
 use once_cell::sync::Lazy;
 use serde_derive::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -1109,6 +1109,155 @@ pub fn login_backoff_ms(failures: u32) -> u64 {
 }
 
 // --------------------------------------------------------------------------
+// SEC-10: pre-bind spray / AD-lockout protection
+// --------------------------------------------------------------------------
+//
+// The per-username backoff above runs *after* the directory bind and is keyed on
+// the username, so it does nothing against password *spraying* -- one password
+// tried against many different accounts. Every attempt still reaches the DC, and
+// enough of them lock real users out of Windows. That is the damage worth
+// preventing here: not the attacker guessing a password, but the attacker denying
+// the whole site its accounts.
+//
+// What separates spraying from typos is the number of DISTINCT usernames that fail
+// from one source in a short window: a fat-fingered user fails the same name over
+// and over, a sprayer walks the directory. So count distinct failed usernames per
+// source, and fleet-wide for a sprayer that rotates its source, and refuse BEFORE
+// the bind once either trips. Refusal is immediate -- no tarpit, which would only
+// be a self-DoS -- and logged once per trip.
+//
+// Sizing note: every workstation behind one NAT presents the SAME source IP to this
+// server, so the per-IP threshold has to sit above what a whole site can plausibly
+// fail by accident. Ten different people failing inside five minutes is not that.
+
+const SPRAY_IP_WINDOW_SECS: u64 = 300;
+const SPRAY_IP_MAX_USERS: usize = 10;
+const SPRAY_IP_COOLDOWN_SECS: u64 = 60;
+const SPRAY_GLOBAL_WINDOW_SECS: u64 = 60;
+const SPRAY_GLOBAL_MAX_USERS: usize = 30;
+const SPRAY_GLOBAL_COOLDOWN_SECS: u64 = 120;
+/// Bound on the per-IP table so a spoofed-source flood cannot grow it without limit.
+const SPRAY_MAX_TRACKED_IPS: usize = 4096;
+
+#[derive(Default)]
+struct SprayWindow {
+    users: HashSet<String>,
+    started: u64,
+    blocked_until: u64,
+}
+
+impl SprayWindow {
+    /// Start a fresh counting window once the current one has aged out. A cooldown
+    /// keeps its own deadline and is not affected by this.
+    fn roll(&mut self, now: u64, window: u64) {
+        if now.saturating_sub(self.started) >= window {
+            self.users.clear();
+            self.started = now;
+        }
+    }
+
+    fn trip(&mut self, now: u64, cooldown: u64) -> bool {
+        if now < self.blocked_until {
+            return false;
+        }
+        self.blocked_until = now.saturating_add(cooldown);
+        self.users.clear();
+        self.started = now;
+        true
+    }
+}
+
+static SPRAY_BY_IP: Lazy<Mutex<HashMap<String, SprayWindow>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+static SPRAY_GLOBAL: Lazy<Mutex<SprayWindow>> = Lazy::new(|| Mutex::new(SprayWindow::default()));
+
+/// Checked BEFORE the directory bind. `Some(reason)` means refuse the login
+/// without ever contacting the DC -- which is what stops a spray from locking AD
+/// accounts out. The reason is deliberately vague (it is shown to whoever is
+/// calling, attacker included) and says nothing about whether the account exists.
+pub fn login_spray_block(source_ip: Option<&str>) -> Option<&'static str> {
+    let now = now_secs();
+    {
+        let mut global = SPRAY_GLOBAL.lock().unwrap();
+        if now < global.blocked_until {
+            return Some("too many failed sign-ins on this server right now; try again shortly");
+        }
+        global.roll(now, SPRAY_GLOBAL_WINDOW_SECS);
+    }
+    let ip = source_ip?;
+    let mut map = SPRAY_BY_IP.lock().unwrap();
+    let entry = map.get_mut(ip)?;
+    if now < entry.blocked_until {
+        return Some("too many failed sign-ins from your network; try again shortly");
+    }
+    None
+}
+
+/// Record a failed login against its source. Call this only for failures -- a
+/// success is never counted, so a legitimate user is never penalised for someone
+/// else's typo. Returns true when this failure tripped a cooldown.
+pub fn note_login_spray(source_ip: Option<&str>, username: &str) -> bool {
+    let now = now_secs();
+    let user = normalize_lookup_username(username);
+    if user.is_empty() {
+        return false;
+    }
+    let mut tripped = false;
+    {
+        let mut global = SPRAY_GLOBAL.lock().unwrap();
+        global.roll(now, SPRAY_GLOBAL_WINDOW_SECS);
+        global.users.insert(user.clone());
+        if global.users.len() > SPRAY_GLOBAL_MAX_USERS
+            && global.trip(now, SPRAY_GLOBAL_COOLDOWN_SECS)
+        {
+            tripped = true;
+            log::error!(
+                "Nemo login: more than {} distinct usernames failed within {}s across all \
+                 sources - refusing directory binds for {}s (password spraying)",
+                SPRAY_GLOBAL_MAX_USERS,
+                SPRAY_GLOBAL_WINDOW_SECS,
+                SPRAY_GLOBAL_COOLDOWN_SECS,
+            );
+        }
+    }
+    let Some(ip) = source_ip else {
+        return tripped;
+    };
+    let mut map = SPRAY_BY_IP.lock().unwrap();
+    map.retain(|_, w| now < w.blocked_until || now.saturating_sub(w.started) < SPRAY_IP_WINDOW_SECS);
+    if map.len() >= SPRAY_MAX_TRACKED_IPS && !map.contains_key(ip) {
+        // Table is full of live windows: fall back to the global tripwire rather than
+        // letting a source-spoofing flood grow it without bound.
+        return tripped;
+    }
+    let entry = map.entry(ip.to_owned()).or_insert_with(|| SprayWindow {
+        started: now,
+        ..Default::default()
+    });
+    entry.roll(now, SPRAY_IP_WINDOW_SECS);
+    entry.users.insert(user);
+    if entry.users.len() > SPRAY_IP_MAX_USERS && entry.trip(now, SPRAY_IP_COOLDOWN_SECS) {
+        log::warn!(
+            "Nemo login: more than {} distinct usernames failed within {}s from {} - refusing \
+             directory binds from it for {}s (password spraying)",
+            SPRAY_IP_MAX_USERS,
+            SPRAY_IP_WINDOW_SECS,
+            ip,
+            SPRAY_IP_COOLDOWN_SECS,
+        );
+        tripped = true;
+    }
+    tripped
+}
+
+/// Test hook: forget all spray state. Not used at runtime.
+#[cfg(test)]
+fn reset_spray_state() {
+    SPRAY_BY_IP.lock().unwrap().clear();
+    *SPRAY_GLOBAL.lock().unwrap() = SprayWindow::default();
+}
+
+// --------------------------------------------------------------------------
 // Pure helpers (LDAP filter / principal / username canonicalisation)
 // --------------------------------------------------------------------------
 
@@ -2064,6 +2213,56 @@ mod tests {
         // Escalates but never exceeds the 30s cap, and never overflows.
         assert_eq!(login_backoff_ms(100), 30_000);
         assert!(login_backoff_ms(7) <= 30_000);
+    }
+
+    // SEC-10. One test, not several: the limiter's state is process-global, so
+    // separate #[test] fns would race each other under the default parallel runner.
+    #[test]
+    fn spray_limiter_counts_distinct_usernames_and_trips_before_the_bind() {
+        reset_spray_state();
+
+        // A user fat-fingering the SAME account never trips it, however often.
+        for _ in 0..50 {
+            note_login_spray(Some("10.0.0.5"), "alice");
+        }
+        assert_eq!(login_spray_block(Some("10.0.0.5")), None);
+
+        // Walking distinct accounts from one source does, on the 11th.
+        for n in 0..SPRAY_IP_MAX_USERS {
+            assert!(!note_login_spray(Some("10.0.0.9"), &format!("user{}", n)));
+        }
+        assert_eq!(login_spray_block(Some("10.0.0.9")), None);
+        assert!(note_login_spray(Some("10.0.0.9"), "user-over"));
+        assert!(login_spray_block(Some("10.0.0.9")).is_some());
+        // Scoped to that source only; the rest of the fleet keeps signing in.
+        assert_eq!(login_spray_block(Some("10.0.0.5")), None);
+        assert_eq!(login_spray_block(None), None);
+
+        // Username forms that normalise to the same account count once, so a
+        // sprayer cannot pad the window with decorations of one name.
+        reset_spray_state();
+        for form in ["bob", "CORP\\bob", "bob@corp.local", "BOB"] {
+            note_login_spray(Some("10.0.0.7"), form);
+        }
+        assert_eq!(
+            SPRAY_BY_IP.lock().unwrap().get("10.0.0.7").unwrap().users.len(),
+            1
+        );
+
+        // The global tripwire catches a sprayer that rotates its source address,
+        // where no single per-IP window would ever fill.
+        reset_spray_state();
+        for n in 0..SPRAY_GLOBAL_MAX_USERS {
+            assert!(!note_login_spray(Some(&format!("10.1.0.{}", n)), &format!("g{}", n)));
+        }
+        assert_eq!(login_spray_block(Some("10.1.0.200")), None);
+        assert!(note_login_spray(Some("10.1.0.200"), "g-over"));
+        // Now every source is refused, including ones that never failed.
+        assert!(login_spray_block(Some("10.9.9.9")).is_some());
+        assert!(login_spray_block(None).is_some());
+
+        reset_spray_state();
+        assert_eq!(login_spray_block(None), None);
     }
 
     #[test]
