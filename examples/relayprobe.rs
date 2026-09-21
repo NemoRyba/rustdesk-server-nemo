@@ -17,6 +17,10 @@
 //! | false         | forwarded, relay pairs   | forwarded, relay pairs|
 //! | true          | "log in to TBFDesk to connect", not forwarded | forwarded, relay pairs |
 //!
+//! Env LEGACY_SEAL=1 seals a bare 32-byte session key (the pre-SEC-14 shape). The
+//! server must refuse the handshake outright; nothing may fall back to a shared
+//! nonce space.
+//!
 //! Note when running this on one host: hbbr treats any LOOPBACK connection as its
 //! command port (relay_server.rs `handle_connection`), so RELAY_SERVER must be a
 //! routable address of the machine, not 127.0.0.1, or nothing will ever pair.
@@ -57,9 +61,13 @@ async fn connect_secure(addr: &str, rs_pk: &sign::PublicKey) -> ResultType<Frame
     pk.copy_from_slice(&their_pk_b);
     let (our_pk_b, our_sk_b) = box_::gen_keypair();
     let key = secretbox::gen_key();
-    // SEC-14: seal key || version, exactly as the real client does.
+    // SEC-14: seal key || version, exactly as the real client does. LEGACY_SEAL=1
+    // seals a bare 32-byte key instead -- the pre-SEC-14 shape -- so the refusal can
+    // be exercised without building an old binary.
     let mut payload = key.0.to_vec();
-    payload.push(SESSION_KEY_V1);
+    if std::env::var("LEGACY_SEAL").ok().as_deref() != Some("1") {
+        payload.push(SESSION_KEY_V1);
+    }
     let sealed = box_::seal(
         &payload,
         &box_::Nonce([0u8; box_::NONCEBYTES]),

@@ -483,14 +483,6 @@ async fn relay_key_exchange(stream: &mut FramedStream) -> ResultType<()> {
     // [its X25519 pubkey, the symmetric key sealed to ours], Encrypt::decode takes
     // them the other way round.
     let session = Encrypt::decode(&ex.keys[1], &ex.keys[0], &our_sk_b)?;
-    // SEC-14 rollout aid: name the stragglers. A peer that sealed a bare 32-byte key
-    // is a pre-SEC-14 build, and this control frame keeps the old shared nonce space.
-    if !session.directional {
-        log::warn!(
-            "Relay peer sealed a pre-SEC-14 session key; this control frame keeps the old \
-             shared nonce space. Update that client."
-        );
-    }
     stream.set_key(session);
     Ok(())
 }

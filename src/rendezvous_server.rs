@@ -1696,18 +1696,6 @@ impl RendezvousServer {
                             Some(rendezvous_message::Union::KeyExchange(ex)) => {
                                 match Self::key_exchange_open(&ex, &our_sk_b) {
                                     Ok(sym) => {
-                                        // SEC-14 rollout aid: name the stragglers. A
-                                        // client that sealed a bare 32-byte key is a
-                                        // pre-SEC-14 build, and this connection keeps
-                                        // the old shared nonce space for it.
-                                        if !sym.directional {
-                                            log::warn!(
-                                                "Peer {:?} sealed a pre-SEC-14 session key; this \
-                                                 connection keeps the old shared nonce space. \
-                                                 Update that client.",
-                                                addr
-                                            );
-                                        }
                                         // One derived key, two `Encrypt`: `enc` and
                                         // `dec` count on separate fields (tcp.rs), so
                                         // a send-only instance riding with the sink
@@ -2138,11 +2126,6 @@ mod tests {
             opened.key, symmetric,
             "server derived a different symmetric key"
         );
-        assert!(
-            opened.directional,
-            "the v1 marker must survive the seal -- without it the server silently \
-             keeps the shared nonce space"
-        );
         assert_eq!(opened.role, hbb_common::tcp::Role::Responder);
 
         // ... and the swapped order must not accidentally succeed.
@@ -2179,26 +2162,9 @@ mod tests {
             .expect("server decrypts the request");
         assert_eq!(&from_client[..], &b"punch-hole-request"[..]);
 
-        // SEC-14, the bug this replaces. One shared key and one nonce space meant the
-        // two directions derived the SAME nonce from their own counters, so frame #1
-        // each way encrypted the same plaintext to the same ciphertext -- keystream
-        // reuse on every connection, from the first frame. Assert both halves: that
-        // the old shape really did collide, and that the new one does not.
-        let mut legacy_i = Encrypt::new(SessionKey {
-            key: symmetric.clone(),
-            role: Role::Initiator,
-            directional: false,
-        });
-        let mut legacy_r = Encrypt::new(SessionKey {
-            key: symmetric.clone(),
-            role: Role::Responder,
-            directional: false,
-        });
-        assert_eq!(
-            legacy_i.enc(b"same plaintext"),
-            legacy_r.enc(b"same plaintext"),
-            "pre-SEC-14 shape: the two directions shared a nonce space (two-time pad)"
-        );
+        // SEC-14: the two directions must not derive the same nonce from their own
+        // counters. (That the OLD shape did is asserted in hbb_common's own tests,
+        // which can still construct it; here the shape is no longer reachable.)
         let mut v1_i = Encrypt::new(SessionKey::new(symmetric.clone(), Role::Initiator));
         let mut v1_r = Encrypt::new(SessionKey::new(symmetric.clone(), Role::Responder));
         assert_ne!(
@@ -2207,8 +2173,9 @@ mod tests {
             "SEC-14: the two directions must not reuse a nonce with one key"
         );
 
-        // A pre-SEC-14 client seals a bare 32-byte key. That must still open, and must
-        // report directional=false so we answer it exactly as the old server did.
+        // A pre-SEC-14 client seals a bare 32-byte key. Nothing is deployed that does
+        // so, and accepting it would silently reinstate the shared nonce space, so the
+        // handshake refuses it outright.
         let legacy_sealed = box_::seal(
             &symmetric.0,
             &box_::Nonce([0u8; box_::NONCEBYTES]),
@@ -2222,10 +2189,10 @@ mod tests {
             ],
             ..Default::default()
         };
-        let legacy_opened = RendezvousServer::key_exchange_open(&legacy_reply, &our_sk_b)
-            .expect("a pre-SEC-14 client still completes the handshake");
-        assert_eq!(legacy_opened.key, symmetric);
-        assert!(!legacy_opened.directional);
+        assert!(
+            RendezvousServer::key_exchange_open(&legacy_reply, &our_sk_b).is_err(),
+            "a bare 32-byte session key must not be accepted"
+        );
 
         // An unknown version is refused rather than guessed at, so a future v2 cannot
         // be silently misread as v1.
