@@ -1333,15 +1333,54 @@ fn first_attr(attrs: &HashMap<String, Vec<String>>, key: &str) -> String {
         .unwrap_or_default()
 }
 
+/// The identity an LDAP server reports for the current connection (RFC 4532
+/// "Who am I?"). `dn:` carries a distinguished name, `u:` a directory-specific
+/// user string -- Active Directory answers `u:DOMAIN\\sAMAccountName`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuthzId {
+    Dn(String),
+    User(String),
+}
+
+/// Parse an authzid. Anything that is neither form is not an identity we are
+/// willing to act on, so it comes back as None and the caller falls back to the
+/// (tightened) search path rather than guessing.
+pub fn parse_authzid(authzid: &str) -> Option<AuthzId> {
+    let s = authzid.trim();
+    if let Some(dn) = s.strip_prefix("dn:") {
+        let dn = dn.trim();
+        if !dn.is_empty() {
+            return Some(AuthzId::Dn(dn.to_owned()));
+        }
+        return None;
+    }
+    if let Some(u) = s.strip_prefix("u:") {
+        let u = u.trim();
+        if !u.is_empty() {
+            return Some(AuthzId::User(u.to_owned()));
+        }
+        return None;
+    }
+    None
+}
+
 /// Prefer sAMAccountName, then userPrincipalName, then the raw input, for the
 /// canonical username used everywhere else.
 pub fn canonical_username(attrs: &HashMap<String, Vec<String>>, raw_input: &str) -> String {
     let sam = first_attr(attrs, "sAMAccountName");
     let upn = first_attr(attrs, "userPrincipalName");
+    // `uid` is the standard account-name attribute outside Active Directory
+    // (inetOrgPerson/posixAccount). It is directory-supplied like the other two, so
+    // consulting it costs nothing on AD -- where sAMAccountName wins anyway -- and is
+    // what lets a non-AD directory produce a canonical name at all now that the raw
+    // input is no longer an acceptable fallback (SEC-8).
+    let uid = first_attr(attrs, "uid");
     let chosen = if !sam.is_empty() {
         sam
     } else if !upn.is_empty() {
         upn
+    } else if !uid.is_empty() {
+        uid
     } else {
         raw_input.to_owned()
     };
@@ -1675,6 +1714,7 @@ pub async fn search_ldap_users(
     let attr_list = vec![
         "sAMAccountName",
         "userPrincipalName",
+        "uid",
         "displayName",
         "mail",
         "department",
@@ -1738,6 +1778,7 @@ fn escape_filter_keep_wildcard(input: &str) -> String {
 const DIRECTORY_SEARCH_ATTRS: &[&str] = &[
     "sAMAccountName",
     "userPrincipalName",
+    "uid",
     "displayName",
     "cn",
     "givenName",
@@ -1793,6 +1834,79 @@ pub async fn search_ldap_users(
     Err("LDAP support was not compiled in (build with --features nemo-ldap)".to_owned())
 }
 
+/// RFC 4532 "Who am I?": ask the directory which identity this connection is bound
+/// as. `None` means the server did not answer usefully -- the caller must then fall
+/// back to a search and treat the result with suspicion, never assume success.
+///
+/// The response value is read by hand rather than through `Exop::parse`, which
+/// panics on an absent or non-UTF-8 value; a hostile or merely odd directory must
+/// not be able to take the server down.
+#[cfg(feature = "nemo-ldap")]
+async fn ldap_whoami(ldap: &mut ldap3::Ldap) -> Option<AuthzId> {
+    use ldap3::exop::WhoAmI;
+    let (exop, _res) = match ldap.extended(WhoAmI).await {
+        Ok(r) => match r.success() {
+            Ok(v) => v,
+            Err(err) => {
+                log::debug!("LDAP Who-am-I refused: {}", err);
+                return None;
+            }
+        },
+        Err(err) => {
+            log::debug!("LDAP Who-am-I failed: {}", err);
+            return None;
+        }
+    };
+    let raw = exop.val?;
+    let authzid = String::from_utf8(raw).ok()?;
+    let parsed = parse_authzid(&authzid);
+    if parsed.is_none() && !authzid.trim().is_empty() {
+        log::warn!("LDAP Who-am-I returned an unrecognised authzid: {:?}", authzid);
+    }
+    parsed
+}
+
+/// Search that insists on exactly one entry. Zero matches and several matches are
+/// both "could not identify", which is the only safe reading when the answer picks
+/// which account a caller becomes.
+#[cfg(feature = "nemo-ldap")]
+async fn search_one(
+    ldap: &mut ldap3::Ldap,
+    base: &str,
+    scope: ldap3::Scope,
+    filter: &str,
+    attr_list: &[&str],
+) -> Option<ldap3::SearchEntry> {
+    let sr = match ldap.search(base, scope, filter, attr_list.to_vec()).await {
+        Ok(sr) => sr,
+        Err(err) => {
+            log::debug!("LDAP search under {} failed: {}", base, err);
+            return None;
+        }
+    };
+    let (entries, _res) = match sr.success() {
+        Ok(v) => v,
+        Err(err) => {
+            log::debug!("LDAP search under {} rejected: {}", base, err);
+            return None;
+        }
+    };
+    if entries.len() != 1 {
+        if entries.len() > 1 {
+            log::warn!(
+                "LDAP search under {} matched {} entries where exactly one was required",
+                base,
+                entries.len()
+            );
+        }
+        return None;
+    }
+    entries
+        .into_iter()
+        .next()
+        .map(ldap3::SearchEntry::construct)
+}
+
 /// Authenticate `username`/`password` against the configured directory.
 /// Returns `Ok(LdapUser)` on success, `Err(reason)` otherwise.
 #[cfg(feature = "nemo-ldap")]
@@ -1839,10 +1953,14 @@ pub async fn authenticate_ldap(
 
     let mut dn = String::new();
     let mut attrs: HashMap<String, Vec<String>> = HashMap::new();
+    // SEC-8: the directory-confirmed identity, used as the canonical-name fallback
+    // in place of the raw input. Stays empty unless RFC 4532 supplied it.
+    let mut identity = String::new();
     let attr_list = vec![
         "distinguishedName",
         "sAMAccountName",
         "userPrincipalName",
+        "uid",
         "displayName",
         "mail",
     ];
@@ -1874,10 +1992,21 @@ pub async fn authenticate_ldap(
             .map_err(|e| format!("user search rejected: {}", e))?;
         let _ = ldap.unbind().await;
 
+        // SEC-8: exactly one, not the first of several. A filter that matches two
+        // accounts is an ambiguity, and picking one of them is how you bind as the
+        // wrong user. L-fix (user enumeration): an unknown username must still be
+        // indistinguishable from a wrong password in the client-visible error, so the
+        // detail stays in the server log.
+        if entries.len() != 1 {
+            log::warn!(
+                "LDAP login: filter for user '{}' matched {} directory entries; refusing \
+                 (exactly one is required)",
+                username,
+                entries.len(),
+            );
+            return Err("invalid username or password".to_owned());
+        }
         let entry = entries.into_iter().next().ok_or_else(|| {
-            // L-fix (user enumeration): an unknown username must be indistinguishable
-            // from a wrong password in the client-visible error. Detail stays in the
-            // server log for the operator.
             log::warn!("LDAP login: user '{}' not found in directory", username);
             "invalid username or password".to_owned()
         })?;
@@ -1915,20 +2044,110 @@ pub async fn authenticate_ldap(
             .success()
             .map_err(|_| "invalid username or password".to_owned())?;
 
-        // Best-effort self-search for profile attributes.
+        // SEC-8: the bind proved the PASSWORD. It did NOT prove which account the
+        // typed name belongs to. The old follow-up search was filtered by that same
+        // typed string, so an unusual user_search_filter could resolve it to a
+        // different entry than the one that actually bound -- and when the search was
+        // skipped (no base DN) or simply failed, canonical_username fell all the way
+        // back to the raw input. The allowlist was then matched against a name the
+        // user chose rather than one the directory confirmed.
+        //
+        // So ask the directory who it thinks we are (RFC 4532, which Active Directory
+        // has answered since 2003) and act only on that. AD replies
+        // `u:DOMAIN\sAMAccountName`, which normalises to exactly the account name the
+        // allowlist is keyed on -- no search needed at all in the common case.
+        let confirmed = ldap_whoami(&mut ldap).await;
         let base = cfg.base_dn.trim();
-        if !base.is_empty() {
-            let filter =
-                build_search_filter(&cfg.user_search_filter, username, &cfg.windows_domain);
-            if let Ok(sr) = ldap
-                .search(base, Scope::Subtree, &filter, attr_list.clone())
-                .await
-            {
-                if let Ok((entries, _)) = sr.success() {
-                    if let Some(entry) = entries.into_iter().next() {
-                        let se = SearchEntry::construct(entry);
+        match &confirmed {
+            Some(AuthzId::Dn(bound_dn)) => {
+                // Authoritative DN: read the account's own attributes from it, not from
+                // whatever a filter on the typed name happens to match.
+                dn = bound_dn.clone();
+                if let Some(se) = search_one(&mut ldap, bound_dn, Scope::Base, "(objectClass=*)", &attr_list).await {
+                    attrs = se.attrs;
+                }
+                if attrs.is_empty() {
+                    let _ = ldap.unbind().await;
+                    log::warn!(
+                        "LDAP login: the directory reported the bound DN as '{}' but its \
+                         attributes could not be read, so the account's real login name is \
+                         unknown. Refusing rather than trusting the typed name.",
+                        bound_dn
+                    );
+                    return Err("invalid username or password".to_owned());
+                }
+            }
+            Some(AuthzId::User(reported)) => {
+                // Authoritative name. Enrich with profile attributes if we can, but
+                // filter by the CONFIRMED name, and drop the entry if it disagrees.
+                identity = normalize_lookup_username(reported);
+                if !base.is_empty() {
+                    let filter =
+                        build_search_filter(&cfg.user_search_filter, reported, &cfg.windows_domain);
+                    if let Some(se) =
+                        search_one(&mut ldap, base, Scope::Subtree, &filter, &attr_list).await
+                    {
+                        if canonical_username(&se.attrs, &identity) == identity {
+                            dn = se.dn.clone();
+                            attrs = se.attrs;
+                        } else {
+                            log::warn!(
+                                "LDAP login: the directory confirmed '{}' but the profile search \
+                                 matched a different entry ('{}'); using the confirmed identity \
+                                 and dropping the profile attributes",
+                                identity,
+                                se.dn,
+                            );
+                        }
+                    }
+                }
+            }
+            None => {
+                // The directory does not answer RFC 4532. Fall back to the search, but
+                // tightened: exactly one entry, and its canonical name must be the
+                // account that actually bound. Ambiguity is refused, never resolved.
+                if base.is_empty() {
+                    let _ = ldap.unbind().await;
+                    log::warn!(
+                        "LDAP login: {} answered no RFC 4532 Who-am-I and no base DN is \
+                         configured, so a bound account cannot be identified at all. Set the \
+                         base DN (or a service bind DN) to enable login.",
+                        url
+                    );
+                    return Err(
+                        "this server cannot confirm your account; ask your administrator to \
+                         finish the directory configuration"
+                            .to_owned(),
+                    );
+                }
+                let filter =
+                    build_search_filter(&cfg.user_search_filter, username, &cfg.windows_domain);
+                let expected = normalize_lookup_username(&principal);
+                match search_one(&mut ldap, base, Scope::Subtree, &filter, &attr_list).await {
+                    Some(se) => {
+                        let found = canonical_username(&se.attrs, "");
+                        if found.is_empty() || found != expected {
+                            let _ = ldap.unbind().await;
+                            log::warn!(
+                                "LDAP login: the entry matched for '{}' resolves to '{}', which is \
+                                 not the account that bound ('{}'). Refusing.",
+                                username,
+                                found,
+                                expected,
+                            );
+                            return Err("invalid username or password".to_owned());
+                        }
                         dn = se.dn.clone();
                         attrs = se.attrs;
+                    }
+                    None => {
+                        let _ = ldap.unbind().await;
+                        log::warn!(
+                            "LDAP login: '{}' bound successfully but could not be uniquely \
+                             identified in the directory (no match, or more than one). Refusing.",
+                            username
+                        );
+                        return Err("invalid username or password".to_owned());
                     }
                 }
             }
@@ -1936,7 +2155,11 @@ pub async fn authenticate_ldap(
         let _ = ldap.unbind().await;
     }
 
-    let canonical = canonical_username(&attrs, username);
+    // SEC-8: the fallback is the identity the DIRECTORY confirmed, never the raw
+    // input. It is empty on every path where `attrs` is authoritative, so an entry
+    // with no sAMAccountName/userPrincipalName fails closed below instead of
+    // silently adopting whatever was typed.
+    let canonical = canonical_username(&attrs, &identity);
     if canonical.is_empty() {
         return Err("could not determine canonical username".to_owned());
     }
@@ -2091,6 +2314,50 @@ mod tests {
         assert_eq!(raw_username("jdoe@example.local"), "jdoe");
         assert_eq!(raw_username("  jdoe  "), "jdoe");
         assert_eq!(raw_username("jdoe"), "jdoe");
+    }
+
+    // SEC-8. The allowlist is keyed on the normalised bare account name, so what
+    // matters is that an AD-shaped authzid lands on exactly that -- and that anything
+    // we do not recognise is None rather than a guess.
+    #[test]
+    fn authzid_is_parsed_only_in_its_two_defined_forms() {
+        // Active Directory's answer.
+        assert_eq!(
+            parse_authzid("u:CORP\\jdoe"),
+            Some(AuthzId::User("CORP\\jdoe".to_owned()))
+        );
+        match parse_authzid("u:CORP\\jdoe").unwrap() {
+            AuthzId::User(u) => assert_eq!(normalize_lookup_username(&u), "jdoe"),
+            other => panic!("{:?}", other),
+        }
+        // OpenLDAP's answer.
+        assert_eq!(
+            parse_authzid("dn:uid=jdoe,ou=people,dc=corp,dc=local"),
+            Some(AuthzId::Dn("uid=jdoe,ou=people,dc=corp,dc=local".to_owned()))
+        );
+        assert_eq!(parse_authzid("  dn:cn=x,dc=y  "), Some(AuthzId::Dn("cn=x,dc=y".to_owned())));
+        // An anonymous bind reports an empty authzid: not an identity.
+        assert_eq!(parse_authzid(""), None);
+        assert_eq!(parse_authzid("dn:"), None);
+        assert_eq!(parse_authzid("u:"), None);
+        assert_eq!(parse_authzid("u: "), None);
+        // Neither defined form -- must not be treated as a name.
+        assert_eq!(parse_authzid("jdoe"), None);
+        assert_eq!(parse_authzid("dn=cn=x"), None);
+        assert_eq!(parse_authzid("U:jdoe"), None);
+    }
+
+    // SEC-8: with no directory-confirmed identity the fallback is empty, so an entry
+    // carrying neither sAMAccountName nor userPrincipalName yields an empty canonical
+    // name -- which authenticate_ldap refuses, instead of adopting the typed string.
+    #[test]
+    fn canonical_username_fails_closed_without_a_confirmed_identity() {
+        assert_eq!(canonical_username(&HashMap::new(), ""), "");
+        let mut attrs = HashMap::new();
+        attrs.insert("displayName".to_owned(), vec!["John Doe".to_owned()]);
+        assert_eq!(canonical_username(&attrs, ""), "");
+        // A confirmed identity IS used when attributes are missing.
+        assert_eq!(canonical_username(&attrs, "jdoe"), "jdoe");
     }
 
     #[test]
