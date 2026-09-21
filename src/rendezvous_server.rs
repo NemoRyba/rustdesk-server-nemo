@@ -222,20 +222,19 @@ impl RendezvousServer {
             log::warn!(
                 "key-exchange={} protects the TCP rendezvous channel only. Plaintext UDP \
                  registration is STILL ACCEPTED, so any client not yet on disable-udp=Y \
-                 registers in the clear. DO NOT close it yet: a TCP-only peer is online \
-                 but cannot RECEIVE a punch or relay request, because this server pushes \
-                 to peers over UDP and keeps no per-peer TCP sink (see H43). Switching \
-                 the fleet to disable-udp=Y today would leave every machine registered, \
-                 online and unreachable.",
+                 registers in the clear. Rollout: push disable-udp=Y to the fleet, \
+                 confirm every peer is online, then restart with --udp-registration=N. \
+                 Note disable-udp only chooses the RENDEZVOUS transport -- it does not \
+                 turn off UDP hole punching, which is enable-udp-punch on the client.",
                 key_exchange.as_str()
             );
         }
         if !udp_registration {
-            log::warn!(
+            log::info!(
                 "udp-registration=N: plaintext UDP registration is refused; clients must \
-                 use the KeyExchange-secured TCP channel (disable-udp=Y). WARNING: until \
-                 this server can push to a peer over its TCP connection (H43), those \
-                 clients can make outbound connections but cannot receive any."
+                 use the KeyExchange-secured TCP channel (disable-udp=Y). Those clients \
+                 are reachable in both directions -- hbbs pushes punch and relay requests \
+                 over the peer's own rendezvous connection."
             );
         }
         let nat_port = port - 1;
