@@ -16,7 +16,7 @@ use hbb_common::{
         register_pk_response::Result::{TOO_FREQUENT, UUID_MISMATCH},
         *,
     },
-    tcp::{listen_any, Encrypt, FramedStream},
+    tcp::{listen_any, Encrypt, FramedStream, Role, SessionKey},
     timeout,
     tokio::{
         self,
@@ -1696,6 +1696,18 @@ impl RendezvousServer {
                             Some(rendezvous_message::Union::KeyExchange(ex)) => {
                                 match Self::key_exchange_open(&ex, &our_sk_b) {
                                     Ok(sym) => {
+                                        // SEC-14 rollout aid: name the stragglers. A
+                                        // client that sealed a bare 32-byte key is a
+                                        // pre-SEC-14 build, and this connection keeps
+                                        // the old shared nonce space for it.
+                                        if !sym.directional {
+                                            log::warn!(
+                                                "Peer {:?} sealed a pre-SEC-14 session key; this \
+                                                 connection keeps the old shared nonce space. \
+                                                 Update that client.",
+                                                addr
+                                            );
+                                        }
                                         // One derived key, two `Encrypt`: `enc` and
                                         // `dec` count on separate fields (tcp.rs), so
                                         // a send-only instance riding with the sink
@@ -1703,6 +1715,10 @@ impl RendezvousServer {
                                         // reproduce exactly the nonce sequence of the
                                         // client's single FramedStream cipher. Neither
                                         // is ever cloned or reset afterwards.
+                                        // SEC-14: `sym` carries the responder role and
+                                        // whether the client sealed the v1 marker, so
+                                        // both halves derive the same per-direction
+                                        // nonce spaces the client is using.
                                         if let Some(Sink::TcpStream(_, cipher)) = sink.as_mut() {
                                             *cipher = Some(Encrypt::new(sym.clone()));
                                         }
@@ -1793,7 +1809,7 @@ impl RendezvousServer {
     fn key_exchange_open(
         ex: &KeyExchange,
         our_sk_b: &box_::SecretKey,
-    ) -> ResultType<secretbox::Key> {
+    ) -> ResultType<hbb_common::tcp::SessionKey> {
         if ex.keys.len() != 2 {
             bail!(
                 "Key exchange reply carries {} keys, expected 2",
@@ -2096,8 +2112,13 @@ mod tests {
         server_pk.copy_from_slice(&their_pk_b);
         let (client_pk_b, client_sk_b) = box_::gen_keypair();
         let symmetric = secretbox::gen_key();
+        // SEC-14: a v1 client seals key || SESSION_KEY_V1. The marker rides INSIDE the
+        // box, so an on-path attacker cannot strip it to force the old shared nonce
+        // space back without holding the server's secret key.
+        let mut v1_payload = symmetric.0.to_vec();
+        v1_payload.push(hbb_common::tcp::SESSION_KEY_V1);
         let sealed = box_::seal(
-            &symmetric.0,
+            &v1_payload,
             &box_::Nonce([0u8; box_::NONCEBYTES]),
             &box_::PublicKey(server_pk),
             &client_sk_b,
@@ -2114,9 +2135,15 @@ mod tests {
         let opened =
             RendezvousServer::key_exchange_open(&reply, &our_sk_b).expect("sealed key opens");
         assert_eq!(
-            opened, symmetric,
+            opened.key, symmetric,
             "server derived a different symmetric key"
         );
+        assert!(
+            opened.directional,
+            "the v1 marker must survive the seal -- without it the server silently \
+             keeps the shared nonce space"
+        );
+        assert_eq!(opened.role, hbb_common::tcp::Role::Responder);
 
         // ... and the swapped order must not accidentally succeed.
         let swapped = KeyExchange {
@@ -2140,7 +2167,7 @@ mod tests {
         // is recv-only, so together they match the client's single FramedStream cipher.
         let mut sink_enc = Encrypt::new(opened.clone());
         let mut loop_dec = Encrypt::new(opened);
-        let mut client = Encrypt::new(symmetric);
+        let mut client = Encrypt::new(SessionKey::new(symmetric.clone(), Role::Initiator));
         let mut from_server = BytesMut::from(&sink_enc.enc(b"punch-hole-response")[..]);
         client
             .dec(&mut from_server)
@@ -2151,6 +2178,73 @@ mod tests {
             .dec(&mut from_client)
             .expect("server decrypts the request");
         assert_eq!(&from_client[..], &b"punch-hole-request"[..]);
+
+        // SEC-14, the bug this replaces. One shared key and one nonce space meant the
+        // two directions derived the SAME nonce from their own counters, so frame #1
+        // each way encrypted the same plaintext to the same ciphertext -- keystream
+        // reuse on every connection, from the first frame. Assert both halves: that
+        // the old shape really did collide, and that the new one does not.
+        let mut legacy_i = Encrypt::new(SessionKey {
+            key: symmetric.clone(),
+            role: Role::Initiator,
+            directional: false,
+        });
+        let mut legacy_r = Encrypt::new(SessionKey {
+            key: symmetric.clone(),
+            role: Role::Responder,
+            directional: false,
+        });
+        assert_eq!(
+            legacy_i.enc(b"same plaintext"),
+            legacy_r.enc(b"same plaintext"),
+            "pre-SEC-14 shape: the two directions shared a nonce space (two-time pad)"
+        );
+        let mut v1_i = Encrypt::new(SessionKey::new(symmetric.clone(), Role::Initiator));
+        let mut v1_r = Encrypt::new(SessionKey::new(symmetric.clone(), Role::Responder));
+        assert_ne!(
+            v1_i.enc(b"same plaintext"),
+            v1_r.enc(b"same plaintext"),
+            "SEC-14: the two directions must not reuse a nonce with one key"
+        );
+
+        // A pre-SEC-14 client seals a bare 32-byte key. That must still open, and must
+        // report directional=false so we answer it exactly as the old server did.
+        let legacy_sealed = box_::seal(
+            &symmetric.0,
+            &box_::Nonce([0u8; box_::NONCEBYTES]),
+            &box_::PublicKey(server_pk),
+            &client_sk_b,
+        );
+        let legacy_reply = KeyExchange {
+            keys: vec![
+                Bytes::from(client_pk_b.0.to_vec()),
+                Bytes::from(legacy_sealed),
+            ],
+            ..Default::default()
+        };
+        let legacy_opened = RendezvousServer::key_exchange_open(&legacy_reply, &our_sk_b)
+            .expect("a pre-SEC-14 client still completes the handshake");
+        assert_eq!(legacy_opened.key, symmetric);
+        assert!(!legacy_opened.directional);
+
+        // An unknown version is refused rather than guessed at, so a future v2 cannot
+        // be silently misread as v1.
+        let mut v2_payload = symmetric.0.to_vec();
+        v2_payload.push(hbb_common::tcp::SESSION_KEY_V1 + 1);
+        let v2_sealed = box_::seal(
+            &v2_payload,
+            &box_::Nonce([0u8; box_::NONCEBYTES]),
+            &box_::PublicKey(server_pk),
+            &client_sk_b,
+        );
+        let v2_reply = KeyExchange {
+            keys: vec![Bytes::from(client_pk_b.0.to_vec()), Bytes::from(v2_sealed)],
+            ..Default::default()
+        };
+        assert!(
+            RendezvousServer::key_exchange_open(&v2_reply, &our_sk_b).is_err(),
+            "an unknown session key version must not be accepted"
+        );
     }
 
     /// C: the flag parser. `off` is the default and every unknown value is refused at
