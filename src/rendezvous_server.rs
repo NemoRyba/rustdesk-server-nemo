@@ -68,6 +68,13 @@ static ROTATION_RELAY_SERVER: AtomicUsize = AtomicUsize::new(0);
 type RelayServers = Vec<String>;
 const CHECK_RELAY_TIMEOUT: u64 = 3_000;
 static ALWAYS_USE_RELAY: AtomicBool = AtomicBool::new(false);
+// TBFDesk: whether plaintext UDP registration is still accepted.
+//
+// The KeyExchange protects the TCP rendezvous channel only -- UDP has no handshake, so
+// a client registering over UDP is in the clear no matter what --key-exchange says.
+// Closing this is therefore the LAST step of the rollout, not the first: refuse UDP
+// before the fleet is on disable-udp=Y and those clients simply cannot register.
+static UDP_REGISTRATION: AtomicBool = AtomicBool::new(true);
 
 // C (--key-exchange): server half of the rendezvous handshake the client already
 // speaks (client common.rs::secure_tcp_impl). Process-global like
@@ -191,6 +198,30 @@ impl RendezvousServer {
         }
         KEY_EXCHANGE_MODE.store(key_exchange as u8, Ordering::SeqCst);
         log::info!("key-exchange={}", key_exchange.as_str());
+        let udp_registration = get_arg_or("udp-registration", "Y".to_owned())
+            .to_uppercase()
+            .starts_with('Y');
+        UDP_REGISTRATION.store(udp_registration, Ordering::SeqCst);
+        log::info!("udp-registration={}", if udp_registration { "Y" } else { "N" });
+        // Make the remaining plaintext path impossible to miss. --key-exchange only
+        // covers TCP; as long as UDP registration is accepted, a client that has not
+        // been switched to disable-udp=Y is still registering in the clear.
+        if udp_registration && key_exchange != KeyExchangeMode::Off {
+            log::warn!(
+                "key-exchange={} protects the TCP rendezvous channel only. Plaintext UDP \
+                 registration is STILL ACCEPTED, so any client not yet on disable-udp=Y \
+                 registers in the clear. Rollout order: push disable-udp=Y (and \
+                 nemo-require-secure-rendezvous=Y) to the fleet, confirm every peer is \
+                 online over TCP, then restart with --udp-registration=N to close it.",
+                key_exchange.as_str()
+            );
+        }
+        if !udp_registration {
+            log::info!(
+                "udp-registration=N: plaintext UDP registration is refused; clients must \
+                 use the KeyExchange-secured TCP channel (disable-udp=Y)."
+            );
+        }
         let nat_port = port - 1;
         let ws_port = port + 2;
         let pm = PeerMap::new().await?;
@@ -427,6 +458,10 @@ impl RendezvousServer {
         if let Ok(msg_in) = RendezvousMessage::parse_from_bytes(bytes) {
             match msg_in.union {
                 Some(rendezvous_message::Union::RegisterPeer(rp)) => {
+                    if !UDP_REGISTRATION.load(Ordering::SeqCst) {
+                        log::debug!("Refusing plaintext UDP RegisterPeer from {}", addr);
+                        return Ok(());
+                    }
                     // B registered
                     if !rp.id.is_empty() {
                         #[cfg(feature = "nemo-management-api")]
@@ -456,6 +491,10 @@ impl RendezvousServer {
                     }
                 }
                 Some(rendezvous_message::Union::RegisterPk(rk)) => {
+                    if !UDP_REGISTRATION.load(Ordering::SeqCst) {
+                        log::debug!("Refusing plaintext UDP RegisterPk from {}", addr);
+                        return Ok(());
+                    }
                     if let Some(res) = self.register_pk_core(rk, addr).await {
                         return send_rk_res(socket, addr, res).await;
                     }
@@ -587,6 +626,14 @@ impl RendezvousServer {
                     let mut nemo_forwarded = false;
                     if let Some(peer) = self.pm.get_in_memory(&rf.id).await {
                         let mut msg_out = RendezvousMessage::new();
+                        // Same per-connection permissions on the relay path. The
+                        // controller's identity rides in licence_key here, not version.
+                        #[cfg(feature = "nemo-management-api")]
+                        {
+                            rf.control_permissions =
+                                crate::nemo_management::control_permissions_for(&rf.licence_key)
+                                    .into();
+                        }
                         rf.socket_addr = AddrMangle::encode(addr).into();
                         msg_out.set_request_relay(rf);
                         let peer_addr = peer.read().await.socket_addr;
@@ -1111,6 +1158,15 @@ impl RendezvousServer {
                     }
                 });
             let socket_addr = AddrMangle::encode(addr).into();
+            // Per-connection permissions for THIS controller, derived from their
+            // logged-in user's session policy. Until the proto was synced the server
+            // could not express this at all, so every connection arrived with None and
+            // only the target's own local toggles applied.
+            #[cfg(feature = "nemo-management-api")]
+            let control_permissions =
+                crate::nemo_management::control_permissions_for(&ph.version);
+            #[cfg(not(feature = "nemo-management-api"))]
+            let control_permissions: Option<ControlPermissions> = None;
             #[cfg(feature = "nemo-management-api")]
             crate::nemo_management::record_connection_negotiation(
                 &id,
@@ -1133,6 +1189,7 @@ impl RendezvousServer {
                 msg_out.set_fetch_local_addr(FetchLocalAddr {
                     socket_addr,
                     relay_server,
+                    control_permissions: control_permissions.clone().into(),
                     // Carry the caller's IPv6 address through. The server proto used to
                     // lack this field entirely, so protobuf dropped it silently and the
                     // v6 path could never be attempted.
@@ -1150,6 +1207,7 @@ impl RendezvousServer {
                     socket_addr,
                     nat_type: ph.nat_type,
                     relay_server,
+                    control_permissions: control_permissions.into(),
                     // These four were absent from the server proto, so the client sent
                     // them and protobuf discarded them. The target therefore always saw
                     // udp_port == 0 and never took the UDP punch arm -- traversal was

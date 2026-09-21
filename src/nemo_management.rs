@@ -10,7 +10,13 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use hbb_common::{bail, config::keys, log, tokio, ResultType};
+use hbb_common::{
+    bail,
+    config::keys,
+    log,
+    rendezvous_proto::{control_permissions, ControlPermissions},
+    tokio, ResultType,
+};
 use once_cell::sync::Lazy;
 use serde_derive::{Deserialize, Serialize};
 use sodiumoxide::crypto::{box_, sealedbox, sign};
@@ -29,6 +35,15 @@ const OPTION_NEMO_OUTBOUND_TARGETS: &str = "nemo-outbound-targets";
 // Current client policy keys that are newer than this server fork's embedded
 // hbb_common key tables, plus Nemo-only GUI/management options.
 const CLIENT_MANAGEMENT_POLICY_KEYS: &[&str] = &[
+    // TBFDesk security switches. These were missing, so the server silently DROPPED
+    // them from any pushed policy (is_management_policy_key returned false) while the
+    // client was fully wired to receive them -- nemo_management_client.rs lists all
+    // three in NEMO_MANAGEMENT_SETTINGS and even has a clear-on-omit path for them.
+    // The effect was that the fleet-wide kill switch for plaintext rendezvous could
+    // only ever be set by hand-editing each client's TOML.
+    "nemo-require-secure-rendezvous",
+    "nemo-sealed-request",
+    "nemo-auto-update",
     "view_only",
     "show_monitors_toolbar",
     "collapse_toolbar",
@@ -2847,6 +2862,69 @@ fn nemo_user_connection_rejection(token: Option<&str>, target_id: &str) -> Optio
 
 /// User-level connection check from the smuggled source field. Returns
 /// `Some((source_id, reason))` when the connection must be refused.
+/// Map a resolved session policy onto the wire ControlPermissions bitmask.
+///
+/// Encoding (must match the client's `get_control_permission`): two bits per
+/// permission at `enum_value * 2` — 1 = disable, 2 = enable, 0 = not set. "Not set"
+/// is meaningful: the client then falls back to the CONTROLLED machine's own local
+/// setting, so a policy that says nothing about a permission does not silently grant it.
+const CONTROL_PERMISSION_KEYS: &[(&str, control_permissions::Permission)] = &[
+    ("enable-keyboard", control_permissions::Permission::keyboard),
+    ("enable-remote-printer", control_permissions::Permission::remote_printer),
+    ("enable-clipboard", control_permissions::Permission::clipboard),
+    ("enable-file-transfer", control_permissions::Permission::file),
+    ("enable-audio", control_permissions::Permission::audio),
+    ("enable-camera", control_permissions::Permission::camera),
+    ("enable-terminal", control_permissions::Permission::terminal),
+    ("enable-tunnel", control_permissions::Permission::tunnel),
+    ("enable-remote-restart", control_permissions::Permission::restart),
+    ("enable-record-session", control_permissions::Permission::recording),
+    ("enable-block-input", control_permissions::Permission::block_input),
+    ("enable-privacy-mode", control_permissions::Permission::privacy_mode),
+    ("allow-remote-config-modification", control_permissions::Permission::remote_modify),
+];
+
+/// Build the per-connection ControlPermissions for the controller behind `source_field`.
+///
+/// Until now the server could not do this at all: `ControlPermissions` did not exist in
+/// the server's copy of rendezvous.proto, so the field was dropped on the wire and every
+/// connection arrived with `control_permissions: None` — i.e. the fork's per-session
+/// permission feature was inert and only the target's own local toggles applied.
+///
+/// Returns None when no logged-in user can be resolved, or when their policy says
+/// nothing about any permission. None is the correct "no opinion" answer — it leaves the
+/// controlled machine's local settings in charge rather than implicitly granting access.
+pub(crate) fn control_permissions_for(source_field: &str) -> Option<ControlPermissions> {
+    use hbb_common::protobuf::Enum;
+    let (_, _, token) = controller_source_identity(source_field)?;
+    let session = integration::session_for_token(token.as_deref()?)?;
+    if !integration::user_is_enabled(&session.username) {
+        return None;
+    }
+    let policy = integration::user_policy(&session.username);
+    let mut bits: u64 = 0;
+    for (key, permission) in CONTROL_PERMISSION_KEYS {
+        let Some(value) = policy.options.get(*key) else {
+            continue; // not mentioned -> leave the two bits at 0 (not set)
+        };
+        let index = permission.value();
+        if !(0..32).contains(&index) {
+            continue;
+        }
+        // Same truthiness the client uses for these options: "N" disables, anything
+        // else that is present enables.
+        let encoded: u64 = if value.eq_ignore_ascii_case("N") { 1 } else { 2 };
+        bits |= encoded << (index * 2) as u64;
+    }
+    if bits == 0 {
+        return None;
+    }
+    Some(ControlPermissions {
+        permissions: bits,
+        ..Default::default()
+    })
+}
+
 pub(crate) fn nemo_user_rejection_from_field(
     source_field: &str,
     target_id: &str,
