@@ -23,7 +23,7 @@ fn main() -> ResultType<()> {
         -M, --rmem=[NUMBER(default={RMEM})] 'Sets UDP recv buffer size, set system rmem_max first, e.g., sudo sysctl -w net.core.rmem_max=52428800. vi /etc/sysctl.conf, net.core.rmem_max=52428800, sudo sysctl –p'
         , --mask=[MASK] 'Determine if the connection comes from LAN, e.g. 192.168.0.0/16'
         -k, --key=[KEY] 'Only allow the client with the same key'
-        , --udp-registration=[BOOL(default=Y)] 'Accept plaintext UDP registration. UDP has no key exchange, so N is what removes the last plaintext -- set it after the fleet is on disable-udp=Y. This is the rendezvous transport only; it does not affect UDP hole punching.'
+        , --udp-registration=[BOOL(default=N)] 'Accept plaintext UDP registration. UDP has no key exchange and no device-key proof, so Y bypasses both --key-exchange and require-device-key. Default N; clients need disable-udp=Y, which is their default too. Rendezvous transport only -- it does not affect UDP hole punching.'
         , --key-exchange=[MODE(default=require)] 'Rendezvous TCP key exchange: require (default) | offer | require. `off` is a DEBUGGING option only -- it puts the rendezvous channel in the clear. Needs a server key (-k or id_ed25519).'
         , --nemo-api=[BOOL(default=N)] 'Enable Nemo management API'
         , --nemo-api-bind=[ADDR(default=127.0.0.1:21120)] 'Sets Nemo management API bind address'

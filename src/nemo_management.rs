@@ -118,6 +118,15 @@ const CLIENT_MANAGEMENT_POLICY_KEYS: &[&str] = &[
     // The effect was that the fleet-wide kill switch for plaintext rendezvous could
     // only ever be set by hand-editing each client's TOML.
     "nemo-require-secure-rendezvous",
+    // The server's own boot warning tells operators to "push disable-udp=Y to the fleet,
+    // then restart with --udp-registration=N". That rollout was UNDELIVERABLE: this
+    // server's embedded hbb_common files OPTION_DISABLE_UDP under KEYS_BUILDIN_SETTINGS,
+    // and is_management_policy_key never looks at that table -- so hbbs silently dropped
+    // `disable-udp` from every pushed policy. (The client's hbb_common has the same key
+    // under KEYS_SETTINGS; the two submodules disagree.) Naming it here is the narrow
+    // fix; widening is_management_policy_key to include KEYS_BUILDIN_SETTINGS would make
+    // ~35 unrelated built-in keys remotely settable.
+    "disable-udp",
     "nemo-sealed-request",
     "nemo-auto-update",
     "view_only",
