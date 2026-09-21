@@ -1,0 +1,54 @@
+# TBFDesk signal server (hbbs).
+#
+# The upstream rustdesk-hbbs.service in this directory is kept for reference but will
+# NOT start: it has an empty User=/Group= (systemd rejects that) and a bare
+# ExecStart=/usr/bin/hbbs with none of the TBFDesk flags. This is the unit that
+# matches TOPOLOGY-DEPLOYMENT.md, so the production configuration lives in the repo
+# instead of only in one machine's shell history.
+#
+# Before enabling:
+#   1. useradd --system --home /var/lib/rustdesk-server --shell /usr/sbin/nologin rustdesk
+#   2. install -d -o rustdesk -g rustdesk -m 0750 /var/lib/rustdesk-server /var/log/rustdesk-server
+#   3. put the admin API token in /etc/tbfdesk/hbbs.env as NEMO_API_TOKEN=... , mode 0600,
+#      owned by root:rustdesk. NEVER inline it in ExecStart -- argv is world-readable
+#      through /proc (SEC-11).
+#   4. put the server signing key at /var/lib/rustdesk-server/id_ed25519 (0600, owned by
+#      rustdesk). `-k _` means "use that file"; it is load-bearing for availability, so
+#      back it up with the device-key registry.
+[Unit]
+Description=TBFDesk signal server (hbbs)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=rustdesk
+Group=rustdesk
+WorkingDirectory=/var/lib/rustdesk-server
+EnvironmentFile=/etc/tbfdesk/hbbs.env
+# --mask decides which peers count as "same intranet"; set it to cover every internal
+# network, or cross-subnet pairs are forced to relay (DECISIONS-2026-09-21 §1).
+# --nemo-api-tls auto: the management API serves HTTPS on a routable bind by default
+# since SEC-12; `auto` makes that explicit rather than implied.
+ExecStart=/usr/bin/hbbs \
+    -r ${TBFDESK_RELAY} \
+    --mask ${TBFDESK_MASK} \
+    -k _ \
+    --nemo-api Y \
+    --nemo-api-bind 0.0.0.0:21120 \
+    --nemo-api-token ${NEMO_API_TOKEN} \
+    --nemo-api-tls auto
+Restart=always
+RestartSec=10
+LimitNOFILE=1000000
+# The process only needs its own state directory and the token file.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/rustdesk-server /var/log/rustdesk-server
+StandardOutput=append:/var/log/rustdesk-server/hbbs.log
+StandardError=append:/var/log/rustdesk-server/hbbs.error
+
+[Install]
+WantedBy=multi-user.target

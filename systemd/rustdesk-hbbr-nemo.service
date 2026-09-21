@@ -1,0 +1,32 @@
+# TBFDesk relay server (hbbr). Same preconditions as rustdesk-hbbs-nemo.service.
+#
+# hbbr needs the SAME signing key as hbbs: since the relay control-frame encryption
+# landed it offers a signed KeyExchange of its own, and a client verifies it against
+# the server key it already trusts. Point both at the same id_ed25519.
+#
+# NOTE hbbr treats any LOOPBACK connection as its command port, so a relay address of
+# 127.0.0.1 can never pair. Always give clients a routable address.
+[Unit]
+Description=TBFDesk relay server (hbbr)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=rustdesk
+Group=rustdesk
+WorkingDirectory=/var/lib/rustdesk-server
+ExecStart=/usr/bin/hbbr -k _
+Restart=always
+RestartSec=10
+LimitNOFILE=1000000
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/rustdesk-server /var/log/rustdesk-server
+StandardOutput=append:/var/log/rustdesk-server/hbbr.log
+StandardError=append:/var/log/rustdesk-server/hbbr.error
+
+[Install]
+WantedBy=multi-user.target
