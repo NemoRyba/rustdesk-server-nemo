@@ -16,7 +16,7 @@ use hbb_common::{
         register_pk_response::Result::{TOO_FREQUENT, UUID_MISMATCH},
         *,
     },
-    tcp::{listen_any, Encrypt, FramedStream, Role, SessionKey},
+    tcp::{listen_any, Encrypt, FramedStream},
     timeout,
     tokio::{
         self,
@@ -31,7 +31,7 @@ use hbb_common::{
     AddrMangle, ResultType,
 };
 use ipnetwork::Ipv4Network;
-use sodiumoxide::crypto::{box_, secretbox, sign};
+use sodiumoxide::crypto::{box_, sign};
 use std::{
     collections::HashMap,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
@@ -147,9 +147,21 @@ struct Inner {
     sk: Option<sign::SecretKey>,
 }
 
+/// H43: a live rendezvous connection we can push INTO, keyed by peer id. hbbs used
+/// to reach a peer only over UDP (`Data::Msg`), so a peer that registered over TCP or
+/// WS showed up online but could never RECEIVE a punch or relay request -- it could
+/// call out, and nothing could call it. The connection task owns its sink; this is the
+/// handle other tasks use to hand it a message to write.
+type PeerPush = tokio::sync::mpsc::UnboundedSender<RendezvousMessage>;
+
 #[derive(Clone)]
 pub struct RendezvousServer {
     tcp_punch: Arc<Mutex<HashMap<SocketAddr, Sink>>>,
+    /// Peers whose rendezvous connection is TCP/WS rather than UDP. Entries are
+    /// replaced on reconnect and swept when their receiver is gone, so a task that
+    /// exits never has to remove its own -- which would otherwise race a reconnect
+    /// that had already replaced it.
+    tcp_peers: Arc<Mutex<HashMap<String, PeerPush>>>,
     pm: PeerMap,
     tx: Sender,
     relay_servers: Arc<RelayServers>,
@@ -254,6 +266,7 @@ impl RendezvousServer {
         };
         let mut rs = Self {
             tcp_punch: Arc::new(Mutex::new(HashMap::new())),
+            tcp_peers: Arc::new(Mutex::new(HashMap::new())),
             pm,
             tx: tx.clone(),
             relay_servers: Default::default(),
@@ -564,6 +577,9 @@ impl RendezvousServer {
         addr: SocketAddr,
         key: &str,
         ws: bool,
+        // H43: the handle for pushing INTO this connection. Registered against the
+        // peer id when it registers, so hbbs can later reach a TCP/WS-only peer.
+        push_tx: &PeerPush,
     ) -> bool {
         if let Ok(msg_in) = RendezvousMessage::parse_from_bytes(bytes) {
             match msg_in.union {
@@ -667,9 +683,11 @@ impl RendezvousServer {
                                     .into();
                         }
                         rf.socket_addr = AddrMangle::encode(addr).into();
+                        let target_id = rf.id.clone();
                         msg_out.set_request_relay(rf);
                         let peer_addr = peer.read().await.socket_addr;
-                        self.tx.send(Data::Msg(msg_out.into(), peer_addr)).ok();
+                        // H43: the target may be on TCP/WS, not UDP.
+                        self.push_to_peer(&target_id, msg_out, peer_addr).await;
                         #[cfg(feature = "nemo-management-api")]
                         {
                             nemo_forwarded = true;
@@ -755,6 +773,8 @@ impl RendezvousServer {
                             }
                         }
                         log::trace!("New peer registered over tcp: {:?} {:?}", &rp.id, &addr);
+                        // H43: this connection is now how we reach this peer.
+                        self.register_peer_push(&rp.id, push_tx).await;
                         let request_pk = self.update_addr_core(&rp.id, addr).await;
                         let mut msg_out = RendezvousMessage::new();
                         msg_out.set_register_peer_response(RegisterPeerResponse {
@@ -783,6 +803,12 @@ impl RendezvousServer {
                     // so the blocked-peer, id-length, ip-blocker, uuid/pk-mismatch and
                     // rate-limit checks all still apply. A malformed request gets the same
                     // silence it gets over UDP.
+                    //
+                    // H43: register the push handle too -- a client whose key is not yet
+                    // confirmed sends only RegisterPk, so without this it would stay
+                    // unreachable until its first heartbeat.
+                    let pk_id = rk.id.clone();
+                    self.register_peer_push(&pk_id, push_tx).await;
                     if let Some(res) = self.register_pk_core(rk, addr).await {
                         let mut msg_out = RendezvousMessage::new();
                         msg_out.set_register_pk_response(RegisterPkResponse {
@@ -1053,7 +1079,7 @@ impl RendezvousServer {
         ph: PunchHoleRequest,
         key: &str,
         ws: bool,
-    ) -> ResultType<(RendezvousMessage, Option<SocketAddr>)> {
+    ) -> ResultType<(RendezvousMessage, Option<(String, SocketAddr)>)> {
         let mut ph = ph;
         if !key.is_empty() && ph.licence_key != key {
             log::warn!("Authentication failed from {} for peer {} - invalid key", addr, ph.id);
@@ -1253,7 +1279,9 @@ impl RendezvousServer {
                     ..Default::default()
                 });
             }
-            Ok((msg_out, Some(peer_addr)))
+            // H43: the id travels with the address so the caller can prefer the
+            // peer's own rendezvous connection over a UDP datagram.
+            Ok((msg_out, Some((id, peer_addr))))
         } else {
             let mut msg_out = RendezvousMessage::new();
             msg_out.set_punch_hole_response(PunchHoleResponse {
@@ -1294,6 +1322,39 @@ impl RendezvousServer {
     }
 
     #[inline]
+    /// H43: push a message TO a peer. Prefers the peer's live TCP/WS rendezvous
+    /// connection when it has one and falls back to UDP for peers that registered that
+    /// way, so both transports keep working and neither is privileged by accident.
+    async fn push_to_peer(&self, id: &str, msg: RendezvousMessage, addr: SocketAddr) {
+        let mut msg = msg;
+        if !id.is_empty() {
+            let mut map = self.tcp_peers.lock().await;
+            if let Some(tx) = map.get(id) {
+                match tx.send(msg) {
+                    Ok(()) => return,
+                    // Receiver gone: the connection closed between the lookup and now.
+                    // Drop the stale entry and let UDP have it.
+                    Err(err) => {
+                        map.remove(id);
+                        msg = err.0;
+                    }
+                }
+            }
+        }
+        self.tx.send(Data::Msg(msg.into(), addr)).ok();
+    }
+
+    /// Remember that `id` is reachable on this connection. Sweeping here rather than on
+    /// task exit keeps a closing task from removing an entry a reconnect just replaced.
+    async fn register_peer_push(&self, id: &str, tx: &PeerPush) {
+        if id.is_empty() {
+            return;
+        }
+        let mut map = self.tcp_peers.lock().await;
+        map.retain(|_, t| !t.is_closed());
+        map.insert(id.to_owned(), tx.clone());
+    }
+
     async fn send_to_tcp(&mut self, msg: RendezvousMessage, addr: SocketAddr) {
         let mut tcp = self.tcp_punch.lock().await.remove(&try_into_v4(addr));
         tokio::spawn(async move {
@@ -1344,9 +1405,9 @@ impl RendezvousServer {
         key: &str,
         ws: bool,
     ) -> ResultType<()> {
-        let (msg, to_addr) = self.handle_punch_hole_request(addr, ph, key, ws).await?;
-        if let Some(addr) = to_addr {
-            self.tx.send(Data::Msg(msg.into(), addr))?;
+        let (msg, to_peer) = self.handle_punch_hole_request(addr, ph, key, ws).await?;
+        if let Some((id, peer_addr)) = to_peer {
+            self.push_to_peer(&id, msg, peer_addr).await;
         } else {
             self.send_to_tcp_sync(msg, addr).await?;
         }
@@ -1360,14 +1421,13 @@ impl RendezvousServer {
         ph: PunchHoleRequest,
         key: &str,
     ) -> ResultType<()> {
-        let (msg, to_addr) = self.handle_punch_hole_request(addr, ph, key, false).await?;
-        self.tx.send(Data::Msg(
-            msg.into(),
-            match to_addr {
-                Some(addr) => addr,
-                None => addr,
-            },
-        ))?;
+        let (msg, to_peer) = self.handle_punch_hole_request(addr, ph, key, false).await?;
+        match to_peer {
+            // Forwarding to the TARGET: it may be on TCP/WS rather than UDP.
+            Some((id, peer_addr)) => self.push_to_peer(&id, msg, peer_addr).await,
+            // Answering the REQUESTER, which reached us over UDP by definition.
+            None => self.tx.send(Data::Msg(msg.into(), addr))?,
+        }
         Ok(())
     }
 
@@ -1643,6 +1703,10 @@ impl RendezvousServer {
         key: &str,
         ws: bool,
     ) -> ResultType<()> {
+        // H43: one push channel per rendezvous connection. The connection task owns its
+        // sink, so other tasks hand it a message instead of sharing the sink -- which
+        // would be unsound anyway, since handle_tcp can move the sink into tcp_punch.
+        let (push_tx, mut push_rx) = tokio::sync::mpsc::unbounded_channel::<RendezvousMessage>();
         let mut sink;
         if ws {
             use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
@@ -1664,10 +1728,22 @@ impl RendezvousServer {
             let ws_stream = tokio_tungstenite::accept_hdr_async(stream, callback).await?;
             let (a, mut b) = ws_stream.split();
             sink = Some(Sink::Ws(a));
-            while let Ok(Some(Ok(msg))) = timeout(30_000, b.next()).await {
-                if let tungstenite::Message::Binary(bytes) = msg {
-                    if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
-                        break;
+            loop {
+                tokio::select! {
+                    res = timeout(30_000, b.next()) => {
+                        let Ok(Some(Ok(msg))) = res else { break };
+                        if let tungstenite::Message::Binary(bytes) = msg {
+                            if !self.handle_tcp(&bytes, &mut sink, addr, key, ws, &push_tx).await {
+                                break;
+                            }
+                        }
+                    }
+                    // H43: something for this peer, written on its own connection.
+                    Some(msg) = push_rx.recv() => {
+                        if sink.is_none() {
+                            log::warn!("dropping a push to {:?}: this connection has no sink", addr);
+                        }
+                        Self::send_to_sink(&mut sink, msg).await;
                     }
                 }
             }
@@ -1755,9 +1831,25 @@ impl RendezvousServer {
             loop {
                 let mut bytes = match pending.take() {
                     Some(bytes) => bytes,
-                    None => match timeout(30_000, b.next()).await {
-                        Ok(Some(Ok(bytes))) => bytes,
-                        _ => break,
+                    None => tokio::select! {
+                        res = timeout(30_000, b.next()) => match res {
+                            Ok(Some(Ok(bytes))) => bytes,
+                            _ => break,
+                        },
+                        // H43: something hbbs wants to send TO this peer. It registered
+                        // over TCP, so this connection is the only way to reach it -- a
+                        // UDP datagram to its registered address would go nowhere,
+                        // because that address IS this TCP socket's.
+                        Some(msg) = push_rx.recv() => {
+                            if sink.is_none() {
+                                log::warn!(
+                                    "dropping a push to {:?}: this connection has no sink",
+                                    addr
+                                );
+                            }
+                            Self::send_to_sink(&mut sink, msg).await;
+                            continue;
+                        }
                     },
                 };
                 if let Some(rx_enc) = rx_enc.as_mut() {
@@ -1766,7 +1858,7 @@ impl RendezvousServer {
                         break;
                     }
                 }
-                if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
+                if !self.handle_tcp(&bytes, &mut sink, addr, key, ws, &push_tx).await {
                     break;
                 }
             }
@@ -1986,13 +2078,16 @@ mod tests {
     //! Layer 2 (TDD): protocol-handler tests for the direct-vs-relay decision
     //! core, `handle_punch_hole_request`. These run fully in-process — no
     //! sockets — against a temp-DB `PeerMap`, and assert on the returned
-    //! `(RendezvousMessage, Option<SocketAddr>)`.
+    //! `(RendezvousMessage, Option<(String, SocketAddr)>)`.
     //!
     //! Peers are pinned with explicit status (`Some(1)`/`Some(0)`) so the
     //! outcome does not depend on the process-global `COMPANY_ONLY`; the one
     //! case that inherently does (an unregistered target) sets it explicitly.
     //! Each test uses its own temp sqlite file under the gitignored `target/`.
     use super::*;
+    // Test-only: the key-exchange test builds session keys and ciphers by hand.
+    use hbb_common::tcp::{Role, SessionKey};
+    use sodiumoxide::crypto::secretbox;
     use std::sync::atomic::AtomicU32;
 
     static DB_COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -2026,6 +2121,7 @@ mod tests {
         let (tx, _rx) = mpsc::unbounded_channel::<Data>();
         let mut rs = RendezvousServer {
             tcp_punch: Arc::new(Mutex::new(HashMap::new())),
+            tcp_peers: Arc::new(Mutex::new(HashMap::new())),
             pm,
             tx,
             relay_servers: Default::default(),

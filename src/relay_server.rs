@@ -20,7 +20,7 @@ use hbb_common::{
     ResultType,
 };
 use once_cell::sync::Lazy;
-use sodiumoxide::crypto::{box_, secretbox, sign};
+use sodiumoxide::crypto::{box_, sign};
 use std::{
     collections::{HashMap, HashSet},
     io::prelude::*,
