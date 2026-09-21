@@ -117,6 +117,36 @@ async fn main() -> ResultType<()> {
     }
     drop(conn);
 
+    // 1b. PUNCH mode: send a PunchHoleRequest instead, so the server pushes to the
+    // target and the target answers on a FRESH rendezvous socket (PunchHoleSent, or
+    // LocalAddr when hbbs decides the two are on the same intranet). That responder
+    // leg is what the H33 responder fix covers.
+    if std::env::var("PUNCH").ok().as_deref() == Some("1") {
+        let mut conn = connect_secure(addr, &rs_pk).await?;
+        let marker = format!(
+            "1.4.6 nemo-source-v1:{}:{}",
+            my_id,
+            base64::encode(UUID, base64::Variant::Original)
+        );
+        let mut out = RendezvousMessage::new();
+        out.set_punch_hole_request(PunchHoleRequest {
+            id: target.clone(),
+            licence_key: std::env::var("SERVER_KEY").unwrap_or_default(),
+            version: marker,
+            ..Default::default()
+        });
+        println!("sending PunchHoleRequest for {}", target);
+        conn.send(&out).await?;
+        match conn.next_timeout(8_000).await {
+            Some(Ok(b)) => {
+                let m = RendezvousMessage::parse_from_bytes(&b)?;
+                println!("RESULT: {:?}", m.union);
+            }
+            _ => println!("RESULT: no response"),
+        }
+        return Ok(());
+    }
+
     // 2. A BARE RequestRelay. No PunchHoleRequest before it -- that is the point.
     let mut conn = connect_secure(addr, &rs_pk).await?;
     let marker = if token.is_empty() {
