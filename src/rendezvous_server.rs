@@ -1873,10 +1873,37 @@ impl RendezvousServer {
                     // client that never learned this handshake replies with its real
                     // first request (or with nothing at all).
                     if let Ok(Some(Ok(bytes))) = timeout(KEY_EXCHANGE_TIMEOUT, b.next()).await {
-                        match RendezvousMessage::parse_from_bytes(&bytes)
+                        let union = RendezvousMessage::parse_from_bytes(&bytes)
                             .ok()
-                            .and_then(|msg_in| msg_in.union)
-                        {
+                            .and_then(|msg_in| msg_in.union);
+                        // T23: a NemoSealedAuth is a NemoClientAuth inside an envelope
+                        // sealed to our long-term key. Open it HERE, so the existing arm
+                        // below handles both shapes identically and the device-key
+                        // verification is written exactly once. A sealed frame that does
+                        // not open is refused outright: only a client holding our pinned
+                        // public key could have produced one, so a failure here is
+                        // tampering or the wrong server -- never a legacy client, which
+                        // sends the flat frame instead.
+                        #[cfg(feature = "nemo-management-api")]
+                        let union = match union {
+                            Some(rendezvous_message::Union::NemoSealedAuth(sealed)) => {
+                                match Self::nemo_open_sealed_auth(&sealed.sealed, sk) {
+                                    Ok(inner) => {
+                                        Some(rendezvous_message::Union::NemoClientAuth(inner))
+                                    }
+                                    Err(err) => {
+                                        log::warn!(
+                                            "Refusing {:?}: sealed device-key frame does not open: {}",
+                                            addr,
+                                            err
+                                        );
+                                        return Ok(());
+                                    }
+                                }
+                            }
+                            other => other,
+                        };
+                        match union {
                             Some(rendezvous_message::Union::KeyExchange(ex)) => {
                                 match Self::key_exchange_open(&ex, &our_sk_b) {
                                     Ok(sym) => {
@@ -2081,6 +2108,26 @@ impl RendezvousServer {
     /// The payload the signature covers is built by the shared helper so the two ends
     /// cannot drift -- the SEC-14 argument-order bug is the standing reminder.
     #[cfg(feature = "nemo-management-api")]
+    // T23: open a NemoSealedAuth envelope. The client sealed the serialized inner
+    // NemoClientAuth to our long-term Ed25519 key converted to Curve25519, so device_pub
+    // and peer_id no longer cross the wire in the clear. The SESSION key inside is still
+    // sealed to the per-connection ephemeral: this envelope adds confidentiality for the
+    // identity fields and changes nothing about forward secrecy or the signature payload.
+    #[cfg(feature = "nemo-management-api")]
+    fn nemo_open_sealed_auth(sealed: &[u8], sk: &sign::SecretKey) -> ResultType<NemoClientAuth> {
+        use sodiumoxide::crypto::sealedbox;
+        let Ok(curve_sk) = sign::to_curve25519_sk(sk) else {
+            bail!("server secret key does not convert to curve25519");
+        };
+        let Ok(curve_pk) = sign::to_curve25519_pk(&sk.public_key()) else {
+            bail!("server public key does not convert to curve25519");
+        };
+        let Ok(bytes) = sealedbox::open(sealed, &curve_pk, &curve_sk) else {
+            bail!("envelope is not sealed to this server's key");
+        };
+        Ok(NemoClientAuth::parse_from_bytes(&bytes)?)
+    }
+
     fn nemo_client_auth_open(
         auth: &NemoClientAuth,
         server_eph_pk: &box_::PublicKey,
@@ -2410,6 +2457,42 @@ mod tests {
             device_pub_b64: "dGVzdC1kZXZpY2Uta2V5".to_owned(),
             peer_id: TEST_CONTROLLER.to_owned(),
         }
+    }
+
+    // T23: the sealed-auth envelope. Three properties, pinned: a frame sealed to THIS
+    // server's key opens to the exact inner message; one sealed to a different key is
+    // refused; and garbage is refused rather than parsed. The session key inside stays
+    // sealed to the per-connection ephemeral, which is why nemo_client_auth_open is
+    // untouched by this change -- the envelope only hides the identity fields.
+    #[cfg(feature = "nemo-management-api")]
+    #[test]
+    fn sealed_auth_opens_only_for_this_server() {
+        use sodiumoxide::crypto::sealedbox;
+        let (server_pk, server_sk) = sign::gen_keypair();
+        let inner = NemoClientAuth {
+            client_box_pk: Bytes::from_static(b"client-box-pk"),
+            sealed_key: Bytes::from_static(b"sealed-session-key"),
+            device_pub: Bytes::from_static(b"device-pub"),
+            peer_id: "ws-01".to_owned(),
+            sig: Bytes::from_static(b"sig"),
+            ..Default::default()
+        };
+        let plain = inner.write_to_bytes().unwrap();
+        let curve_pk = sign::to_curve25519_pk(&server_pk).unwrap();
+        let sealed = sealedbox::seal(&plain, &curve_pk);
+
+        let opened = RendezvousServer::nemo_open_sealed_auth(&sealed, &server_sk).unwrap();
+        assert_eq!(opened, inner, "the envelope must open to the exact inner message");
+
+        let (_other_pk, other_sk) = sign::gen_keypair();
+        assert!(
+            RendezvousServer::nemo_open_sealed_auth(&sealed, &other_sk).is_err(),
+            "a frame sealed to another server's key must be refused"
+        );
+        assert!(
+            RendezvousServer::nemo_open_sealed_auth(b"not a sealedbox", &server_sk).is_err(),
+            "garbage must be refused, not parsed"
+        );
     }
 
     fn punch_request(target_id: &str) -> PunchHoleRequest {
