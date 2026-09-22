@@ -740,6 +740,9 @@ impl RendezvousServer {
                         crate::nemo_management::nemo_user_rejection_from_field(
                             &rf.licence_key,
                             &nemo_id,
+                            // TASK #19: the token in the marker is bound to the device
+                            // key this connection proved at the handshake.
+                            authed.map(|who| who.device_pub_b64.as_str()),
                         )
                     {
                         crate::nemo_management::record_policy_rejection(
@@ -1258,7 +1261,12 @@ impl RendezvousServer {
         // smuggled in the source field).
         #[cfg(feature = "nemo-management-api")]
         if let Some((controller_id, reason)) =
-            crate::nemo_management::nemo_user_rejection_from_field(&ph.version, &id)
+            crate::nemo_management::nemo_user_rejection_from_field(
+                &ph.version,
+                &id,
+                // TASK #19: see the RequestRelay arm.
+                authed.map(|who| who.device_pub_b64.as_str()),
+            )
         {
             crate::nemo_management::record_policy_rejection(&controller_id, addr, &reason).await;
             let mut msg_out = RendezvousMessage::new();

@@ -1601,7 +1601,16 @@ async fn api_login(
     // cleartext line above, so an operator can find the stragglers on a fleet whose
     // stored require_device_key is still false (R3: upgrades keep the stored value).
     let client_id = req.id.trim();
-    if !login_device_key_ok(&opened, client_id) {
+    let device_key_ok = login_device_key_ok(&opened, client_id);
+    // TASK #19: the session token is bound to the key that PROVED this login, never
+    // to the raw field (with require_device_key off an unverified key must not be
+    // baked into the session). Empty = unbound, reachable only through the gate below.
+    let proven_device_key = if device_key_ok {
+        opened.device_key_pub.clone()
+    } else {
+        String::new()
+    };
+    if !device_key_ok {
         log::warn!(
             "Nemo login WITHOUT a valid pinned device key: user='{}' from client id={} uuid={} (proof {}) - provision this machine before enabling require-device-key",
             opened.username,
@@ -1661,6 +1670,7 @@ async fn api_login(
                 user.username.clone(),
                 user.display_name.clone(),
                 user.email.clone(),
+                proven_device_key,
             );
             log::info!(
                 "Nemo login OK: user='{}' name='{}' admin={} from client id={} uuid={}",
@@ -3024,12 +3034,30 @@ fn controller_source_identity(source_field: &str) -> Option<(String, Vec<u8>, Op
 
 // Per-user connection ACL + require-login, enforced at the punch. `token` is the
 // controller's logged-in user session token (if any).
-fn nemo_user_connection_rejection(token: Option<&str>, target_id: &str) -> Option<String> {
+fn nemo_user_connection_rejection(
+    token: Option<&str>,
+    authed_device_pub: Option<&str>,
+    target_id: &str,
+) -> Option<String> {
     let user = token
         .and_then(integration::session_for_token)
         .filter(|s| integration::user_is_enabled(&s.username));
     match user {
         Some(session) => {
+            // TASK #19: the token is bound to the key that proved its login; only a
+            // connection that proved THAT key (AuthedDevice) may spend it. No proof =
+            // refused (fail closed). Unbound sessions: require_device_key off only.
+            if !session.device_key_pub.is_empty()
+                && authed_device_pub != Some(session.device_key_pub.as_str())
+            {
+                log::warn!(
+                    "user '{}' spent a token bound to key {}... on a connection proving {}",
+                    session.username,
+                    &session.device_key_pub[..session.device_key_pub.len().min(12)],
+                    if authed_device_pub.is_some() { "another key" } else { "no key" },
+                );
+                return Some("this sign-in is bound to another computer; sign in again from this one".to_owned());
+            }
             let (is_admin, allowed) = integration::effective_permission(&session.username);
             if integration::user_allowed_target(is_admin, &allowed, target_id) {
                 None
@@ -3115,13 +3143,15 @@ pub(crate) fn control_permissions_for(source_field: &str) -> Option<ControlPermi
 pub(crate) fn nemo_user_rejection_from_field(
     source_field: &str,
     target_id: &str,
+    // TASK #19: the device key this rendezvous connection proved, if any.
+    authed_device_pub: Option<&str>,
 ) -> Option<(String, String)> {
     // Parse best-effort: a controller with no source marker still gets the
     // require-login gate (token = None) so it cannot bypass mandatory login.
     let parsed = controller_source_identity(source_field);
     let token = parsed.as_ref().and_then(|(_, _, t)| t.clone());
     let source_id = parsed.map(|(id, _, _)| id).unwrap_or_default();
-    let reason = nemo_user_connection_rejection(token.as_deref(), target_id)?;
+    let reason = nemo_user_connection_rejection(token.as_deref(), authed_device_pub, target_id)?;
     Some((source_id, reason))
 }
 
@@ -4529,10 +4559,10 @@ mod tests {
     #[test]
     fn relay_gate_treats_a_missing_marker_and_a_forged_token_alike() {
         assert!(controller_source_identity("1.4.6").is_none());
-        assert!(nemo_user_rejection_from_field("1.4.6", "target").is_none() == !integration::require_login());
+        assert!(nemo_user_rejection_from_field("1.4.6", "target", None).is_none() == !integration::require_login());
         assert_eq!(
-            nemo_user_connection_rejection(None, "target"),
-            nemo_user_connection_rejection(Some("not-a-real-session-token"), "target"),
+            nemo_user_connection_rejection(None, None, "target"),
+            nemo_user_connection_rejection(Some("not-a-real-session-token"), None, "target"),
         );
     }
 

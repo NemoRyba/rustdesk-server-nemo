@@ -956,6 +956,14 @@ pub struct Session {
     pub username: String,
     pub display_name: String,
     pub email: String,
+    /// TASK #19: base64 of the pinned Ed25519 device key that proved the login this
+    /// token was issued for; the punch/relay user gate refuses the token from any
+    /// connection that did not prove exactly this key. Empty only when the login
+    /// carried no valid proof (possible solely while require_device_key is off).
+    /// Deliberately NO serde default: a sessions file from before this field fails
+    /// to parse and is dropped whole (everyone signs in again) instead of loading
+    /// its tokens as unbound.
+    pub device_key_pub: String,
     pub expires_at: u64,
 }
 
@@ -996,12 +1004,18 @@ fn persist_sessions(sessions: &HashMap<String, Session>) {
     }
 }
 
-pub fn create_session(username: String, display_name: String, email: String) -> String {
+pub fn create_session(
+    username: String,
+    display_name: String,
+    email: String,
+    device_key_pub: String,
+) -> String {
     let token = uuid::Uuid::new_v4().simple().to_string();
     let session = Session {
         username,
         display_name,
         email,
+        device_key_pub,
         expires_at: now_secs() + SESSION_TTL_SECS,
     };
     let mut sessions = SESSIONS.lock().unwrap();
