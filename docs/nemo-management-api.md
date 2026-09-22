@@ -69,7 +69,10 @@ git revert <nemo-management-api-commit>
 ## Endpoints
 
 - `GET /nemo/admin`
-- `GET /nemo/api/health`
+- `GET /nemo/api/health` — admin token required. Despite the name this is not a
+  liveness probe: it returns the server's security policy (same body as
+  `GET /nemo/api/policy`). There is no unauthenticated probe endpoint; use the
+  process supervisor (the container image health-checks hbbs/hbbr with `s6-svstat`).
 - `GET /nemo/api/peers?limit=100&offset=0`
 - `GET /nemo/api/peers/{id}`
 - `POST /nemo/api/peers/{id}/block`

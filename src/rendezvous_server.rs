@@ -85,8 +85,10 @@ static KEY_EXCHANGE_MODE: AtomicU8 = AtomicU8::new(KeyExchangeMode::Off as u8);
 // that does not speak this handshake; do not hold the task for the full read window.
 const KEY_EXCHANGE_TIMEOUT: u64 = 3_000;
 
-/// C: how this server treats the rendezvous key exchange. `Off` is the default and
-/// sends nothing at all, i.e. byte-for-byte today's stream for a deployed fleet.
+/// C: how this server treats the rendezvous key exchange. `Require` is the default
+/// (main.rs). `Off` sends nothing at all -- and because the handshake block in
+/// `handle_listener_inner` is also where the device-key proof is read, `Off` leaves
+/// Layer 1 unenforced on this transport, not just unencrypted. Debugging only.
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum KeyExchangeMode {
@@ -100,9 +102,18 @@ enum KeyExchangeMode {
 impl KeyExchangeMode {
     fn parse(v: &str) -> ResultType<Self> {
         match v.trim().to_lowercase().as_str() {
-            "" | "off" => Ok(Self::Off),
+            "off" => Ok(Self::Off),
             "offer" => Ok(Self::Offer),
             "require" => Ok(Self::Require),
+            // An EMPTY value is the same silent downgrade as a typo, and it is the one
+            // an operator hits by accident: `--key-exchange ""`, an unset ${VAR} in a
+            // systemd ExecStart, or a blank entry in .env / --config all arrive here as
+            // "". get_arg_or applies the compiled-in `require` only when the flag is
+            // ABSENT, so "" always means someone passed the flag and meant something.
+            "" => bail!(
+                "--key-exchange was given an empty value, expected off|offer|require \
+                 (omit the flag for the default, require)"
+            ),
             // A typo must not silently downgrade a security flag to off; an
             // operator only ever sees this by having set the flag explicitly.
             other => bail!(
@@ -243,6 +254,21 @@ impl RendezvousServer {
         }
         KEY_EXCHANGE_MODE.store(key_exchange as u8, Ordering::SeqCst);
         log::info!("key-exchange={}", key_exchange.as_str());
+        // `off` skips the whole handshake block in handle_listener_inner -- which is also
+        // where the NemoClientAuth arm and the require-device-key refusal live -- so it
+        // does not merely drop encryption, it drops Layer 1 on this transport while the
+        // stored require_device_key still reads `true` in the config and the admin API.
+        // Warn like udp-registration=Y below: the plaintext path must be impossible to
+        // miss. This also covers the degrade-to-off path above.
+        if key_exchange == KeyExchangeMode::Off {
+            log::warn!(
+                "key-exchange=off: the rendezvous TCP channel is PLAINTEXT and carries no \
+                 device-key proof, so require-device-key is NOT enforced on it -- anything \
+                 that connects may register, punch and relay unauthenticated. TBFDesk \
+                 clients refuse an unsecured rendezvous, so this also takes the fleet \
+                 offline. Debugging only; the default is require."
+            );
+        }
         let udp_registration = get_arg_or("udp-registration", "N".to_owned())
             .to_uppercase()
             .starts_with('Y');
@@ -569,8 +595,11 @@ impl RendezvousServer {
                     // Upstream security port (80d3a50, rustdesk-server #670): UDP
                     // PunchHoleRequest is intentionally unsupported to avoid UDP
                     // reflection/amplification (a spoofed-source packet made hbbs emit a
-                    // response to a victim). Supported clients punch over TCP/WS, where our
-                    // Nemo policy/recording hooks (handle_udp_punch_hole_request) still run.
+                    // response to a victim). Supported clients punch over the TCP
+                    // rendezvous, where `handle_tcp_punch_hole_request` ->
+                    // `handle_punch_hole_request` runs the Nemo policy/recording hooks --
+                    // and where the device-key proof exists to bind the controller to
+                    // its id (H44), which is exactly what a UDP datagram cannot carry.
                 }
                 Some(rendezvous_message::Union::PunchHoleSent(_phs)) => {
                     // Upstream security port (109d9a2): UDP PunchHoleSent intentionally
@@ -640,7 +669,9 @@ impl RendezvousServer {
                     if let Some(sink) = sink.take() {
                         self.tcp_punch.lock().await.insert(try_into_v4(addr), sink);
                     }
-                    allow_err!(self.handle_tcp_punch_hole_request(addr, ph, key, ws).await);
+                    allow_err!(self
+                        .handle_tcp_punch_hole_request(addr, ph, key, ws, authed)
+                        .await);
                     return true;
                 }
                 Some(rendezvous_message::Union::RequestRelay(mut rf)) => {
@@ -675,6 +706,11 @@ impl RendezvousServer {
                         &self.pm,
                         &rf.licence_key,
                         &nemo_id,
+                        // H44: the identity the gates key off now comes from the device
+                        // key this connection PROVED, not from the unsigned marker the
+                        // client wrote into licence_key. A marker naming anyone else is
+                        // refused, and no marker at all no longer means "no gates".
+                        authed.map(|who| who.peer_id.as_str()),
                     )
                     .await
                     {
@@ -1160,6 +1196,11 @@ impl RendezvousServer {
         ph: PunchHoleRequest,
         key: &str,
         ws: bool,
+        // H44: who this rendezvous connection proved to be with its pinned device key.
+        // The controller gates below key off THIS, not off the unsigned source marker
+        // in `ph.version`.
+        #[cfg_attr(not(feature = "nemo-management-api"), allow(unused_variables))]
+        authed: Option<&AuthedDevice>,
     ) -> ResultType<(RendezvousMessage, Option<(String, SocketAddr)>)> {
         let mut ph = ph;
         if !key.is_empty() && ph.licence_key != key {
@@ -1198,6 +1239,9 @@ impl RendezvousServer {
             &self.pm,
             &ph.version,
             &id,
+            // H44: see the RequestRelay arm. The marker in `ph.version` is a hint now,
+            // not the identity.
+            authed.map(|who| who.peer_id.as_str()),
         )
         .await
         {
@@ -1485,8 +1529,11 @@ impl RendezvousServer {
         ph: PunchHoleRequest,
         key: &str,
         ws: bool,
+        authed: Option<&AuthedDevice>,
     ) -> ResultType<()> {
-        let (msg, to_peer) = self.handle_punch_hole_request(addr, ph, key, ws).await?;
+        let (msg, to_peer) = self
+            .handle_punch_hole_request(addr, ph, key, ws, authed)
+            .await?;
         if let Some((id, peer_addr)) = to_peer {
             self.push_to_peer(&id, msg, peer_addr).await;
         } else {
@@ -1495,22 +1542,12 @@ impl RendezvousServer {
         Ok(())
     }
 
-    #[inline]
-    async fn handle_udp_punch_hole_request(
-        &mut self,
-        addr: SocketAddr,
-        ph: PunchHoleRequest,
-        key: &str,
-    ) -> ResultType<()> {
-        let (msg, to_peer) = self.handle_punch_hole_request(addr, ph, key, false).await?;
-        match to_peer {
-            // Forwarding to the TARGET: it may be on TCP/WS rather than UDP.
-            Some((id, peer_addr)) => self.push_to_peer(&id, msg, peer_addr).await,
-            // Answering the REQUESTER, which reached us over UDP by definition.
-            None => self.tx.send(Data::Msg(msg.into(), addr))?,
-        }
-        Ok(())
-    }
+    // H44: `handle_udp_punch_hole_request` used to live here. It had NO callers -- the
+    // UDP PunchHoleRequest arm has been a deliberate no-op since the upstream
+    // reflection/amplification fix (80d3a50) -- and it was the one route into
+    // `handle_punch_hole_request` that carries no device-key proof to bind the
+    // controller to. Deleted rather than wired up with `authed: None`: an unreachable
+    // unauthenticated punch path is a landmine for whoever re-enables UDP next.
 
     async fn check_ip_blocker(&self, ip: &str, id: &str) -> bool {
         let mut lock = IP_BLOCKER.lock().await;
@@ -1814,8 +1851,10 @@ impl RendezvousServer {
             let (a, mut b) = Framed::new(stream, BytesCodec::new()).split();
             sink = Some(Sink::TcpStream(a, None));
             // C (--key-exchange): offer the rendezvous handshake before the read loop
-            // takes over the stream. `off` sends nothing and leaves both `rx_enc` and
-            // `pending` None, so the loop below is byte-for-byte today's behaviour.
+            // takes over the stream. `off` sends nothing and leaves `rx_enc`, `pending`
+            // AND `authed` None -- and since the NemoClientAuth arm and the
+            // require-device-key refusal both live inside this block, `off` disables
+            // Layer 1 on this transport as well as the encryption. Debugging only.
             let mode = key_exchange_mode();
             // Recv half of the connection cipher; the send half rides with the sink.
             let mut rx_enc: Option<Encrypt> = None;
@@ -2340,6 +2379,39 @@ mod tests {
         }
     }
 
+    // H44: a controller that proved its device key, which is what every client does at
+    // shipped defaults. Before H44 these tests passed `None` here and the gates were
+    // skipped entirely -- that was the bypass, so the tests have to model the real thing.
+    const TEST_CONTROLLER: &str = "tech-01";
+
+    /// `register` above only touches the in-memory PeerMap, but the controller gate reads
+    /// the DATABASE (`get_registered` -> `get_registered_peer`), so a controller has to be
+    /// written through `update_pk` to exist as far as the gate is concerned.
+    async fn register_controller(pm: &mut PeerMap, addr: &str) {
+        let peer = pm.get_or(TEST_CONTROLLER).await;
+        pm.update_pk(
+            TEST_CONTROLLER.to_owned(),
+            peer,
+            addr.parse().expect("valid socket addr"),
+            Bytes::from_static(b"tech-uuid"),
+            Bytes::from_static(b"tech-pk"),
+            addr.split(':').next().unwrap_or_default().to_owned(),
+        )
+        .await;
+        // update_pk inserts the row with status 0, which the controller gate reads as
+        // BLOCKED. A real controller is an approved peer, so mark it so.
+        pm.set_peer_status(TEST_CONTROLLER, Some(1), None)
+            .await
+            .expect("set controller status");
+    }
+
+    fn authed_controller() -> AuthedDevice {
+        AuthedDevice {
+            device_pub_b64: "dGVzdC1kZXZpY2Uta2V5".to_owned(),
+            peer_id: TEST_CONTROLLER.to_owned(),
+        }
+    }
+
     fn punch_request(target_id: &str) -> PunchHoleRequest {
         PunchHoleRequest {
             id: target_id.to_owned(),
@@ -2605,11 +2677,13 @@ mod tests {
         assert!(err.contains("not pinned"), "{}", err);
     }
 
-    /// C: the flag parser. `off` is the default and every unknown value is refused at
-    /// boot rather than silently downgraded.
+    /// C: the flag parser. `require` is the default (main.rs), and every value that is
+    /// not one of the three documented modes -- including an EMPTY one -- is refused at
+    /// boot rather than silently downgraded to `off`.
     #[test]
     fn key_exchange_mode_parses_the_three_documented_values() {
-        assert_eq!(KeyExchangeMode::parse("").unwrap(), KeyExchangeMode::Off);
+        assert!(KeyExchangeMode::parse("").is_err());
+        assert!(KeyExchangeMode::parse("   ").is_err());
         assert_eq!(KeyExchangeMode::parse("off").unwrap(), KeyExchangeMode::Off);
         assert_eq!(
             KeyExchangeMode::parse("Offer").unwrap(),
@@ -2629,12 +2703,15 @@ mod tests {
     #[tokio::main(flavor = "current_thread")]
     async fn run_punch_invalid_key_returns_license_mismatch() {
         let db = temp_db();
-        let pm = PeerMap::new_for_test(&db.0).await.unwrap();
+        let mut pm = PeerMap::new_for_test(&db.0).await.unwrap();
+        // H44: the controller is a registered peer too -- hbbs refuses a punch from one
+        // that is not, so a test that does not register it is testing nothing.
+        register_controller(&mut pm, "203.0.113.7:55000").await;
         let mut rs = test_server(pm, "192.168.0.0/16");
         let mut ph = punch_request("ws-01");
         ph.licence_key = "wrong-key".to_owned();
         let (msg, forwarded) = rs
-            .handle_punch_hole_request("203.0.113.7:55000".parse().unwrap(), ph, "server-key", false)
+            .handle_punch_hole_request("203.0.113.7:55000".parse().unwrap(), ph, "server-key", false, Some(&authed_controller()))
             .await
             .unwrap();
         assert!(forwarded.is_none());
@@ -2652,10 +2729,13 @@ mod tests {
     async fn run_punch_unknown_peer_returns_id_not_exist() {
         crate::nemo_management::set_company_only_for_test(false);
         let db = temp_db();
-        let pm = PeerMap::new_for_test(&db.0).await.unwrap();
+        let mut pm = PeerMap::new_for_test(&db.0).await.unwrap();
+        // H44: the controller is a registered peer too -- hbbs refuses a punch from one
+        // that is not, so a test that does not register it is testing nothing.
+        register_controller(&mut pm, "203.0.113.7:55000").await;
         let mut rs = test_server(pm, "192.168.0.0/16");
         let (msg, forwarded) = rs
-            .handle_punch_hole_request("203.0.113.7:55000".parse().unwrap(), punch_request("ghost"), "", false)
+            .handle_punch_hole_request("203.0.113.7:55000".parse().unwrap(), punch_request("ghost"), "", false, Some(&authed_controller()))
             .await
             .unwrap();
         assert!(forwarded.is_none());
@@ -2672,12 +2752,15 @@ mod tests {
     #[tokio::main(flavor = "current_thread")]
     async fn run_punch_stale_peer_returns_offline() {
         let db = temp_db();
-        let pm = PeerMap::new_for_test(&db.0).await.unwrap();
+        let mut pm = PeerMap::new_for_test(&db.0).await.unwrap();
         // Allowed (status=1) but registration is stale -> OFFLINE with no reason.
         register(&pm, "ws-01", "198.51.100.9:41000", Some(1), false).await;
+        // H44: the controller is a registered peer too -- hbbs refuses a punch from one
+        // that is not, so a test that does not register it is testing nothing.
+        register_controller(&mut pm, "203.0.113.7:55000").await;
         let mut rs = test_server(pm, "192.168.0.0/16");
         let (msg, forwarded) = rs
-            .handle_punch_hole_request("203.0.113.7:55000".parse().unwrap(), punch_request("ws-01"), "", false)
+            .handle_punch_hole_request("203.0.113.7:55000".parse().unwrap(), punch_request("ws-01"), "", false, Some(&authed_controller()))
             .await
             .unwrap();
         assert!(forwarded.is_none());
@@ -2693,11 +2776,14 @@ mod tests {
     #[tokio::main(flavor = "current_thread")]
     async fn run_punch_blocked_peer_returns_offline_with_reason() {
         let db = temp_db();
-        let pm = PeerMap::new_for_test(&db.0).await.unwrap();
+        let mut pm = PeerMap::new_for_test(&db.0).await.unwrap();
         register(&pm, "ws-01", "198.51.100.9:41000", Some(0), true).await;
+        // H44: the controller is a registered peer too -- hbbs refuses a punch from one
+        // that is not, so a test that does not register it is testing nothing.
+        register_controller(&mut pm, "203.0.113.7:55000").await;
         let mut rs = test_server(pm, "192.168.0.0/16");
         let (msg, forwarded) = rs
-            .handle_punch_hole_request("203.0.113.7:55000".parse().unwrap(), punch_request("ws-01"), "", false)
+            .handle_punch_hole_request("203.0.113.7:55000".parse().unwrap(), punch_request("ws-01"), "", false, Some(&authed_controller()))
             .await
             .unwrap();
         assert!(forwarded.is_none());
@@ -2714,12 +2800,15 @@ mod tests {
     async fn run_punch_wan_to_wan_passes_nat_type_through() {
         ALWAYS_USE_RELAY.store(false, Ordering::SeqCst);
         let db = temp_db();
-        let pm = PeerMap::new_for_test(&db.0).await.unwrap();
+        let mut pm = PeerMap::new_for_test(&db.0).await.unwrap();
         // Both endpoints are public (outside the LAN mask), different IPs.
         register(&pm, "ws-01", "198.51.100.9:41000", Some(1), true).await;
+        // H44: the controller is a registered peer too -- hbbs refuses a punch from one
+        // that is not, so a test that does not register it is testing nothing.
+        register_controller(&mut pm, "203.0.113.7:55000").await;
         let mut rs = test_server(pm, "192.168.0.0/16");
         let (msg, forwarded) = rs
-            .handle_punch_hole_request("203.0.113.7:55000".parse().unwrap(), punch_request("ws-01"), "", false)
+            .handle_punch_hole_request("203.0.113.7:55000".parse().unwrap(), punch_request("ws-01"), "", false, Some(&authed_controller()))
             .await
             .unwrap();
         assert!(forwarded.is_some());
@@ -2744,11 +2833,14 @@ mod tests {
         // forcing is made configurable, this test changes with it.
         ALWAYS_USE_RELAY.store(false, Ordering::SeqCst);
         let db = temp_db();
-        let pm = PeerMap::new_for_test(&db.0).await.unwrap();
+        let mut pm = PeerMap::new_for_test(&db.0).await.unwrap();
         register(&pm, "ws-01", "192.168.0.50:41000", Some(1), true).await;
+        // H44: the controller is a registered peer too -- hbbs refuses a punch from one
+        // that is not, so a test that does not register it is testing nothing.
+        register_controller(&mut pm, "203.0.113.7:55000").await;
         let mut rs = test_server(pm, "192.168.0.0/16");
         let (msg, forwarded) = rs
-            .handle_punch_hole_request("203.0.113.7:55000".parse().unwrap(), punch_request("ws-01"), "", false)
+            .handle_punch_hole_request("203.0.113.7:55000".parse().unwrap(), punch_request("ws-01"), "", false, Some(&authed_controller()))
             .await
             .unwrap();
         assert!(forwarded.is_some());
@@ -2772,12 +2864,15 @@ mod tests {
     async fn run_punch_lan_to_lan_returns_fetch_local_addr() {
         ALWAYS_USE_RELAY.store(false, Ordering::SeqCst);
         let db = temp_db();
-        let pm = PeerMap::new_for_test(&db.0).await.unwrap();
+        let mut pm = PeerMap::new_for_test(&db.0).await.unwrap();
         // Both endpoints on the LAN -> same-intranet direct path.
         register(&pm, "ws-01", "192.168.0.50:41000", Some(1), true).await;
+        // H44: the controller is a registered peer too -- hbbs refuses a punch from one
+        // that is not, so a test that does not register it is testing nothing.
+        register_controller(&mut pm, "192.168.0.60:55000").await;
         let mut rs = test_server(pm, "192.168.0.0/16");
         let (msg, forwarded) = rs
-            .handle_punch_hole_request("192.168.0.60:55000".parse().unwrap(), punch_request("ws-01"), "", false)
+            .handle_punch_hole_request("192.168.0.60:55000".parse().unwrap(), punch_request("ws-01"), "", false, Some(&authed_controller()))
             .await
             .unwrap();
         assert!(forwarded.is_some());

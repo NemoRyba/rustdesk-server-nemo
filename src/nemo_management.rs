@@ -42,13 +42,18 @@ const EVENT_LIMIT: usize = 500;
 const MAX_REQUEST_BODY: usize = 4 * 1024 * 1024;
 const MAX_PUBLIC_REQUEST_BODY: usize = 64 * 1024;
 
-/// Routes reachable without the admin token. Everything here is sized for a client
-/// poll or a login, not for an administrative payload.
+/// Body-size tier for a path. "Public" means a route an UNAUTHENTICATED caller can
+/// push a body to; everything here is sized for a client poll or a login, not for an
+/// administrative payload.
+///
+/// `/nemo/api/health` is deliberately NOT in this list. The name says probe, but the
+/// handler calls `require_auth` and returns the whole security policy -- see `health`.
+/// `/nemo/admin*` is the mirror case: token-free, but a GET that serves a static page,
+/// so no body ever reaches it and its tier does not matter.
 fn request_body_cap(path: &str) -> usize {
     let public = path.starts_with("/api/")
         || path == "/nemo/api/client/policy"
-        || path == "/nemo/api/update/latest"
-        || path == "/nemo/api/health";
+        || path == "/nemo/api/update/latest";
     if public {
         MAX_PUBLIC_REQUEST_BODY
     } else {
@@ -3068,15 +3073,25 @@ pub(crate) fn nemo_user_rejection_from_field(
     Some((source_id, reason))
 }
 
+/// The four controller gates. `source_uuid` is `None` when the controller proved itself
+/// with its pinned device key at the rendezvous handshake: that Ed25519 proof already
+/// binds the connection to `source_id` and is strictly stronger than the uuid the client
+/// asserts in the marker, so there is nothing left for the uuid to add.
 async fn controller_policy_rejection(
     pm: &PeerMap,
     source_id: &str,
-    source_uuid: &[u8],
+    source_uuid: Option<&[u8]>,
     target_id: &str,
 ) -> Option<String> {
     let source_id = source_id.trim();
     if source_id.is_empty() {
-        return None;
+        // H44: fail closed. An empty id is not "no controller to check", it is a
+        // controller we could not name, and every gate below keys off this id. It used
+        // to be unreachable because the marker parser rejects an empty id; it is not
+        // any more, now that the id can come from the handshake -- a pinned device key
+        // with a BLANK binding authenticates whatever peer_id the client claims,
+        // including "" (rendezvous_server.rs, nemo_client_auth_open).
+        return Some("controller did not identify itself".to_owned());
     }
     let source = match pm.get_registered(source_id).await {
         Ok(Some(source)) => source,
@@ -3086,8 +3101,10 @@ async fn controller_policy_rejection(
             return Some("controller policy could not be verified".to_owned());
         }
     };
-    if source_uuid.is_empty() || source.uuid.as_slice() != source_uuid {
-        return Some("controller identity rejected by TBF policy".to_owned());
+    if let Some(source_uuid) = source_uuid {
+        if source_uuid.is_empty() || source.uuid.as_slice() != source_uuid {
+            return Some("controller identity rejected by TBF policy".to_owned());
+        }
     }
     if matches!(source.status, Some(0)) {
         return Some("controller is blocked by TBF policy".to_owned());
@@ -3108,13 +3125,63 @@ async fn controller_policy_rejection(
     None
 }
 
+/// H44: decide WHO the controller is, before any of the four gates run.
+///
+/// `authed_peer_id` is the id this rendezvous connection PROVED with its pinned device
+/// key (`AuthedDevice::peer_id`). `None` means it proved nothing -- either the operator
+/// turned require-device-key off for a staged rollout, or --key-exchange=off. The marker
+/// inside `source_field` is written by the client and signed by nobody, so it is only
+/// ever the identity of last resort.
+///
+/// `Ok((id, uuid))` names the controller to run the gates on; `uuid = None` means "do not
+/// cross-check the registered uuid", because the device key already bound the connection
+/// to that id. `Err((id, reason))` is a refusal decided before any database lookup.
+///
+/// Split out as a pure fn so the decision is unit-testable without a PeerMap.
+fn resolve_controller_identity(
+    source_field: &str,
+    authed_peer_id: Option<&str>,
+) -> Result<(String, Option<Vec<u8>>), (String, String)> {
+    match (authed_peer_id, controller_source_identity(source_field)) {
+        (Some(proven), Some((claimed, uuid, _))) => {
+            if claimed != proven {
+                log::warn!(
+                    "controller {} proved its device key but its source marker claims {}",
+                    proven,
+                    claimed
+                );
+                return Err((
+                    proven.to_owned(),
+                    "controller identity does not match the proven device key".to_owned(),
+                ));
+            }
+            Ok((proven.to_owned(), Some(uuid)))
+        }
+        (Some(proven), None) => Ok((proven.to_owned(), None)),
+        (None, Some((claimed, uuid, _))) => Ok((claimed, Some(uuid))),
+        // The bypass this change exists to close. This used to be the `?` that returned
+        // None from the whole function, and BOTH call sites read None as "no rejection",
+        // i.e. PASS -- so all four controller gates could be skipped by simply leaving
+        // the marker out of the punch or relay frame.
+        (None, None) => Err((
+            "?".to_owned(),
+            "controller identity could not be established".to_owned(),
+        )),
+    }
+}
+
 pub(crate) async fn controller_policy_rejection_from_field(
     pm: &PeerMap,
     source_field: &str,
     target_id: &str,
+    authed_peer_id: Option<&str>,
 ) -> Option<(String, String)> {
-    let (source_id, source_uuid, _token) = controller_source_identity(source_field)?;
-    let reason = controller_policy_rejection(pm, &source_id, &source_uuid, target_id).await?;
+    let (source_id, source_uuid) = match resolve_controller_identity(source_field, authed_peer_id) {
+        Ok(identity) => identity,
+        Err(rejection) => return Some(rejection),
+    };
+    let reason =
+        controller_policy_rejection(pm, &source_id, source_uuid.as_deref(), target_id).await?;
     Some((source_id, reason))
 }
 
@@ -3404,6 +3471,14 @@ pub(crate) async fn record_policy_rejection(id: &str, addr: SocketAddr, reason: 
     );
 }
 
+// NOT a liveness probe, despite the name: this returns the full PolicyResponse --
+// require_device_key, strip_unsealed_secrets, require_sealed_login,
+// require_sealed_request and the build id. Served unauthenticated it would tell any
+// caller on the API port exactly which hardening switches are off and which build is
+// running, so it stays behind require_auth and stays OUT of request_body_cap's public
+// list. Its only caller is the admin dashboard (nemo_admin.html), which sends the
+// bearer token. It is also a duplicate of `get_policy`; if one is ever removed, this
+// is the one to go.
 async fn health(
     Extension(state): Extension<HbbsApiState>,
     headers: HeaderMap,
@@ -4313,8 +4388,12 @@ mod tests {
     // the controller's marker rides in RequestRelay.licence_key, NOT in a version
     // string. If the two field shapes parsed differently, adding the gate would have
     // refused every relayed session instead of only unauthorised ones.
-    // SEC-9: every route the admin token does NOT protect must land in the small
-    // tier. If a public path ever moves, this is what catches it.
+    // SEC-9: every route an unauthenticated caller can push a BODY to must land in
+    // the small tier. If a public path ever moves, this is what catches it.
+    // Two paths are not what their names suggest: `/nemo/admin` needs no token but is
+    // a GET serving a static page (no body, so the large tier is harmless), and
+    // `/nemo/api/health` reads like a probe but is require_auth-gated and returns the
+    // whole security policy -- admin tier.
     #[test]
     fn public_routes_get_the_small_body_cap() {
         for public in [
@@ -4326,7 +4405,6 @@ mod tests {
             "/api/tls-cert-info",
             "/nemo/api/client/policy",
             "/nemo/api/update/latest",
-            "/nemo/api/health",
         ] {
             assert_eq!(request_body_cap(public), MAX_PUBLIC_REQUEST_BODY, "{}", public);
         }
@@ -4336,6 +4414,9 @@ mod tests {
             "/nemo/api/update",
             "/nemo/api/peers/delete",
             "/nemo/admin",
+            // require_auth-gated (see `health`) and it returns the security policy,
+            // so it belongs here and not in the public list it used to sit in.
+            "/nemo/api/health",
         ] {
             assert_eq!(request_body_cap(admin), MAX_REQUEST_BODY, "{}", admin);
         }
@@ -4398,6 +4479,53 @@ mod tests {
         assert!(controller_source_identity("nemo-source-v1:peer-a:").is_none());
         // Invalid base64 uuid.
         assert!(controller_source_identity("nemo-source-v1:peer-a:!!!not-base64!!!").is_none());
+    }
+
+    // H44: the identity that drives the four controller gates.
+    #[test]
+    fn controller_identity_prefers_the_proven_device_key() {
+        let uuid = vec![1u8, 2, 3];
+        let field = format!("1.4.6 {}", source_field("tech-01", &uuid));
+        // Proven + matching marker: the proven id wins, uuid still cross-checked.
+        assert_eq!(
+            resolve_controller_identity(&field, Some("tech-01")),
+            Ok(("tech-01".to_owned(), Some(uuid.clone()))),
+        );
+        // Proven + no marker: the device key IS the identity, so there is no uuid to
+        // compare and the gates must still run.
+        assert_eq!(
+            resolve_controller_identity("1.4.6", Some("tech-01")),
+            Ok(("tech-01".to_owned(), None)),
+        );
+        // Unproven + marker: staged rollout with require-device-key off; the marker is
+        // all there is, exactly as before.
+        assert_eq!(
+            resolve_controller_identity(&field, None),
+            Ok(("tech-01".to_owned(), Some(uuid))),
+        );
+    }
+
+    #[test]
+    fn controller_identity_refuses_a_marker_that_impersonates_someone_else() {
+        let field = format!("1.4.6 {}", source_field("tech-02", &[9u8, 9]));
+        let err = resolve_controller_identity(&field, Some("tech-01")).unwrap_err();
+        assert_eq!(err.0, "tech-01");
+        assert!(
+            err.1.contains("does not match the proven device key"),
+            "{}",
+            err.1
+        );
+    }
+
+    // The bypass this change exists to close: no proof AND no marker used to return
+    // None from controller_policy_rejection_from_field, which both call sites read as
+    // PASS -- so omitting one wire field skipped all four controller gates.
+    #[test]
+    fn controller_identity_fails_closed_when_nothing_identifies_the_caller() {
+        assert!(controller_source_identity("1.4.6").is_none());
+        let err = resolve_controller_identity("1.4.6", None).unwrap_err();
+        assert_eq!(err.0, "?");
+        assert!(err.1.contains("could not be established"), "{}", err.1);
     }
 
     #[test]
