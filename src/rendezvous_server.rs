@@ -775,6 +775,13 @@ impl RendezvousServer {
                         }
                         rf.socket_addr = AddrMangle::encode(addr).into();
                         let target_id = rf.id.clone();
+                        // The controller's source marker -- and with it the user's
+                        // SESSION TOKEN -- rides in licence_key on this frame; the two
+                        // gates above have consumed it. The target never reads this
+                        // field off an inbound RequestRelay (it sends its own to hbbr),
+                        // so forwarding it whole handed the technician's bearer token to
+                        // the workstation on every relayed session. Found by the sweep.
+                        rf.licence_key = Default::default();
                         msg_out.set_request_relay(rf);
                         let peer_addr = peer.read().await.socket_addr;
                         // H43: the target may be on TCP/WS, not UDP.

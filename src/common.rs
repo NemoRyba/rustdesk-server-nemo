@@ -92,7 +92,15 @@ pub fn get_arg(name: &str) -> String {
 #[allow(dead_code)]
 #[inline]
 pub fn get_arg_or(name: &str, default: String) -> String {
-    std::env::var(arg_name(name)).unwrap_or(default)
+    // arg_name yields NEMO-API-TOKEN, and that is the only spelling .env and clap ever
+    // set. But systemd's EnvironmentFile cannot carry a dash in a key, so the shipped
+    // unit could only reach us by re-passing the token on argv -- where it sat in
+    // /proc/<pid>/cmdline, world-readable. Accept the underscore spelling too, so the
+    // env file alone is enough and the argv bridge can go.
+    let dashed = arg_name(name);
+    std::env::var(&dashed)
+        .or_else(|_| std::env::var(dashed.replace('-', "_")))
+        .unwrap_or(default)
 }
 
 #[allow(dead_code)]
@@ -253,4 +261,20 @@ async fn check_software_update_() -> hbb_common::ResultType<()> {
        log::info!("new version is available: {}", latest_release_version);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod arg_env_tests {
+    use super::*;
+    #[test]
+    fn get_arg_accepts_the_underscore_spelling_an_env_file_can_set() {
+        std::env::remove_var("TBF-ARG-TEST");
+        std::env::set_var("TBF_ARG_TEST", "from-underscore");
+        assert_eq!(get_arg("tbf-arg-test"), "from-underscore");
+        std::env::set_var("TBF-ARG-TEST", "from-dash");
+        assert_eq!(get_arg("tbf-arg-test"), "from-dash", "the dashed spelling still wins");
+        std::env::remove_var("TBF-ARG-TEST");
+        std::env::remove_var("TBF_ARG_TEST");
+        assert_eq!(get_arg_or("tbf-arg-test", "dflt".into()), "dflt");
+    }
 }

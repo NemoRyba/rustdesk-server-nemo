@@ -36,7 +36,6 @@ ExecStart=/usr/bin/hbbs \
     -k _ \
     --nemo-api Y \
     --nemo-api-bind 0.0.0.0:21120 \
-    --nemo-api-token ${NEMO_API_TOKEN} \
     --nemo-api-tls auto
 Restart=always
 RestartSec=10
