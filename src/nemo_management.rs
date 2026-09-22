@@ -56,6 +56,7 @@ const MAX_PUBLIC_REQUEST_BODY: usize = 64 * 1024;
 fn request_body_cap(path: &str) -> usize {
     let public = path.starts_with("/api/")
         || path == "/nemo/api/client/policy"
+        || path.starts_with("/nemo/api/client/audit/")
         || path == "/nemo/api/update/latest"
         || path == "/nemo"
         || path == "/nemo/admin"
@@ -1007,6 +1008,8 @@ pub(crate) async fn spawn_hbbs_api(
             get(get_peer_management_policy).put(update_peer_management_policy),
         )
         .route("/nemo/api/client/policy", post(client_policy))
+        // TASK-25: device-key-signed audit uploads from clients (conn/file/alarm).
+        .route("/nemo/api/client/audit/:kind", post(client_audit))
         .route("/nemo/api/policy", get(get_policy).put(update_policy))
         .route("/nemo/api/stats", get(get_stats))
         .route("/nemo/api/events", get(get_events))
@@ -2592,6 +2595,26 @@ fn verify_device_signature(pub_b64: &str, sig_b64: &str, domain: &str, id: &str)
     true
 }
 
+// TASK-25: the client's audit uploads (connection open/close/login, file
+// transfers, login-failure alarms, controller notes). Authenticated like the
+// policy poll's device proof under its own domain "nemo-audit"; no key = no
+// event, deliberately (an unproven audit line is worse than none). Recorded in
+// the events ring the dashboard shows (/nemo/api/events): in-memory, bounded by
+// log_history_limit(), like every other event there.
+const CLIENT_AUDIT_KINDS: &[&str] = &["conn", "file", "alarm"];
+const MAX_AUDIT_DETAIL: usize = 4096;
+
+// The proven peer id of an audit body, or None when the body carries no valid
+// device-key proof for the id it claims.
+fn client_audit_identity(body: &serde_json::Value) -> Option<String> {
+    let f = |k: &str| body.get(k).and_then(|v| v.as_str()).unwrap_or("").trim().to_owned();
+    let (id, pub_b64, sig_b64) = (f("id"), f("device_key_pub"), f("device_key_sig"));
+    if id.is_empty() || !verify_device_signature(&pub_b64, &sig_b64, "nemo-audit", &id) {
+        return None;
+    }
+    Some(id)
+}
+
 fn verify_device_key(request: &ClientPolicyRequest) -> bool {
     let (Some(pub_b64), Some(sig_b64)) = (
         request.device_key_pub.as_deref(),
@@ -2600,6 +2623,25 @@ fn verify_device_key(request: &ClientPolicyRequest) -> bool {
         return false;
     };
     verify_device_signature(pub_b64, sig_b64, "nemo-poll", &request.id)
+}
+
+// TASK-25: the event detail of an audit body: everything but the proof fields,
+// bounded so a file audit (10 names + paths + info) cannot bloat the ring.
+fn client_audit_detail(body: &mut serde_json::Value) -> String {
+    if let Some(obj) = body.as_object_mut() {
+        obj.remove("device_key_pub");
+        obj.remove("device_key_sig");
+    }
+    let mut detail = body.to_string();
+    if detail.len() > MAX_AUDIT_DETAIL {
+        let mut cut = MAX_AUDIT_DETAIL;
+        while !detail.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        detail.truncate(cut);
+        detail.push_str("...");
+    }
+    detail
 }
 
 // S-B/S-DUALKEY step 3: seal `data` to a client's Ed25519 device key with a NaCl
@@ -3688,6 +3730,35 @@ async fn update_peer_management_policy(
         format!("options={}", policy.options.len()),
     );
     Ok(Json(ManagementPolicyResponse { id, policy }))
+}
+
+// POST /nemo/api/client/audit/:kind (CLIENT_AUDIT_KINDS): the device-key proof is the auth.
+async fn client_audit(
+    Extension(state): Extension<HbbsApiState>,
+    Path(kind): Path<String>,
+    peer_addr: Option<ConnectInfo<SocketAddr>>,
+    Json(mut body): Json<serde_json::Value>,
+) -> ApiResult<serde_json::Value> {
+    if !CLIENT_AUDIT_KINDS.contains(&kind.as_str()) {
+        return Err(api_error(StatusCode::NOT_FOUND, "unknown audit kind"));
+    }
+    let Some(id) = client_audit_identity(&body) else {
+        log::warn!("client audit '{}' rejected: no device-key proof", kind);
+        return Err(api_error(StatusCode::FORBIDDEN, "a provisioned device key is required"));
+    };
+    if state.pm.get_registered(&id).await.map_err(server_error)?.is_none() {
+        return Err(api_error(StatusCode::NOT_FOUND, "peer not found"));
+    }
+    let detail = client_audit_detail(&mut body);
+    let mut store = STATS.write().await;
+    record_event_locked(
+        &mut store,
+        &format!("client-audit-{}", kind),
+        Some(&id),
+        peer_addr.map(|ConnectInfo(addr)| addr),
+        detail,
+    );
+    Ok(Json(serde_json::json!({})))
 }
 
 async fn client_policy(
