@@ -494,6 +494,19 @@ async fn make_pair_(stream: impl StreamTrait, addr: SocketAddr, key: &str, limit
                     log::warn!("Relay authentication failed from {} - invalid key", addr);
                     return;
                 }
+                // TASK #16: Layer 1 reaches the relay transitively. The session id must
+                // be a grant hbbs minted for a session it brokered (over connections it
+                // gated), signed with the server key. The licence_key compare above
+                // proves nothing on its own: every client holds that key.
+                let pk = RELAY_SK.read().unwrap().as_ref().map(|sk| sk.public_key());
+                let Some(pk) = pk else {
+                    log::warn!("Refusing relay from {}: no server key to verify the grant", addr);
+                    return;
+                };
+                if let Err(err) = crate::common::relay_grant_verify(&pk, &rf.uuid) {
+                    log::warn!("Refusing relay from {}: {}", addr, err);
+                    return;
+                }
                 if !rf.uuid.is_empty() {
                     let mut peer = PEERS.lock().await.remove(&rf.uuid);
                     if let Some(peer) = peer.as_mut() {

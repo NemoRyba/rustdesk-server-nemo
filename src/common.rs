@@ -103,6 +103,26 @@ pub fn get_arg_or(name: &str, default: String) -> String {
         .unwrap_or(default)
 }
 
+// TASK #16: the relay session grant. hbbs mints one per session it brokers and hands
+// it to BOTH parties as the relay `uuid`; hbbr admits a RequestRelay only if its uuid
+// is a grant signed with the server key that has not expired -- knowing the key (every
+// client does) no longer joins a session. The expiry is the one clock in the path:
+// hbbs and hbbr share a host in the shipped unit; 60s covers a dial plus hbbr's park.
+// Layout: base64( nonce[16] || exp_be_u64[8] || sig[64] ), sig over DOMAIN||nonce||exp.
+#[allow(dead_code)]
+pub const RELAY_GRANT_TTL_SECS: u64 = 60;
+const RELAY_GRANT_DOMAIN: &[u8] = b"tbfdesk-relay-grant-v1";
+const RELAY_GRANT_LEN: usize = 16 + 8 + sign::SIGNATUREBYTES;
+
+#[allow(dead_code)]
+pub fn relay_grant_mint(sk: &sign::SecretKey, ttl_secs: u64) -> String {
+    let nonce = *uuid::Uuid::new_v4().as_bytes();
+    let exp = (now() + ttl_secs).to_be_bytes();
+    let msg = [RELAY_GRANT_DOMAIN, &nonce[..], &exp[..]].concat();
+    let sig = sign::sign_detached(&msg, sk);
+    base64::encode([&nonce[..], &exp[..], sig.as_ref()].concat())
+}
+
 #[allow(dead_code)]
 #[inline]
 pub fn now() -> u64 {
@@ -110,6 +130,28 @@ pub fn now() -> u64 {
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|x| x.as_secs())
         .unwrap_or_default()
+}
+
+#[allow(dead_code)]
+pub fn relay_grant_verify(pk: &sign::PublicKey, grant: &str) -> ResultType<()> {
+    let raw = base64::decode(grant).context("relay grant is not base64")?;
+    if raw.len() != RELAY_GRANT_LEN {
+        hbb_common::bail!("relay grant has the wrong length");
+    }
+    let (nonce, rest) = raw.split_at(16);
+    let (exp, sig) = rest.split_at(8);
+    let sig = sign::Signature::from_bytes(sig)
+        .ok()
+        .context("relay grant signature is malformed")?;
+    let msg = [RELAY_GRANT_DOMAIN, nonce, exp].concat();
+    if !sign::verify_detached(&sig, &msg, pk) {
+        hbb_common::bail!("relay grant signature does not verify");
+    }
+    let exp = u64::from_be_bytes(exp.try_into().context("relay grant expiry")?);
+    if now() >= exp {
+        hbb_common::bail!("relay grant expired");
+    }
+    Ok(())
 }
 
 // Review finding (HIGH): `id_ed25519` holds the rendezvous signing secret — the trust
@@ -262,6 +304,34 @@ async fn check_software_update_() -> hbb_common::ResultType<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod relay_grant_tests {
+    use super::*;
+
+    // TASK #16: what hbbr relies on: right key, untampered, not expired.
+    #[test]
+    fn relay_grant_verifies_only_fresh_untampered_grants_from_this_key() {
+        let (pk, sk) = sign::gen_keypair();
+        let grant = relay_grant_mint(&sk, RELAY_GRANT_TTL_SECS);
+        assert!(relay_grant_verify(&pk, &grant).is_ok());
+        assert_ne!(relay_grant_mint(&sk, 60), grant, "fresh nonce");
+
+        let (other_pk, _) = sign::gen_keypair();
+        assert!(relay_grant_verify(&other_pk, &grant).is_err(), "wrong key");
+
+        let mut raw = base64::decode(&grant).unwrap();
+        raw[0] ^= 1;
+        assert!(relay_grant_verify(&pk, &base64::encode(&raw)).is_err(), "tampered");
+
+        let expired = relay_grant_mint(&sk, 0);
+        assert!(relay_grant_verify(&pk, &expired).is_err(), "expired");
+
+        assert!(relay_grant_verify(&pk, "").is_err(), "empty");
+        assert!(relay_grant_verify(&pk, "not a grant").is_err(), "junk");
+    }
+}
+
 
 #[cfg(test)]
 mod arg_env_tests {

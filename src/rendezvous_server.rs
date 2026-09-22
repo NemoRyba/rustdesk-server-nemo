@@ -805,6 +805,20 @@ impl RendezvousServer {
                 Some(rendezvous_message::Union::RelayResponse(mut rr)) => {
                     let addr_b = AddrMangle::decode(&rr.socket_addr);
                     rr.socket_addr = Default::default();
+                    // TASK #16: hbbs mints the relay session id: a grant signed with
+                    // the server key that hbbr verifies. Back to the responder on this
+                    // connection, on to the controller in the forwarded RelayResponse.
+                    let Some(sk) = self.inner.sk.as_ref() else {
+                        log::warn!("Dropping RelayResponse from {:?}: no server key", addr);
+                        return false;
+                    };
+                    rr.uuid = relay_grant_mint(sk, RELAY_GRANT_TTL_SECS);
+                    let mut grant_out = RendezvousMessage::new();
+                    grant_out.set_relay_response(RelayResponse {
+                        uuid: rr.uuid.clone(),
+                        ..Default::default()
+                    });
+                    Self::send_to_sink(sink, grant_out).await;
                     let id = rr.id().to_owned();
                     if !id.is_empty() {
                         let pk = self.get_pk(&rr.version, id.clone()).await;
