@@ -48,12 +48,18 @@ const MAX_PUBLIC_REQUEST_BODY: usize = 64 * 1024;
 ///
 /// `/nemo/api/health` is deliberately NOT in this list. The name says probe, but the
 /// handler calls `require_auth` and returns the whole security policy -- see `health`.
-/// `/nemo/admin*` is the mirror case: token-free, but a GET that serves a static page,
-/// so no body ever reaches it and its tier does not matter.
+///
+/// TASK-18: the three navigable admin paths serve the tokenless LOGIN SHELL, so they
+/// belong in the token-free tier. Enumerated rather than prefix-matched on purpose --
+/// the sibling `/nemo/admin/app` carries the real dashboard, is require_auth-gated, and
+/// must stay in the admin tier.
 fn request_body_cap(path: &str) -> usize {
     let public = path.starts_with("/api/")
         || path == "/nemo/api/client/policy"
-        || path == "/nemo/api/update/latest";
+        || path == "/nemo/api/update/latest"
+        || path == "/nemo"
+        || path == "/nemo/admin"
+        || path == "/nemo/admin/";
     if public {
         MAX_PUBLIC_REQUEST_BODY
     } else {
@@ -955,9 +961,18 @@ pub(crate) async fn spawn_hbbs_api(
         login_enc_sk,
     };
     let app = Router::new()
-        .route("/nemo", get(admin_gui))
-        .route("/nemo/admin", get(admin_gui))
-        .route("/nemo/admin/", get(admin_gui))
+        // TASK-18: the dashboard HTML is a complete map of the management surface
+        // -- every /nemo/api route, every pushed policy key, the LDAP and device-key
+        // workflows, the running build id -- and the shipped systemd unit binds
+        // 0.0.0.0:21120, so it must not be served to a tokenless caller. A browser
+        // navigation cannot carry an Authorization header, so the three navigable
+        // paths serve a structureless login shell and the shell XHRs the real page
+        // from /nemo/admin/app WITH the header. One credential, one predicate
+        // (require_auth), no cookie and therefore no CSRF surface.
+        .route("/nemo", get(admin_shell))
+        .route("/nemo/admin", get(admin_shell))
+        .route("/nemo/admin/", get(admin_shell))
+        .route("/nemo/admin/app", get(admin_gui))
         .route("/nemo/api/health", get(health))
         .route("/nemo/api/peers", get(list_peers))
         .route("/nemo/api/peers/delete", post(delete_peers))
@@ -1179,10 +1194,47 @@ async fn api_tls_cert_info() -> Json<TlsCertInfo> {
     }))
 }
 
-async fn admin_gui() -> Html<String> {
+// TASK-18. The login shell: the only thing an unauthenticated caller is served.
+// It carries no route names, no policy keys, no LDAP fields and no build id --
+// just a token box and the one URL it fetches.
+//
+// 401, not 200, for three reasons: the shell's own XHR then tells "not signed in"
+// from "here is the dashboard" by status alone, with no content sniffing; a
+// scanner is told the truth; and a browser renders the body of a 401 regardless,
+// so a plain navigation still shows the sign-in card. WWW-Authenticate names the
+// scheme for tools without triggering a browser dialog (browsers have no native
+// Bearer UI -- Basic would pop one and fight our own page).
+async fn admin_shell() -> impl axum::response::IntoResponse {
+    (
+        StatusCode::UNAUTHORIZED,
+        [
+            (axum::http::header::CACHE_CONTROL, "no-store"),
+            (
+                axum::http::header::WWW_AUTHENTICATE,
+                "Bearer realm=\"TBFDesk admin\"",
+            ),
+        ],
+        Html(include_str!("nemo_admin_shell.html")),
+    )
+}
+
+// TASK-18. The dashboard itself, admin-token only. This used to be reachable at
+// /nemo, /nemo/admin and /nemo/admin/ with no credential at all, which handed an
+// attacker on the 0.0.0.0 bind the whole management map and the build id for free.
+async fn admin_gui(
+    Extension(state): Extension<HbbsApiState>,
+    headers: HeaderMap,
+) -> Result<impl axum::response::IntoResponse, ApiFailure> {
+    require_auth(&headers, &state.token)?;
     // Stamp the running build id into the page so the header can show the GUI's own
     // build and detect a browser-cached (stale) page vs the live server build.
-    Html(include_str!("nemo_admin.html").replace("{{NEMO_BUILD_ID}}", nemo_build_id()))
+    // no-store: this body is credentialed, so no shared cache may keep a copy and
+    // then hand it to the next, tokenless, caller -- which matters on the
+    // --nemo-api-allow-insecure plaintext bind.
+    Ok((
+        [(axum::http::header::CACHE_CONTROL, "no-store")],
+        Html(include_str!("nemo_admin.html").replace("{{NEMO_BUILD_ID}}", nemo_build_id())),
+    ))
 }
 
 // --------------------------------------------------------------------------
@@ -4405,6 +4457,10 @@ mod tests {
             "/api/tls-cert-info",
             "/nemo/api/client/policy",
             "/nemo/api/update/latest",
+            // TASK-18: these three now serve the tokenless login shell.
+            "/nemo",
+            "/nemo/admin",
+            "/nemo/admin/",
         ] {
             assert_eq!(request_body_cap(public), MAX_PUBLIC_REQUEST_BODY, "{}", public);
         }
@@ -4413,7 +4469,8 @@ mod tests {
             "/nemo/api/policies",
             "/nemo/api/update",
             "/nemo/api/peers/delete",
-            "/nemo/admin",
+            // TASK-18: the dashboard HTML itself is token-gated, unlike the shell.
+            "/nemo/admin/app",
             // require_auth-gated (see `health`) and it returns the security policy,
             // so it belongs here and not in the public list it used to sit in.
             "/nemo/api/health",
@@ -4422,6 +4479,33 @@ mod tests {
         }
         // The public tier still has room for a sealed login envelope.
         assert!(MAX_PUBLIC_REQUEST_BODY > MAX_SEALED_REQUEST_B64);
+    }
+
+    // TASK-18: the dashboard HTML is a map of the whole management surface, so it is
+    // admin-token-only; what an anonymous caller gets is the shell. Guard the shell
+    // against acquiring structure by accident -- a future edit that pastes a route
+    // list, a policy key or the build stamp into it fails here rather than in the
+    // field. No router needed: this is a property of the bytes we compile in.
+    #[test]
+    fn the_login_shell_discloses_no_management_structure() {
+        let shell = include_str!("nemo_admin_shell.html");
+        let lower = shell.to_lowercase();
+        for leak in [
+            "/nemo/api/",
+            "{{nemo_build_id}}",
+            "ldap",
+            "device-key",
+            "nemo-permanent-password",
+            "view-peers",
+        ] {
+            assert!(!lower.contains(leak), "the login shell must not mention {leak}");
+        }
+        // It needs exactly two things: the gated URL it fetches, and the storage key
+        // the dashboard already uses, so a returning admin is never asked twice.
+        assert!(shell.contains("/nemo/admin/app"));
+        assert!(shell.contains("nemoAdminToken"));
+        // And the build stamp must still live in the gated page, not the shell.
+        assert!(include_str!("nemo_admin.html").contains("{{NEMO_BUILD_ID}}"));
     }
 
     #[test]

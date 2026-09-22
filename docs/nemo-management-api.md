@@ -44,7 +44,12 @@ The built-in admin GUI is served by the same feature/API:
 http://127.0.0.1:21120/nemo/admin
 ```
 
-If `--nemo-api-token` is set, enter the same token in the GUI token field.
+That URL serves a **login shell** to anyone who can reach the port: a token field and
+nothing else — no route names, no policy keys, no build id. The dashboard itself is
+`GET /nemo/admin/app` and needs the admin token like every other management route. A
+browser navigation cannot send an `Authorization` header, so the shell fetches the
+dashboard with one and renders the result in place. Enter the token once; the browser
+keeps it and the shell is invisible from then on.
 
 ## Disable
 
@@ -68,7 +73,8 @@ git revert <nemo-management-api-commit>
 
 ## Endpoints
 
-- `GET /nemo/admin`
+- `GET /nemo/admin` — login shell, no token; also at `/nemo` and `/nemo/admin/`
+- `GET /nemo/admin/app` — the dashboard HTML itself, admin token required
 - `GET /nemo/api/health` — admin token required. Despite the name this is not a
   liveness probe: it returns the server's security policy (same body as
   `GET /nemo/api/policy`). There is no unauthenticated probe endpoint; use the

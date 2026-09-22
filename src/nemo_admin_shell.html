@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TBFDesk Admin</title>
+  <!-- TASK-18: the login shell. This is everything an unauthenticated caller on
+       21120 is allowed to see, so it deliberately carries NO structure: no API
+       route names, no policy keys, no directory or provisioning fields, no build
+       stamp. The single URL below is the only thing it reveals, and that URL
+       answers 401 without the admin token. Keep it that way -- there is a unit
+       test (the_login_shell_discloses_no_management_structure) that says so, and
+       it checks the literal strings, so do not name them even in a comment. -->
+  <style>
+    :root { color-scheme: light; --bg:#f6f7f9; --panel:#fff; --line:#d6dce2;
+            --text:#18212b; --muted:#62707f; --accent:#087f8c; --danger:#b42318; }
+    * { box-sizing: border-box; }
+    body { margin:0; min-height:100vh; display:flex; align-items:center;
+           justify-content:center; background:var(--bg); color:var(--text);
+           font:14px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+    .card { width:320px; background:var(--panel); border:1px solid var(--line);
+            border-radius:10px; padding:28px 26px; }
+    h1 { margin:0 0 4px; font-size:17px; }
+    p  { margin:0 0 18px; color:var(--muted); font-size:13px; }
+    input, button { width:100%; font:inherit; padding:9px 11px; border-radius:6px;
+                    border:1px solid var(--line); }
+    button { margin-top:10px; border-color:var(--accent); background:var(--accent);
+             color:#fff; font-weight:600; cursor:pointer; }
+    button[disabled] { opacity:.6; cursor:default; }
+    .err { margin:12px 0 0; min-height:18px; color:var(--danger); font-size:13px; }
+  </style>
+</head>
+<body>
+  <form class="card" id="f" autocomplete="off">
+    <h1>TBFDesk Admin</h1>
+    <p>Sign in with the management API token.</p>
+    <input id="t" type="password" autocomplete="off" placeholder="API token" aria-label="API token">
+    <button id="b" type="submit">Sign in</button>
+    <p class="err" id="e" role="alert"></p>
+    <noscript><p class="err">This page needs JavaScript.</p></noscript>
+  </form>
+  <script>
+  // ONE IIFE, ON PURPOSE. document.open()/write() below replaces the document but
+  // keeps this same Window and its global lexical scope, so any top-level
+  // `const`/`let` declared here would collide with the dashboard's own top-level
+  // declarations (nemo_admin.html declares `const tokenInput` and friends) and
+  // abort its script with a redeclaration SyntaxError -- the page would render
+  // dead. Nothing in here may reach the global scope.
+  (function () {
+    var KEY = "nemoAdminToken";
+    var APP = "/nemo/admin/app";
+    var f = document.getElementById("f");
+    var t = document.getElementById("t");
+    var b = document.getElementById("b");
+    var e = document.getElementById("e");
+
+    // Fetch the dashboard WITH the bearer header (a navigation cannot carry one)
+    // and swap it in. document.write executes the inline scripts that an
+    // innerHTML assignment would silently drop.
+    function enter(token, quiet) {
+      b.disabled = true;
+      e.textContent = "";
+      fetch(APP, {
+        headers: { "Authorization": "Bearer " + token },
+        cache: "no-store"
+      }).then(function (res) {
+        if (!res.ok) {
+          // Only ever keep a token the server has actually accepted, and drop one
+          // it has rejected, so a stale token does not wedge this browser.
+          if (res.status === 401) { try { localStorage.removeItem(KEY); } catch (_) {} }
+          b.disabled = false;
+          e.textContent = res.status === 401
+            ? (quiet ? "" : "That token was not accepted.")
+            : ("Server error " + res.status + ".");
+          t.focus();
+          return null;
+        }
+        return res.text();
+      }).then(function (html) {
+        if (!html) return;
+        try { localStorage.setItem(KEY, token); } catch (_) {}
+        document.open();
+        document.write(html);
+        document.close();
+      }).catch(function () {
+        b.disabled = false;
+        e.textContent = "Could not reach the server.";
+      });
+    }
+
+    f.addEventListener("submit", function (ev) {
+      ev.preventDefault();
+      var v = t.value.trim();
+      if (v) enter(v, false);
+    });
+
+    // Returning admin: the token this browser already holds is tried silently, so
+    // the shell is invisible in the normal case. Same key and same behaviour the
+    // dashboard already had when it auto-loaded from localStorage.
+    var saved = "";
+    try { saved = localStorage.getItem(KEY) || ""; } catch (_) {}
+    if (saved) { enter(saved, true); } else { t.focus(); }
+  })();
+  </script>
+</body>
+</html>
