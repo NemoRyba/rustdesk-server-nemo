@@ -831,6 +831,36 @@ pub fn device_key_binding(public_key: &str) -> Option<String> {
         .find(|k| k.public_key == pk)
         .map(|k| k.peer_id.clone())
 }
+/// TASK #14: the ONE binding rule both enforcement points apply (nemo_client_auth_open,
+/// verify_device_signature). A bound key authenticates exactly its peer; an UNBOUND key
+/// authenticates NOTHING unless --allow-unbound-device-keys is on, because the admin
+/// peer-id box is optional free text and "blank = any id" was a fleet-wide skeleton key.
+pub(crate) fn device_key_binding_check(
+    bound: &str,
+    claimed: &str,
+    allow_unbound: bool,
+) -> Result<(), String> {
+    if bound.is_empty() && allow_unbound {
+        return Ok(());
+    }
+    if bound.is_empty() {
+        return Err(format!(
+            "device key has no peer-id binding (client claims {}); bind it or pass --allow-unbound-device-keys Y",
+            claimed
+        ));
+    }
+    if bound != claimed {
+        return Err(format!(
+            "device key is bound to peer {} but the client claims {}",
+            bound, claimed
+        ));
+    }
+    Ok(())
+}
+/// TASK #14 escape hatch, read like insecure_ldap_allowed (CLI/.env only).
+pub(crate) fn allow_unbound_device_keys() -> bool {
+    crate::nemo_management::is_truthy(&get_arg("allow-unbound-device-keys"))
+}
 pub fn require_device_key() -> bool {
     CONFIG.lock().unwrap().require_device_key
 }
@@ -2285,6 +2315,22 @@ mod tests {
         assert!(id_b.starts_with(shared));
         // Re-deriving for the SAME key keeps its id stable.
         assert_eq!(device_key_id_for(&key_a, &existing), id_a);
+    }
+
+    // TASK #14: a bound key opens for exactly its peer; an UNBOUND key for nobody
+    // unless the escape hatch is on. The rule both enforcement points share.
+    #[test]
+    fn device_key_binding_check_fails_closed_on_an_unbound_key() {
+        assert!(device_key_binding_check("peer-a", "peer-a", false).is_ok());
+        assert!(device_key_binding_check("peer-a", "peer-b", false).is_err());
+        assert!(device_key_binding_check("peer-a", "peer-b", true).is_err());
+        assert!(device_key_binding_check("", "peer-a", false).is_err());
+        assert!(device_key_binding_check("", "", false).is_err());
+        assert!(device_key_binding_check("", "peer-a", true).is_ok());
+        let err = device_key_binding_check("peer-a", "peer-b", false).unwrap_err();
+        assert!(err.contains("bound to peer peer-a"), "{}", err);
+        let err = device_key_binding_check("", "peer-a", false).unwrap_err();
+        assert!(err.contains("allow-unbound-device-keys"), "{}", err);
     }
 
     // S-C: tls_verify=false is refused unless the loud override flag is set.

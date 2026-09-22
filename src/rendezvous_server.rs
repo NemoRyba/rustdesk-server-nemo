@@ -2145,20 +2145,19 @@ impl RendezvousServer {
         if !crate::nemo_integration::is_device_key_pinned(&device_pub_b64) {
             bail!("device key is not pinned on this server");
         }
-        // Bound-peer check, the same rule the management API applies: a key registered
-        // against one machine must not authenticate another. An unbound key (empty
-        // binding) authenticates any id, which is the documented meaning of leaving the
-        // binding blank.
-        match crate::nemo_integration::device_key_binding(&device_pub_b64) {
-            Some(bound) if !bound.is_empty() && bound != auth.peer_id => {
-                bail!(
-                    "device key is bound to peer {} but the client claims {}",
-                    bound,
-                    auth.peer_id
-                );
-            }
-            Some(_) => {}
-            None => bail!("device key vanished from the registry mid-handshake"),
+        // TASK #14: bound-peer check, the ONE rule the management API applies too
+        // (device_key_binding_check). A key registered against one machine must not
+        // authenticate another, and an UNBOUND key authenticates nothing unless the
+        // operator started hbbs with --allow-unbound-device-keys Y.
+        let Some(bound) = crate::nemo_integration::device_key_binding(&device_pub_b64) else {
+            bail!("device key vanished from the registry mid-handshake");
+        };
+        if let Err(reason) = crate::nemo_integration::device_key_binding_check(
+            &bound,
+            &auth.peer_id,
+            crate::nemo_integration::allow_unbound_device_keys(),
+        ) {
+            bail!("{}", reason);
         }
         let Some(device_pk) = sign::PublicKey::from_slice(&auth.device_pub) else {
             bail!("device public key is not a valid Ed25519 key");

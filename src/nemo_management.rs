@@ -916,6 +916,27 @@ pub(crate) fn init_from_args() {
         if company_only() { "enabled" } else { "disabled" },
         conn_history_limit(),
     );
+    // TASK #14: unbound device keys authenticate nothing unless the escape hatch is on;
+    // say at boot how many pinned keys that affects instead of going dark silently.
+    let unbound = integration::list_device_keys()
+        .iter()
+        .filter(|k| k.peer_id.is_empty())
+        .count();
+    if integration::allow_unbound_device_keys() {
+        log::warn!(
+            "allow-unbound-device-keys=Y: every pinned device key with no peer-id binding \
+             authenticates ANY peer id, a fleet-wide skeleton key ({} such key(s) right \
+             now). Bind or replace them, then drop the flag.",
+            unbound
+        );
+    } else if unbound > 0 {
+        log::warn!(
+            "{} pinned device key(s) have no peer-id binding and will NOT authenticate. \
+             Bind each to its peer id in the admin dashboard, or start hbbs with \
+             --allow-unbound-device-keys Y as a temporary escape hatch.",
+            unbound
+        );
+    }
 }
 
 pub(crate) async fn spawn_hbbs_api(
@@ -2528,12 +2549,19 @@ fn verify_device_signature(pub_b64: &str, sig_b64: &str, domain: &str, id: &str)
     if !integration::is_device_key_pinned(pub_b64) {
         return false;
     }
-    // M1: a key bound to a peer id authenticates ONLY that id. Unbound (legacy)
-    // keys keep authenticating any id until the operator binds or replaces them.
-    match integration::device_key_binding(pub_b64) {
-        Some(bound) if !bound.is_empty() && bound != id => return false,
-        None => return false, // unpinned (racing delete)
-        _ => {}
+    // TASK #14: the binding rule is shared with the rendezvous handshake
+    // (integration::device_key_binding_check): a bound key authenticates only its
+    // peer, an unbound one nothing at all unless --allow-unbound-device-keys is on.
+    let Some(bound) = integration::device_key_binding(pub_b64) else {
+        return false; // unpinned (racing delete)
+    };
+    if let Err(reason) = integration::device_key_binding_check(
+        &bound,
+        id,
+        integration::allow_unbound_device_keys(),
+    ) {
+        log::debug!("device signature refused: {}", reason);
+        return false;
     }
     let (Ok(pk_bytes), Ok(sig_bytes)) =
         (base64::decode(pub_b64.trim()), base64::decode(sig_b64.trim()))
@@ -5175,7 +5203,9 @@ mod tests {
             "peer-a"
         ));
 
-        // Pin it UNBOUND (legacy): any id verifies with a valid fresh signature.
+        // TASK #14: pinned UNBOUND -> refused even with a valid fresh signature. The
+        // admin peer-id box is optional free text, so a blank binding must never be a
+        // skeleton key; only --allow-unbound-device-keys Y (off in tests) reopens it.
         integration::pin_device_key_for_test(integration::DeviceKey {
             id: "testkey".to_owned(),
             label: "test".to_owned(),
@@ -5183,12 +5213,21 @@ mod tests {
             created_at: String::new(),
             peer_id: String::new(),
         });
-        assert!(verify_device_signature(
+        assert!(!verify_device_signature(
             &pub_b64,
             &signed_for(&sk, "nemo-poll", "peer-a", now),
             "nemo-poll",
             "peer-a"
         ));
+        // Re-pin BOUND to peer-a so the checks below fail for the reason they name.
+        integration::unpin_device_key_for_test(&pub_b64);
+        integration::pin_device_key_for_test(integration::DeviceKey {
+            id: "testkey".to_owned(),
+            label: "test".to_owned(),
+            public_key: pub_b64.clone(),
+            created_at: String::new(),
+            peer_id: "peer-a".to_owned(),
+        });
         // Domain separation: a poll signature is useless against the ab endpoint.
         assert!(!verify_device_signature(
             &pub_b64,
@@ -5219,15 +5258,9 @@ mod tests {
             "peer-b"
         ));
 
-        // M1: re-pin BOUND to peer-a — only peer-a authenticates now.
-        integration::unpin_device_key_for_test(&pub_b64);
-        integration::pin_device_key_for_test(integration::DeviceKey {
-            id: "testkey".to_owned(),
-            label: "test".to_owned(),
-            public_key: pub_b64.clone(),
-            created_at: String::new(),
-            peer_id: "peer-a".to_owned(),
-        });
+        // M1: bound to peer-a — peer-a authenticates, a peer-b claim is refused by the
+        // binding, and a peer-b signature presented under the bound id by the id check
+        // inside the signature.
         assert!(verify_device_signature(
             &pub_b64,
             &signed_for(&sk, "nemo-poll", "peer-a", now),
@@ -5239,6 +5272,12 @@ mod tests {
             &signed_for(&sk, "nemo-poll", "peer-b", now),
             "nemo-poll",
             "peer-b"
+        ));
+        assert!(!verify_device_signature(
+            &pub_b64,
+            &signed_for(&sk, "nemo-poll", "peer-b", now),
+            "nemo-poll",
+            "peer-a"
         ));
         integration::unpin_device_key_for_test(&pub_b64);
     }
