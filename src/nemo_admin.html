@@ -1185,7 +1185,7 @@
       ["allow-websocket", "Use WebSocket", "bool"],
       ["disable-udp", "Disable UDP", "bool"],
       ["allow-insecure-tls-fallback", "Insecure TLS fallback", "bool", null, "Allow clients to accept the API's self-signed certificate. Needed until you install a CA-signed cert; the login password is still sealed regardless. Deny once you have a trusted cert."],
-      ["nemo-require-encrypted-session", "Require encrypted session (fail closed, S-A)", "bool", null, "Refuse to connect to a peer whose encryption key can't be verified, instead of silently falling back to plaintext. Allow = maximum security; Deny/Local = permit the (insecure) fallback."],
+      ["nemo-require-encrypted-session", "Require encrypted session (fail closed, S-A)", "bool", null, "Refuse to connect to a peer whose encryption key can't be verified, instead of silently falling back to plaintext. ON BY DEFAULT: Local and Allow both enforce it. Only Deny re-opens the (insecure) plaintext fallback, and only as a recovery measure — the relay is in the path of every relayed session, so a handshake fault it induces would then hand it the session in the clear."],
       ["allow-auto-update", "Auto update", "bool"],
       ["enable-confirm-closing-tabs", "Confirm closing tabs", "bool"],
       ["enable-open-new-connections-in-tabs", "Open connections in tabs", "bool"],
