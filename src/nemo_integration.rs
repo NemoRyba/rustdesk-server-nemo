@@ -80,6 +80,10 @@ fn default_true() -> bool {
     true
 }
 
+fn default_permissions_version() -> u64 {
+    1
+}
+
 impl Default for LdapConfig {
     fn default() -> Self {
         Self {
@@ -99,7 +103,7 @@ impl Default for LdapConfig {
 /// A user's management policy (session settings) — same shape as the per-device
 /// managed policy, but keyed to the LDAP identity. Applied to whatever client the
 /// user logs into (replacing the device policy).
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct UserManagedPolicy {
     #[serde(default)]
     pub allow_user_override: bool,
@@ -156,6 +160,11 @@ impl Default for UserPermission {
 pub struct IntegrationConfig {
     #[serde(default)]
     pub ldap: LdapConfig,
+    /// Version number for concurrency control (H11/H20/H22).
+    /// Incremented on every permissions update. Clients can use this to detect
+    /// stale tabs and prevent overwriting concurrent changes.
+    #[serde(default = "default_permissions_version")]
+    pub permissions_version: u64,
     /// username (lower-cased canonical) -> permissions
     #[serde(default)]
     pub permissions: HashMap<String, UserPermission>,
@@ -266,6 +275,7 @@ impl Default for IntegrationConfig {
     fn default() -> Self {
         Self {
             ldap: LdapConfig::default(),
+            permissions_version: 1,
             permissions: HashMap::new(),
             default_targets: Vec::new(),
             require_login: false,
@@ -309,6 +319,14 @@ pub fn ab_version() -> u64 {
 }
 fn bump_ab_version() {
     AB_VERSION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+// H11/H20/H22: Permissions version for concurrency control
+static PERMISSIONS_VERSION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Increment the permissions version (called when policies change)
+pub fn bump_permissions_version() {
+    PERMISSIONS_VERSION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
 fn load_config() -> IntegrationConfig {
@@ -536,12 +554,22 @@ pub fn permissions_snapshot() -> HashMap<String, UserPermission> {
     CONFIG.lock().unwrap().permissions.clone()
 }
 
+/// H11/H20/H22: Get the current permissions version for concurrency control
+pub fn permissions_version() -> u64 {
+    CONFIG.lock().unwrap().permissions_version
+}
+
 pub fn default_targets() -> Vec<String> {
     CONFIG.lock().unwrap().default_targets.clone()
 }
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct PermissionsUpdate {
+    /// H11/H20/H22: Version number for concurrency control. If the client's version
+    /// doesn't match the server's current version, the update is rejected to prevent
+    /// stale tabs from overwriting concurrent changes.
+    #[serde(default)]
+    pub version: Option<u64>,
     /// Present = replace the whole permission set; absent = leave it (so a panel
     /// can update just default_policy_name / admin_policy without wiping users).
     #[serde(default)]
@@ -560,8 +588,22 @@ pub struct PermissionsUpdate {
 
 /// Replace the RBAC map (and optionally the default targets / require-login),
 /// persist, return it.
-pub fn update_permissions(update: PermissionsUpdate) -> HashMap<String, UserPermission> {
+pub fn update_permissions(update: PermissionsUpdate) -> Result<HashMap<String, UserPermission>, String> {
     let mut cfg = CONFIG.lock().unwrap();
+    
+    // H11/H20/H22: Check version for concurrency control
+    if let Some(client_version) = update.version {
+        if client_version != cfg.permissions_version {
+            return Err(format!(
+                "version mismatch: client has version {}, server has version {}",
+                client_version, cfg.permissions_version
+            ));
+        }
+    }
+    
+    // H23/M13: Capture existing permissions before update to detect changes
+    let old_permissions = cfg.permissions.clone();
+    
     // Normalise keys to canonical lower-case so lookups at login match. Only when
     // permissions are actually provided — a partial update (e.g. just the admin
     // policy) must NOT wipe the whole allowlist.
@@ -586,11 +628,18 @@ pub fn update_permissions(update: PermissionsUpdate) -> HashMap<String, UserPerm
     if let Some(ap) = update.admin_policy {
         cfg.admin_policy = ap;
     }
+    // H11/H20/H22: Increment permissions version to detect concurrent modifications
+    cfg.permissions_version = cfg.permissions_version.saturating_add(1);
     let snapshot = cfg.permissions.clone();
     persist(&cfg);
     drop(cfg);
     bump_ab_version(); // signal logged-in clients to re-fetch their address book
-    snapshot
+    
+    // H23/M13: Evict live sessions whose permissions have changed
+    // so they must re-authenticate with the new policy
+    evict_sessions_with_changed_permissions(&old_permissions, &snapshot);
+    
+    Ok(snapshot)
 }
 
 fn normalize_targets(targets: Vec<String>) -> Vec<String> {
@@ -606,6 +655,69 @@ fn normalize_targets(targets: Vec<String>) -> Vec<String> {
         }
     }
     out
+}
+
+/// H23/M13: Evict live sessions whose permissions have changed.
+/// When permissions are updated, existing sessions are invalidated so users
+/// must re-authenticate with the new policy. This ensures permission changes
+/// take effect immediately rather than lingering until token expiry.
+fn evict_sessions_with_changed_permissions(
+    old_perms: &HashMap<String, UserPermission>,
+    new_perms: &HashMap<String, UserPermission>,
+) {
+    let mut sessions = SESSIONS.lock().unwrap();
+    
+    // Collect tokens to evict
+    let to_evict: Vec<String> = sessions
+        .iter()
+        .filter(|(_, s)| {
+            let key = normalize_lookup_username(&s.username);
+            // Evict if user was removed from permissions
+            if !new_perms.contains_key(&key) {
+                return true;
+            }
+            // Evict if user was disabled (enabled: true -> false)
+            let old_enabled = old_perms.get(&key).map(|p| p.enabled);
+            let new_enabled = new_perms.get(&key).map(|p| p.enabled);
+            if old_enabled == Some(true) && new_enabled == Some(false) {
+                return true;
+            }
+            // Evict if allowed_targets changed (user can no longer reach some targets)
+            let old_targets = old_perms.get(&key).map(|p| &p.allowed_targets);
+            let new_targets = new_perms.get(&key).map(|p| &p.allowed_targets);
+            if old_targets != new_targets {
+                return true;
+            }
+            // Evict if is_admin flag changed (admin changes affect live sessions)
+            let old_admin = old_perms.get(&key).map(|p| p.is_admin);
+            let new_admin = new_perms.get(&key).map(|p| p.is_admin);
+            if old_admin != new_admin {
+                return true;
+            }
+            // Evict if policy changed
+            let old_policy = old_perms.get(&key).map(|p| (&p.policy, p.policy_name.as_deref()));
+            let new_policy = new_perms.get(&key).map(|p| (&p.policy, p.policy_name.as_deref()));
+            if old_policy != new_policy {
+                return true;
+            }
+            false
+        })
+        .map(|(t, _)| t.clone())
+        .collect();
+    
+    let evicted_count = to_evict.len();
+    // Actually evict
+    for token in to_evict {
+        sessions.remove(&token);
+    }
+    
+    // Persist updated sessions
+    if !sessions.is_empty() {
+        persist_sessions(&sessions);
+    } else if evicted_count > 0 {
+        // All sessions evicted, remove the file
+        let _ = std::fs::remove_file(sessions_path());
+    }
 }
 
 /// Record a successful LDAP login for an **already-allowlisted** user: refresh

@@ -1290,8 +1290,9 @@
     $("adminPolicySave").addEventListener("click", async () => {
       const ap = collectAdminPolicy();
       try {
-        await api("/nemo/api/integration/permissions", { method: "PUT", body: JSON.stringify({ admin_policy: ap }) });
+        const result = await api("/nemo/api/integration/permissions", { method: "PUT", body: JSON.stringify({ version: integ.permissionsVersion, admin_policy: ap }) });
         integ.adminPolicy = ap;
+        integ.permissionsVersion = result.permissions_version || integ.permissionsVersion + 1;
         setMsg("adminPolicyMsg", "Saved.", true);
       } catch (err) { setMsg("adminPolicyMsg", err.message, false); }
     });
@@ -2074,6 +2075,7 @@
         integ.peers = perms.peers || [];
         integ.policies = pol.policies || {};
         integ.devicePolicies = pol.device_policies || {};
+        integ.permissionsVersion = perms.permissions_version || 1;
         renderLdapForm();
         renderPolicies();
         renderPerms();
@@ -2458,6 +2460,8 @@
         const res = await api("/nemo/api/policies", { method: "PUT", body: JSON.stringify({ policies: integ.policies }) });
         integ.policies = res.policies || {};
         integ.devicePolicies = res.device_policies || {};
+        // Policies affect user permissions (policy_name), so bump the version
+        integ.permissionsVersion = res.permissions_version || integ.permissionsVersion + 1;
         setMsg("policiesSaveMsg", "Saved", true);
         renderPolicies();
         renderPerms();
@@ -2588,13 +2592,16 @@
     async function savePermissions() {
       collectPerms();
       const body = {
+        version: integ.permissionsVersion,
         permissions: integ.perms,
         default_targets: $("defaultAllowAll").checked ? ["*"] : [],
         require_login: $("requireLogin").checked,
         default_policy_name: ($("defaultPolicySelect") ? $("defaultPolicySelect").value : "") || ""
       };
       try {
-        integ.perms = await api("/nemo/api/integration/permissions", { method: "PUT", body: JSON.stringify(body) });
+        const result = await api("/nemo/api/integration/permissions", { method: "PUT", body: JSON.stringify(body) });
+        integ.perms = result.permissions || {};
+        integ.permissionsVersion = result.permissions_version || integ.permissionsVersion + 1;
         integ.defaultTargets = body.default_targets;
         integ.requireLogin = body.require_login;
         integ.defaultPolicyName = body.default_policy_name;

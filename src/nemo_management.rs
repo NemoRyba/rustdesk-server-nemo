@@ -2241,7 +2241,10 @@ async fn put_permissions(
     Json(update): Json<integration::PermissionsUpdate>,
 ) -> ApiResult<HashMap<String, integration::UserPermission>> {
     require_auth(&headers, &state.token)?;
-    Ok(Json(integration::update_permissions(update)))
+    match integration::update_permissions(update) {
+        Ok(perms) => Ok(Json(perms)),
+        Err(e) => Err(api_error(StatusCode::BAD_REQUEST, &format!("Bad Request: {}", e))),
+    }
 }
 
 // --- S-DUALKEY: provisioned device keys -------------------------------------
