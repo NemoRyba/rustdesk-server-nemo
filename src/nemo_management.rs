@@ -358,6 +358,32 @@ struct TlsCertInfo {
     pem: String,         // the serving certificate in PEM, so a client can save/pin it
 }
 
+/// Sweep HIGH (Bearer over accept-any-cert): the client login screen defaults to
+/// allow-insecure-tls-fallback=Y so a self-signed API works out of the box, and
+/// then accepts ANY certificate -- including a man-in-the-middle's. The policy
+/// itself is signed by the management key, so it can safely carry the fix:
+/// - self-signed API: push its own SHA-256 as nemo-api-cert-fingerprint. The
+///   client then uses the pinned TLS client for the API host and never falls
+///   back. Back up nemo-api-cert.pem/-key.pem: a regenerated cert strands every
+///   pinned client until the pin is cleared locally.
+/// - operator-provided (CA) cert: push allow-insecure-tls-fallback=N, since a
+///   valid chain never needs the fallback and a MITM would.
+/// An explicit value in the global policy always wins.
+fn apply_api_tls_defaults(options: &mut HashMap<String, String>, info: Option<&TlsCertInfo>) {
+    let Some(info) = info.filter(|i| i.tls) else {
+        return;
+    };
+    if info.mode == "self-signed" && !info.fingerprint.is_empty() {
+        options
+            .entry("nemo-api-cert-fingerprint".to_owned())
+            .or_insert_with(|| info.fingerprint.clone());
+    } else if info.mode == "provided" {
+        options
+            .entry("allow-insecure-tls-fallback".to_owned())
+            .or_insert_with(|| "N".to_owned());
+    }
+}
+
 // Parse the PEM the API is serving and stash a client-facing summary. Best
 // effort: on any parse failure we still record tls=true + mode so the login
 // screen can explain the situation rather than showing nothing.
@@ -3876,6 +3902,7 @@ async fn client_policy(
     }
     // Global (infrastructure) defaults first — api-server, TLS fallback, etc.
     let mut policy = global_policy();
+    apply_api_tls_defaults(&mut policy.options, API_CERT_INFO.read().unwrap().as_ref());
 
     // Identity-based policy: resolve the logged-in, enabled user from the token.
     // A1: the token may arrive sealed to our mgmt key (confidential on the wire).
@@ -4579,6 +4606,26 @@ mod tests {
     //! single serial test that restores the flag, so the suite stays
     //! deterministic under `cargo test`'s parallel runner.
     use super::*;
+
+    #[test]
+    fn api_tls_defaults_pin_self_signed_and_close_fallback_for_provided() {
+        let mut o = HashMap::new();
+        apply_api_tls_defaults(&mut o, None);
+        assert!(o.is_empty());
+        let ss = TlsCertInfo { tls: true, mode: "self-signed".into(), fingerprint: "AA:BB".into(), ..Default::default() };
+        apply_api_tls_defaults(&mut o, Some(&ss));
+        assert_eq!(o.get("nemo-api-cert-fingerprint").map(|s| s.as_str()), Some("AA:BB"));
+        assert!(!o.contains_key("allow-insecure-tls-fallback"));
+        let mut o = HashMap::new();
+        o.insert("nemo-api-cert-fingerprint".to_owned(), "CC".to_owned());
+        apply_api_tls_defaults(&mut o, Some(&ss));
+        assert_eq!(o["nemo-api-cert-fingerprint"], "CC", "operator value wins");
+        let mut o = HashMap::new();
+        let ca = TlsCertInfo { tls: true, mode: "provided".into(), fingerprint: "DD".into(), ..Default::default() };
+        apply_api_tls_defaults(&mut o, Some(&ca));
+        assert_eq!(o["allow-insecure-tls-fallback"], "N");
+        assert!(!o.contains_key("nemo-api-cert-fingerprint"), "never pin a renewing CA cert");
+    }
 
     #[test]
     fn session_binding_needs_the_same_proven_key() {
