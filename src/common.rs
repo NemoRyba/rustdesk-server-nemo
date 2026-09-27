@@ -191,7 +191,12 @@ fn create_private_file(path: &str) -> std::io::Result<std::fs::File> {
     std::fs::File::create(path)
 }
 
-pub fn gen_sk(wait: u64) -> (String, Option<sign::SecretKey>) {
+/// Load the signing key from `id_ed25519`, or -- only when `may_generate` --
+/// create one. A missing key file used to mean a silent new key: every client
+/// that pinned the old one then refused the server, and hbbs and hbbr could each
+/// mint a different key on a fresh host. Now a missing file is fatal unless the
+/// operator asked for a new key (hbbs `--generate-key Y`); hbbr never generates.
+pub fn gen_sk(wait: u64, may_generate: bool) -> (String, Option<sign::SecretKey>) {
     let sk_file = "id_ed25519";
     if wait > 0 && !std::path::Path::new(sk_file).exists() {
         std::thread::sleep(std::time::Duration::from_millis(wait));
@@ -214,6 +219,17 @@ pub fn gen_sk(wait: u64) -> (String, Option<sign::SecretKey>) {
                 std::process::exit(1);
             }
         }
+    } else if !may_generate {
+        // don't use log here, since it is async
+        println!(
+            "Fatal error: no {sk_file} in {}. Restore the backed-up key (clients pin it), \
+             or create a new one once with `hbbs -k _ --generate-key Y` -- which \
+             invalidates every client provisioned with the old key.",
+            std::env::current_dir()
+                .map(|d| d.display().to_string())
+                .unwrap_or_else(|_| ".".to_owned())
+        );
+        std::process::exit(1);
     } else {
         let gen_func = || {
             let (tmp, sk) = sign::gen_keypair();

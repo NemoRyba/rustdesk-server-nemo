@@ -36,6 +36,7 @@ fn main() -> ResultType<()> {
         , --nemo-api-allow-insecure=[BOOL(default=N)] 'Allow the management API (admin token, LDAP login, managed secrets) over plaintext HTTP on a routable bind (NOT recommended)'
         , --nemo-integration-file=[FILE] 'Path to the Nemo integration config (LDAP + RBAC) JSON file'
         , --insecure-ldap-i-accept-mitm=[BOOL(default=N)] 'Allow LDAP tls_verify=false (accept ANY DC certificate — man-in-the-middle risk; NOT for production)'
+        , --generate-key=[BOOL(default=N)] 'With -k _ and no id_ed25519: create a new signing key instead of refusing to start. Every client provisioned with the old key will refuse this server, so use it once on a fresh install'
         , --allow-unbound-device-keys=[BOOL(default=N)] 'Let a pinned device key that has NO peer-id binding authenticate ANY peer id. Escape hatch for keys minted before bindings existed: one blank admin field becomes a fleet-wide skeleton key, so bind or replace those keys and drop this flag (NOT for production)'
         , --nemo-global-policy-file=[FILE] 'Path to the Nemo global client-policy JSON file'
         , --nemo-company-only-file=[FILE] 'Path to persist the company-only flag across restarts'

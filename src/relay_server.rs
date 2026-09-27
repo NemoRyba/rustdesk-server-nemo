@@ -657,7 +657,9 @@ fn get_server_keypair(key: &str) -> (String, Option<sign::SecretKey>) {
     }
 
     if key == "-" || key == "_" {
-        let (pk, gen) = crate::common::gen_sk(300);
+        // hbbr shares hbbs's key and never creates one (it would race hbbs on a
+        // fresh host); systemd restarts it until hbbs has written the file.
+        let (pk, gen) = crate::common::gen_sk(300, false);
         key = pk;
         sk = gen;
     }
