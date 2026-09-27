@@ -328,11 +328,26 @@ fn load_config() -> IntegrationConfig {
         Ok(text) => match serde_json::from_str::<IntegrationConfig>(&text) {
             Ok(cfg) => cfg,
             Err(err) => {
-                log::error!(
-                    "Nemo integration config at {} is invalid ({}); using defaults",
-                    path.display(),
-                    err
-                );
+                // Crash-safety review finding: silently falling back to
+                // IntegrationConfig::default() here -- empty allowlist, no device
+                // keys, require_login off -- used to be invisible, AND the very next
+                // persist() (record_login writes on every successful login) wrote
+                // those defaults straight over the damaged file, destroying whatever
+                // of it could have been recovered by hand. Move the bad file aside
+                // first, so it survives for inspection/recovery, and say so loudly
+                // (not just at error level -- this is a fleet-wide lockout under
+                // require_device_key/require_login).
+                let corrupt = path.with_extension(format!("corrupt-{}", now_iso8601()));
+                match std::fs::rename(&path, &corrupt) {
+                    Ok(()) => log::error!(
+                        "Nemo integration config at {} is invalid ({}); moved it to {}                          and starting from EMPTY defaults -- every user/device key is                          gone until it is restored or reconfigured",
+                        path.display(), err, corrupt.display()
+                    ),
+                    Err(rename_err) => log::error!(
+                        "Nemo integration config at {} is invalid ({}); could not move                          it aside ({}), starting from EMPTY defaults -- the NEXT save                          will overwrite it",
+                        path.display(), err, rename_err
+                    ),
+                }
                 IntegrationConfig::default()
             }
         },
@@ -394,11 +409,34 @@ fn restrict_file_windows(path: &std::path::Path) {
     }
 }
 
+/// Crash-safety review finding: a plain `fs::write` truncates the file first and
+/// rewrites it in place, so a crash or a full disk mid-write left a truncated,
+/// unparseable file -- and record_login persists on every login, so this was not
+/// a rare window. Write to a sibling temp file, fsync it, then rename over the
+/// target: on the same filesystem (always true here; the temp file sits next to
+/// it) POSIX rename is atomic, so readers only ever see the old complete file or
+/// the new complete file, never a partial one. Returns the path actually
+/// written, for the caller to restrict permissions on.
+fn atomic_write(path: &std::path::Path, text: &str) -> std::io::Result<()> {
+    let tmp = path.with_extension(format!(
+        "{}.tmp-{}",
+        path.extension().and_then(|e| e.to_str()).unwrap_or("json"),
+        std::process::id()
+    ));
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        use std::io::Write;
+        f.write_all(text.as_bytes())?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)
+}
+
 fn persist(cfg: &IntegrationConfig) {
     let path = config_path();
     match serde_json::to_string_pretty(cfg) {
         Ok(text) => {
-            if let Err(err) = std::fs::write(&path, text) {
+            if let Err(err) = atomic_write(&path, &text) {
                 log::error!(
                     "failed to write Nemo integration config to {}: {}",
                     path.display(),
@@ -1173,7 +1211,7 @@ fn load_sessions() -> HashMap<String, Session> {
 fn persist_sessions(sessions: &HashMap<String, Session>) {
     if let Ok(text) = serde_json::to_string(sessions) {
         let path = sessions_path();
-        if let Err(err) = std::fs::write(&path, text) {
+        if let Err(err) = atomic_write(&path, &text) {
             log::error!("failed to persist Nemo sessions to {}: {}", path.display(), err);
         } else {
             // M3: live bearer tokens — keep them readable only by the service account.

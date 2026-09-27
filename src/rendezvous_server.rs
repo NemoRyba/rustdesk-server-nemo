@@ -166,9 +166,24 @@ struct Inner {
 /// handle other tasks use to hand it a message to write.
 type PeerPush = tokio::sync::mpsc::UnboundedSender<RendezvousMessage>;
 
+/// A RequestRelay hbbs actually forwarded to a target, keyed by the CONTROLLER's
+/// address (the same bytes the target echoes back unchanged in RelayResponse.socket_addr,
+/// so this is the correlation hbbs already has on hand). Review finding: hbbs used to
+/// mint a signed relay grant for ANY RelayResponse frame, with no check that a
+/// RequestRelay for it was ever sent -- so any peer, or any unauthenticated caller
+/// while require_device_key is off, could mint unlimited grants and use hbbr as a
+/// free relay. A grant is now minted only for a pending, unexpired, single-use entry
+/// this table records at the point hbbs actually pushed the request to that target.
+struct PendingRelay {
+    target_id: String,
+    expires: std::time::Instant,
+}
+const PENDING_RELAY_TTL: std::time::Duration = std::time::Duration::from_secs(RELAY_GRANT_TTL_SECS);
+
 #[derive(Clone)]
 pub struct RendezvousServer {
     tcp_punch: Arc<Mutex<HashMap<SocketAddr, Sink>>>,
+    pending_relay: Arc<Mutex<HashMap<SocketAddr, PendingRelay>>>,
     /// Peers whose rendezvous connection is TCP/WS rather than UDP. Entries are
     /// replaced on reconnect and swept when their receiver is gone, so a task that
     /// exits never has to remove its own -- which would otherwise race a reconnect
@@ -326,6 +341,7 @@ impl RendezvousServer {
         };
         let mut rs = Self {
             tcp_punch: Arc::new(Mutex::new(HashMap::new())),
+            pending_relay: Arc::new(Mutex::new(HashMap::new())),
             tcp_peers: Arc::new(Mutex::new(HashMap::new())),
             pm,
             tx: tx.clone(),
@@ -790,6 +806,18 @@ impl RendezvousServer {
                         {
                             nemo_forwarded = true;
                         }
+                        // Record it so the target's eventual RelayResponse can be told
+                        // apart from an unsolicited one; `addr` is the controller's
+                        // address, the same bytes the target's reply carries back.
+                        let mut pending = self.pending_relay.lock().await;
+                        pending.retain(|_, p| p.expires > std::time::Instant::now());
+                        pending.insert(
+                            addr,
+                            PendingRelay {
+                                target_id,
+                                expires: std::time::Instant::now() + PENDING_RELAY_TTL,
+                            },
+                        );
                     }
                     #[cfg(feature = "nemo-management-api")]
                     if !nemo_id.is_empty() {
@@ -804,6 +832,29 @@ impl RendezvousServer {
                 }
                 Some(rendezvous_message::Union::RelayResponse(mut rr)) => {
                     let addr_b = AddrMangle::decode(&rr.socket_addr);
+                    // Only a RelayResponse answering a RequestRelay hbbs actually sent
+                    // gets a grant. `addr_b` is the controller address the target echoed
+                    // back unchanged; the entry is single-use (removed here) and expires
+                    // with the grant TTL. Optionally cross-check the responder's proven
+                    // identity against the target hbbs pushed the request to, when this
+                    // connection authenticated with a device key.
+                    let pending = self.pending_relay.lock().await.remove(&addr_b);
+                    let Some(pending) = pending else {
+                        log::warn!(
+                            "Dropping unsolicited RelayResponse from {:?}: no matching RequestRelay was forwarded",
+                            addr
+                        );
+                        return false;
+                    };
+                    if let Some(who) = authed {
+                        if who.peer_id != pending.target_id {
+                            log::warn!(
+                                "Dropping RelayResponse from {:?}: proved identity '{}' does not match the target '{}' hbbs forwarded the request to",
+                                addr, who.peer_id, pending.target_id
+                            );
+                            return false;
+                        }
+                    }
                     rr.socket_addr = Default::default();
                     // TASK #16: hbbs mints the relay session id: a grant signed with
                     // the server key that hbbr verifies. Back to the responder on this
@@ -2431,6 +2482,7 @@ mod tests {
         let (tx, _rx) = mpsc::unbounded_channel::<Data>();
         let mut rs = RendezvousServer {
             tcp_punch: Arc::new(Mutex::new(HashMap::new())),
+            pending_relay: Arc::new(Mutex::new(HashMap::new())),
             tcp_peers: Arc::new(Mutex::new(HashMap::new())),
             pm,
             tx,
