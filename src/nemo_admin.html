@@ -2167,7 +2167,9 @@
         });
         // Fold the change into the ACL tab so its next save neither drops this
         // user nor trips the version check; keep any unsaved edits on other rows.
-        if (res && res.key && res.permission && res.permissions_version) {
+        // Only when this toggle was the ONLY change since the tab loaded: adopting
+        // a version that skipped ours would launder a stale tab past the check.
+        if (res && res.key && res.permission && res.permissions_version === integ.permissionsVersion + 1) {
           collectPerms();
           integ.perms[res.key] = res.permission;
           integ.permissionsVersion = res.permissions_version;

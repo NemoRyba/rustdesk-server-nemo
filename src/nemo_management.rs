@@ -1697,9 +1697,8 @@ async fn api_login(
                 proven_device_key,
             );
             log::info!(
-                "Nemo login OK: user='{}' name='{}' admin={} from client id={} uuid={}",
+                "Nemo login OK: user='{}' admin={} from client id={} uuid={}",
                 user.username,
-                user.display_name,
                 is_admin,
                 if req.id.trim().is_empty() { "?" } else { req.id.trim() },
                 if req.uuid.trim().is_empty() { "?" } else { req.uuid.trim() },
@@ -3805,8 +3804,6 @@ async fn client_policy(
         .map_err(server_error)?
         .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "peer not found"))?;
     validate_client_policy_request(&peer, &request)?;
-    // Learn this peer's hostname from its own poll so the address book can show it.
-    record_peer_hostname(&request.id, request.hostname.as_deref().unwrap_or(""));
     // S-DUALKEY: note which key the client authenticated with, and enforce the
     // "require provisioned device key" setting.
     let device_key_ok = verify_device_key(&request);
@@ -3817,6 +3814,9 @@ async fn client_policy(
             "a provisioned device key is required",
         ));
     }
+    // Learn this peer's hostname from its own poll so the address book can show
+    // it -- only after the device-key gate, or anyone knowing id+uuid could rename it.
+    record_peer_hostname(&request.id, request.hostname.as_deref().unwrap_or(""));
     if let Some(version) = request.policy_version.as_deref() {
         log::trace!("Client {} requested management policy after {}", request.id, version);
     }
