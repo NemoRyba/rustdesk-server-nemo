@@ -49,7 +49,6 @@ fn main() -> ResultType<()> {
     }
     let rmem = get_arg("rmem").parse::<usize>().unwrap_or(RMEM);
     let serial: i32 = get_arg("serial").parse().unwrap_or(0);
-    crate::common::check_software_update();
     RendezvousServer::start(
         port,
         serial,

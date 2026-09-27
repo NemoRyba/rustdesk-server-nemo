@@ -1,6 +1,6 @@
 use clap::App;
 use hbb_common::{
-    allow_err, anyhow::{Context, Result}, get_version_number, log, tokio, ResultType
+    anyhow::{Context, Result}, log, ResultType
 };
 use ini::Ini;
 use sodiumoxide::crypto::sign;
@@ -294,32 +294,13 @@ pub async fn listen_signal() -> Result<()> {
 }
 
 
-pub fn check_software_update() {
-    const ONE_DAY_IN_SECONDS: u64 = 60 * 60 * 24;
-    std::thread::spawn(move || loop {
-        std::thread::spawn(move || allow_err!(check_software_update_()));
-        std::thread::sleep(std::time::Duration::from_secs(ONE_DAY_IN_SECONDS));
-    });
-}
-
-#[tokio::main(flavor = "current_thread")]
-async fn check_software_update_() -> hbb_common::ResultType<()> {
-    let (request, url) = hbb_common::version_check_request(hbb_common::VER_TYPE_RUSTDESK_SERVER.to_string());
-    let latest_release_response = reqwest::Client::builder().build()?
-        .post(url)
-        .json(&request)
-        .send()
-        .await?;
-
-    let bytes = latest_release_response.bytes().await?;
-    let resp: hbb_common::VersionCheckResponse = serde_json::from_slice(&bytes)?;
-    let response_url = resp.url;
-    let latest_release_version = response_url.rsplit('/').next().unwrap_or_default();
-    if get_version_number(&latest_release_version) > get_version_number(crate::version::VERSION) {
-       log::info!("new version is available: {}", latest_release_version);
-    }
-    Ok(())
-}
+// Sweep MEDIUM (2026-09-27): this used to phone home to api.rustdesk.com once a
+// day with the OS, this server's version, architecture and a machine
+// fingerprint, to ask whether a newer RELEASE exists. This fork ships its own
+// update manifest (nemo_management: put_update_manifest / /nemo/api/update)
+// signed by the operator's own key, so an external check served no purpose
+// here beyond leaking that this server exists and when it last restarted.
+// Removed rather than disabled: no flag reintroduces it by accident.
 
 #[cfg(test)]
 mod relay_grant_tests {
