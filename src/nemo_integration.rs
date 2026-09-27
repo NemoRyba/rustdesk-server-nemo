@@ -216,11 +216,12 @@ pub struct IntegrationConfig {
     /// rule: an explicit stored `false` survives, an omitted field becomes `true`.
     #[serde(default = "default_true")]
     pub strip_unsealed_secrets: bool,
-    /// S-B: when true, an /api/login request that carries no sealed credential is
-    /// rejected instead of being accepted with a readable password. Off by default so
-    /// a fleet that has not been updated yet keeps logging in; turn it on once every
-    /// client seals its login.
-    #[serde(default)]
+    /// S-B / N12: when true, an /api/login request that carries no sealed credential
+    /// is rejected instead of being accepted with a readable password. ON by default
+    /// (a config file without the field gets it on too); current clients have no
+    /// plaintext path at all. An existing file that says false keeps false -- flip it
+    /// in the dashboard once the fleet is updated.
+    #[serde(default = "default_true")]
     pub require_sealed_login: bool,
     /// S-B: when true, the policy poll and the address-book request must arrive as a
     /// sealed request envelope; a plaintext body is rejected. Off by default for the
@@ -288,7 +289,7 @@ impl Default for IntegrationConfig {
             // server keeps whatever its nemo_integration.json stores (field docs above).
             require_device_key: true,
             strip_unsealed_secrets: true,
-            require_sealed_login: false,
+            require_sealed_login: true,
             require_sealed_request: false,
         }
     }
@@ -596,7 +597,7 @@ fn check_permissions_version(client: Option<u64>, server: u64) -> Result<(), Str
 /// why the admin UI always sends it.
 pub fn update_permissions(
     update: PermissionsUpdate,
-) -> Result<(HashMap<String, UserPermission>, u64), String> {
+) -> Result<(HashMap<String, UserPermission>, u64, Vec<String>), String> {
     let mut cfg = CONFIG.lock().unwrap();
     check_permissions_version(update.version, cfg.permissions_version)?;
 
@@ -637,9 +638,9 @@ pub fn update_permissions(
     
     // H23/M13: Evict live sessions whose permissions have changed
     // so they must re-authenticate with the new policy
-    evict_sessions_with_changed_permissions(&old_permissions, &snapshot);
+    let evicted_keys = evict_sessions_with_changed_permissions(&old_permissions, &snapshot);
 
-    Ok((snapshot, version))
+    Ok((snapshot, version, evicted_keys))
 }
 
 fn normalize_targets(targets: Vec<String>) -> Vec<String> {
@@ -664,7 +665,7 @@ fn normalize_targets(targets: Vec<String>) -> Vec<String> {
 fn evict_sessions_with_changed_permissions(
     old_perms: &HashMap<String, UserPermission>,
     new_perms: &HashMap<String, UserPermission>,
-) {
+) -> Vec<String> {
     let mut sessions = SESSIONS.lock().unwrap();
     
     // Collect tokens to evict
@@ -706,18 +707,24 @@ fn evict_sessions_with_changed_permissions(
         .collect();
     
     let evicted_count = to_evict.len();
-    // Actually evict
+    let mut evicted_keys = Vec::new();
     for token in to_evict {
-        sessions.remove(&token);
+        if let Some(s) = sessions.remove(&token) {
+            if !s.device_key_pub.is_empty() && !evicted_keys.contains(&s.device_key_pub) {
+                evicted_keys.push(s.device_key_pub);
+            }
+        }
     }
     
-    // Persist updated sessions
-    if !sessions.is_empty() {
-        persist_sessions(&sessions);
-    } else if evicted_count > 0 {
-        // All sessions evicted, remove the file
-        let _ = std::fs::remove_file(sessions_path());
+    // Persist only when something was evicted.
+    if evicted_count > 0 {
+        if sessions.is_empty() {
+            let _ = std::fs::remove_file(sessions_path());
+        } else {
+            persist_sessions(&sessions);
+        }
     }
+    evicted_keys
 }
 
 /// Record a successful LDAP login for an **already-allowlisted** user: refresh
@@ -758,7 +765,7 @@ pub fn set_user_enabled(
     enabled: bool,
     display_name: &str,
     email: &str,
-) -> (String, UserPermission, u64) {
+) -> (String, UserPermission, u64, Vec<String>) {
     let key = normalize_lookup_username(username);
     let mut cfg = CONFIG.lock().unwrap();
     let old_permissions = cfg.permissions.clone();
@@ -784,8 +791,8 @@ pub fn set_user_enabled(
     let snapshot = cfg.permissions.clone();
     persist(&cfg);
     drop(cfg);
-    evict_sessions_with_changed_permissions(&old_permissions, &snapshot);
-    (key, result, version)
+    let evicted_keys = evict_sessions_with_changed_permissions(&old_permissions, &snapshot);
+    (key, result, version, evicted_keys)
 }
 
 /// Whether clients must have a logged-in, enabled user to be used at all.
@@ -903,15 +910,34 @@ pub fn add_device_key(
 pub fn list_device_keys() -> Vec<DeviceKey> {
     CONFIG.lock().unwrap().device_keys.clone()
 }
-pub fn remove_device_key(id: &str) -> bool {
+/// Remove a device key; returns the removed key (if any) and drops every login
+/// session that key proved, so its tokens die with it (M69).
+pub fn remove_device_key(id: &str) -> Option<DeviceKey> {
     let mut cfg = CONFIG.lock().unwrap();
-    let before = cfg.device_keys.len();
-    cfg.device_keys.retain(|k| k.id != id);
-    let removed = cfg.device_keys.len() != before;
-    if removed {
-        persist(&cfg);
+    let pos = cfg.device_keys.iter().position(|k| k.id == id)?;
+    let removed = cfg.device_keys.remove(pos);
+    persist(&cfg);
+    drop(cfg);
+    let mut sessions = SESSIONS.lock().unwrap();
+    let before = sessions.len();
+    sessions.retain(|_, s| s.device_key_pub != removed.public_key);
+    if sessions.len() != before {
+        persist_sessions(&sessions);
     }
-    removed
+    Some(removed)
+}
+
+/// The peer id each given device key is bound to (unbound or unknown keys are
+/// skipped): the controller machines whose live sessions a revocation must end.
+pub fn peer_ids_for_device_keys(keys: &[String]) -> Vec<String> {
+    let cfg = CONFIG.lock().unwrap();
+    let mut out = Vec::new();
+    for k in &cfg.device_keys {
+        if !k.peer_id.is_empty() && keys.contains(&k.public_key) && !out.contains(&k.peer_id) {
+            out.push(k.peer_id.clone());
+        }
+    }
+    out
 }
 pub fn is_device_key_pinned(public_key: &str) -> bool {
     let pk = public_key.trim();

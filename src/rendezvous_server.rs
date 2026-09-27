@@ -2079,6 +2079,15 @@ impl RendezvousServer {
                         break;
                     }
                 }
+                // M69: a device key revoked in the dashboard must not keep punching or
+                // relaying on the connection it proved earlier. Re-check it per frame
+                // (a map lookup) and drop the connection once it is gone.
+                if let Some(a) = authed.as_ref() {
+                    if !crate::nemo_integration::is_device_key_pinned(&a.device_pub_b64) {
+                        log::warn!("closing rendezvous connection of {}: its device key was revoked", a.peer_id);
+                        break;
+                    }
+                }
                 if !self.handle_tcp(&bytes, &mut sink, addr, key, ws, &push_tx, authed.as_ref()).await {
                     break;
                 }

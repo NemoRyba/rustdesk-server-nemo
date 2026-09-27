@@ -1876,6 +1876,16 @@ async fn api_ab_get(
         return Json(AbResult::err("a provisioned device key is required"));
     }
     let seal_this = device_key_ok && req.sealed.as_deref() == Some("v1");
+    // A token lifted from one machine is not an address book on another, and a
+    // disabled user gets none.
+    let proven = device_key_ok.then_some(req.device_key_pub.as_str());
+    if !session_device_binding_ok(&session.device_key_pub, proven) {
+        log::warn!("address book refused: user '{}' token spent from another device", session.username);
+        return Json(AbResult::err("this sign-in is bound to another computer; sign in again from this one"));
+    }
+    if !integration::user_is_enabled(&session.username) {
+        return Json(AbResult::err("Invalid token"));
+    }
 
     let peers = match state.pm.list_registered(1000, 0).await {
         Ok(peers) => peers,
@@ -2168,12 +2178,14 @@ async fn set_ldap_user(
             serde_json::json!({ "success": false, "message": "username required" }),
         ));
     }
-    let (key, perm, version) = integration::set_user_enabled(
+    let (key, perm, version, evicted_keys) = integration::set_user_enabled(
         username,
         req.enabled,
         req.display_name.trim(),
         req.email.trim(),
     );
+    let controllers = integration::peer_ids_for_device_keys(&evicted_keys);
+    terminate_sessions_from_controllers(&controllers, "user access changed").await;
     Ok(Json(serde_json::json!({
         "success": true,
         "username": username,
@@ -2255,10 +2267,14 @@ async fn put_permissions(
 ) -> ApiResult<PermissionsPutResponse> {
     require_auth(&headers, &state.token)?;
     match integration::update_permissions(update) {
-        Ok((permissions, permissions_version)) => Ok(Json(PermissionsPutResponse {
-            permissions,
-            permissions_version,
-        })),
+        Ok((permissions, permissions_version, evicted_keys)) => {
+            let controllers = integration::peer_ids_for_device_keys(&evicted_keys);
+            terminate_sessions_from_controllers(&controllers, "permissions changed").await;
+            Ok(Json(PermissionsPutResponse {
+                permissions,
+                permissions_version,
+            }))
+        }
         Err(e) => Err(api_error(StatusCode::CONFLICT, &format!("Conflict: {}", e))),
     }
 }
@@ -2320,7 +2336,12 @@ async fn delete_device_key(
 ) -> ApiResult<serde_json::Value> {
     require_auth(&headers, &state.token)?;
     let removed = integration::remove_device_key(&id);
-    Ok(Json(serde_json::json!({ "removed": removed })))
+    // M69: end what the key is doing right now, not just its future logins.
+    let mut ended = Vec::new();
+    if let Some(k) = removed.as_ref().filter(|k| !k.peer_id.is_empty()) {
+        ended = terminate_sessions_from_controllers(&[k.peer_id.clone()], "device key revoked").await;
+    }
+    Ok(Json(serde_json::json!({ "removed": removed.is_some(), "sessions_ended_on": ended })))
 }
 
 // ---- Auto-update manifest (a Layer 1 consumer) ----
@@ -2632,6 +2653,13 @@ fn client_audit_identity(body: &serde_json::Value) -> Option<String> {
         return None;
     }
     Some(id)
+}
+
+/// TASK #19 at the HTTP routes: a session bound to a device key may only be
+/// spent by a request that proved THAT key. Unbound sessions (issued while
+/// require_device_key was off) pass, as at the rendezvous gate.
+fn session_device_binding_ok(bound: &str, proven: Option<&str>) -> bool {
+    bound.is_empty() || proven == Some(bound)
 }
 
 fn verify_device_key(request: &ClientPolicyRequest) -> bool {
@@ -2983,6 +3011,32 @@ struct CutConnectionRequest {
     target_id: String,
     #[serde(default)]
     source_id: Option<String>,
+}
+
+/// H23 / M69: end the live sessions that the given CONTROLLER machines hold, by
+/// issuing a session revocation to every target the connection store shows them
+/// connected to (the same lever /connections/cut pulls, without blocking the
+/// target). The target ends all its authenticated sessions older than the
+/// revocation on its next poll, so other controllers there reconnect too:
+/// over-revocation, never under. Returns the targets revoked.
+async fn terminate_sessions_from_controllers(controllers: &[String], why: &str) -> Vec<String> {
+    if controllers.is_empty() {
+        return Vec::new();
+    }
+    let mut store = STATS.write().await;
+    let mut targets: Vec<String> = Vec::new();
+    for c in store.connections.iter() {
+        if controllers.contains(&c.source_id) && !targets.contains(&c.target_id) {
+            targets.push(c.target_id.clone());
+        }
+    }
+    for t in &targets {
+        let ts = set_peer_terminate(t);
+        let detail = format!("sessions revoked as of {} ({}; controllers {:?})", ts, why, controllers);
+        record_event_locked(&mut store, "connection-cut", Some(t), None, detail);
+    }
+    store.connections.retain(|c| !controllers.contains(&c.source_id));
+    targets
 }
 
 async fn cut_connection(
@@ -3826,10 +3880,20 @@ async fn client_policy(
     // Identity-based policy: resolve the logged-in, enabled user from the token.
     // A1: the token may arrive sealed to our mgmt key (confidential on the wire).
     let access_token = resolve_access_token(&state, &request);
+    // A token spent from a machine other than the one that proved its login gets
+    // the device's policy, never the user's (whose options can carry secrets).
+    let proven = if device_key_ok { request.device_key_pub.as_deref() } else { None };
     let user = access_token
         .as_deref()
         .and_then(integration::session_for_token)
-        .filter(|s| integration::user_is_enabled(&s.username));
+        .filter(|s| integration::user_is_enabled(&s.username))
+        .filter(|s| {
+            let ok = session_device_binding_ok(&s.device_key_pub, proven);
+            if !ok {
+                log::warn!("user policy withheld: user '{}' token spent from another device", s.username);
+            }
+            ok
+        });
     let require_login = integration::require_login();
 
     match user {
@@ -4506,6 +4570,7 @@ pub(crate) fn is_truthy(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+
     //! Layer 1 (TDD): pure-function unit tests for the Nemo policy layer.
     //!
     //! These live inline so they can reach the module-private functions without
@@ -4514,6 +4579,15 @@ mod tests {
     //! single serial test that restores the flag, so the suite stays
     //! deterministic under `cargo test`'s parallel runner.
     use super::*;
+
+    #[test]
+    fn session_binding_needs_the_same_proven_key() {
+        assert!(session_device_binding_ok("", None));
+        assert!(session_device_binding_ok("", Some("k1")));
+        assert!(session_device_binding_ok("k1", Some("k1")));
+        assert!(!session_device_binding_ok("k1", Some("k2")));
+        assert!(!session_device_binding_ok("k1", None));
+    }
 
     // The controller-identity vectors below are a cross-fork CONTRACT: the
     // client fork formats this exact string in
