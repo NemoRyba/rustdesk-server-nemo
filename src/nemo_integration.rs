@@ -321,14 +321,6 @@ fn bump_ab_version() {
     AB_VERSION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
-// H11/H20/H22: Permissions version for concurrency control
-static PERMISSIONS_VERSION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-
-/// Increment the permissions version (called when policies change)
-pub fn bump_permissions_version() {
-    PERMISSIONS_VERSION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-}
-
 fn load_config() -> IntegrationConfig {
     let path = config_path();
     match std::fs::read_to_string(&path) {
@@ -586,21 +578,28 @@ pub struct PermissionsUpdate {
     pub admin_policy: Option<UserManagedPolicy>,
 }
 
-/// Replace the RBAC map (and optionally the default targets / require-login),
-/// persist, return it.
-pub fn update_permissions(update: PermissionsUpdate) -> Result<HashMap<String, UserPermission>, String> {
-    let mut cfg = CONFIG.lock().unwrap();
-    
-    // H11/H20/H22: Check version for concurrency control
-    if let Some(client_version) = update.version {
-        if client_version != cfg.permissions_version {
-            return Err(format!(
-                "version mismatch: client has version {}, server has version {}",
-                client_version, cfg.permissions_version
-            ));
-        }
+/// H11/H20/H22: a save carrying a version must carry the current one, so a tab
+/// loaded before someone else's save cannot silently overwrite it.
+fn check_permissions_version(client: Option<u64>, server: u64) -> Result<(), String> {
+    match client {
+        Some(v) if v != server => Err(format!(
+            "version mismatch: client has version {}, server has version {}",
+            v, server
+        )),
+        _ => Ok(()),
     }
-    
+}
+
+/// Replace the RBAC map (and optionally the default targets / require-login),
+/// persist, return it with the new `permissions_version`. A `version` that is
+/// present and stale is refused; an absent one is accepted (scripts), which is
+/// why the admin UI always sends it.
+pub fn update_permissions(
+    update: PermissionsUpdate,
+) -> Result<(HashMap<String, UserPermission>, u64), String> {
+    let mut cfg = CONFIG.lock().unwrap();
+    check_permissions_version(update.version, cfg.permissions_version)?;
+
     // H23/M13: Capture existing permissions before update to detect changes
     let old_permissions = cfg.permissions.clone();
     
@@ -631,6 +630,7 @@ pub fn update_permissions(update: PermissionsUpdate) -> Result<HashMap<String, U
     // H11/H20/H22: Increment permissions version to detect concurrent modifications
     cfg.permissions_version = cfg.permissions_version.saturating_add(1);
     let snapshot = cfg.permissions.clone();
+    let version = cfg.permissions_version;
     persist(&cfg);
     drop(cfg);
     bump_ab_version(); // signal logged-in clients to re-fetch their address book
@@ -638,8 +638,8 @@ pub fn update_permissions(update: PermissionsUpdate) -> Result<HashMap<String, U
     // H23/M13: Evict live sessions whose permissions have changed
     // so they must re-authenticate with the new policy
     evict_sessions_with_changed_permissions(&old_permissions, &snapshot);
-    
-    Ok(snapshot)
+
+    Ok((snapshot, version))
 }
 
 fn normalize_targets(targets: Vec<String>) -> Vec<String> {
@@ -740,6 +740,9 @@ pub fn record_login(username: &str, display_name: &str, email: &str) -> (bool, b
             entry.last_login = now_iso8601();
             let result = (true, entry.enabled, entry.is_admin);
             persist(&cfg);
+            // Pairs with the "login failed"/"login refused" warnings in
+            // nemo_management; the account name only, no display name or email.
+            log::info!("Nemo login recorded: {}", key);
             result
         }
         None => (false, false, false),
@@ -755,13 +758,14 @@ pub fn set_user_enabled(
     enabled: bool,
     display_name: &str,
     email: &str,
-) -> UserPermission {
+) -> (String, UserPermission, u64) {
     let key = normalize_lookup_username(username);
     let mut cfg = CONFIG.lock().unwrap();
+    let old_permissions = cfg.permissions.clone();
     let defaults = cfg.default_targets.clone();
     let entry = cfg
         .permissions
-        .entry(key)
+        .entry(key.clone())
         .or_insert_with(|| UserPermission {
             allowed_targets: defaults,
             ..UserPermission::default()
@@ -774,8 +778,14 @@ pub fn set_user_enabled(
         entry.email = email.to_owned();
     }
     let result = entry.clone();
+    // The allowlist changed, so an ACL tab loaded before this must not save over it.
+    cfg.permissions_version = cfg.permissions_version.saturating_add(1);
+    let version = cfg.permissions_version;
+    let snapshot = cfg.permissions.clone();
     persist(&cfg);
-    result
+    drop(cfg);
+    evict_sessions_with_changed_permissions(&old_permissions, &snapshot);
+    (key, result, version)
 }
 
 /// Whether clients must have a logged-in, enabled user to be used at all.
@@ -2617,6 +2627,15 @@ mod tests {
 
         // No attributes => fall back to the raw input (canonicalised).
         assert_eq!(canonical_username(&HashMap::new(), "EXAMPLE\\Bob"), "bob");
+    }
+
+    #[test]
+    fn permissions_version_check_refuses_only_a_stale_version() {
+        assert!(check_permissions_version(Some(3), 3).is_ok());
+        assert!(check_permissions_version(None, 3).is_ok());
+        let err = check_permissions_version(Some(2), 3).unwrap_err();
+        assert!(err.contains("version mismatch"), "{}", err);
+        assert!(check_permissions_version(Some(4), 3).is_err());
     }
 
     #[test]

@@ -2169,7 +2169,7 @@ async fn set_ldap_user(
             serde_json::json!({ "success": false, "message": "username required" }),
         ));
     }
-    let perm = integration::set_user_enabled(
+    let (key, perm, version) = integration::set_user_enabled(
         username,
         req.enabled,
         req.display_name.trim(),
@@ -2179,6 +2179,9 @@ async fn set_ldap_user(
         "success": true,
         "username": username,
         "enabled": perm.enabled,
+        "key": key,
+        "permission": perm,
+        "permissions_version": version,
     })))
 }
 
@@ -2194,6 +2197,7 @@ struct PeerBrief {
 #[derive(Serialize)]
 struct PermissionsResponse {
     permissions: HashMap<String, integration::UserPermission>,
+    permissions_version: u64,
     default_targets: Vec<String>,
     require_login: bool,
     default_policy_name: Option<String>,
@@ -2227,6 +2231,7 @@ async fn get_permissions(
     }
     Ok(Json(PermissionsResponse {
         permissions: integration::permissions_snapshot(),
+        permissions_version: integration::permissions_version(),
         default_targets: integration::default_targets(),
         require_login: integration::require_login(),
         default_policy_name: integration::default_policy_name(),
@@ -2235,15 +2240,27 @@ async fn get_permissions(
     }))
 }
 
+#[derive(Serialize)]
+struct PermissionsPutResponse {
+    permissions: HashMap<String, integration::UserPermission>,
+    permissions_version: u64,
+}
+
+// The admin UI replaces its in-memory map with `permissions` and sends
+// `permissions_version` back on the next save, so both must be here: a bare map
+// left the UI holding {} and a stale version.
 async fn put_permissions(
     Extension(state): Extension<HbbsApiState>,
     headers: HeaderMap,
     Json(update): Json<integration::PermissionsUpdate>,
-) -> ApiResult<HashMap<String, integration::UserPermission>> {
+) -> ApiResult<PermissionsPutResponse> {
     require_auth(&headers, &state.token)?;
     match integration::update_permissions(update) {
-        Ok(perms) => Ok(Json(perms)),
-        Err(e) => Err(api_error(StatusCode::BAD_REQUEST, &format!("Bad Request: {}", e))),
+        Ok((permissions, permissions_version)) => Ok(Json(PermissionsPutResponse {
+            permissions,
+            permissions_version,
+        })),
+        Err(e) => Err(api_error(StatusCode::CONFLICT, &format!("Conflict: {}", e))),
     }
 }
 

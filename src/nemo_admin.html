@@ -1292,9 +1292,9 @@
       try {
         const result = await api("/nemo/api/integration/permissions", { method: "PUT", body: JSON.stringify({ version: integ.permissionsVersion, admin_policy: ap }) });
         integ.adminPolicy = ap;
-        integ.permissionsVersion = result.permissions_version || integ.permissionsVersion + 1;
+        integ.permissionsVersion = result.permissions_version;
         setMsg("adminPolicyMsg", "Saved.", true);
-      } catch (err) { setMsg("adminPolicyMsg", err.message, false); }
+      } catch (err) { setMsg("adminPolicyMsg", aclSaveError(err), false); }
     });
     $("adminPolicyReset").addEventListener("click", () => {
       const opts = {};
@@ -2075,7 +2075,7 @@
         integ.peers = perms.peers || [];
         integ.policies = pol.policies || {};
         integ.devicePolicies = pol.device_policies || {};
-        integ.permissionsVersion = perms.permissions_version || 1;
+        integ.permissionsVersion = perms.permissions_version;
         renderLdapForm();
         renderPolicies();
         renderPerms();
@@ -2150,13 +2150,29 @@
       }
     }
 
+    // The server refuses a permissions save whose version is stale (another tab or
+    // admin saved since this page loaded). Only ever adopt the server's number.
+    function aclSaveError(err) {
+      return /version mismatch/.test(err.message)
+        ? "Someone else changed the ACL since this page loaded. Reload the page, then redo this change."
+        : err.message;
+    }
+
     async function toggleDirectoryUser(u, cb) {
       const enabled = cb.checked;
       try {
-        await api("/nemo/api/integration/ldap/users/set", {
+        const res = await api("/nemo/api/integration/ldap/users/set", {
           method: "POST",
           body: JSON.stringify({ username: u.username, enabled: enabled, display_name: u.display_name || "", email: u.email || "" })
         });
+        // Fold the change into the ACL tab so its next save neither drops this
+        // user nor trips the version check; keep any unsaved edits on other rows.
+        if (res && res.key && res.permission && res.permissions_version) {
+          collectPerms();
+          integ.perms[res.key] = res.permission;
+          integ.permissionsVersion = res.permissions_version;
+          renderPerms();
+        }
         u.enabled = enabled;
         u.in_acl = true;
         setMsg("ldapUsersMsg", (enabled ? "Enabled " : "Disabled ") + u.username + " — see the ACL tab for targets/policy", true);
@@ -2460,8 +2476,6 @@
         const res = await api("/nemo/api/policies", { method: "PUT", body: JSON.stringify({ policies: integ.policies }) });
         integ.policies = res.policies || {};
         integ.devicePolicies = res.device_policies || {};
-        // Policies affect user permissions (policy_name), so bump the version
-        integ.permissionsVersion = res.permissions_version || integ.permissionsVersion + 1;
         setMsg("policiesSaveMsg", "Saved", true);
         renderPolicies();
         renderPerms();
@@ -2600,15 +2614,15 @@
       };
       try {
         const result = await api("/nemo/api/integration/permissions", { method: "PUT", body: JSON.stringify(body) });
-        integ.perms = result.permissions || {};
-        integ.permissionsVersion = result.permissions_version || integ.permissionsVersion + 1;
+        integ.perms = result.permissions;
+        integ.permissionsVersion = result.permissions_version;
         integ.defaultTargets = body.default_targets;
         integ.requireLogin = body.require_login;
         integ.defaultPolicyName = body.default_policy_name;
         renderPerms();
         setMsg("permsSaveMsg", "Saved.", true);
       } catch (err) {
-        setMsg("permsSaveMsg", err.message, false);
+        setMsg("permsSaveMsg", aclSaveError(err), false);
       }
     }
 
