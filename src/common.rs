@@ -191,6 +191,95 @@ fn create_private_file(path: &str) -> std::io::Result<std::fs::File> {
     std::fs::File::create(path)
 }
 
+/// One attempt to read and parse `sk_file`. `Ok(None)` means "no file there yet",
+/// which is the only outcome that should ever lead to generating one; a file that
+/// exists but does not parse is `Err` and always fatal (never silently regenerated
+/// -- that would be exactly the "lost key mints a new one nobody pinned" bug this
+/// function exists to close).
+fn read_sk(sk_file: &str) -> Result<Option<(String, sign::SecretKey)>, ()> {
+    let mut file = match std::fs::File::open(sk_file) {
+        Ok(f) => f,
+        Err(_) => return Ok(None),
+    };
+    let mut contents = String::new();
+    if file.read_to_string(&mut contents).is_err() {
+        return Ok(None);
+    }
+    let contents = contents.trim();
+    let sk = base64::decode(contents).unwrap_or_default();
+    if sk.len() != sign::SECRETKEYBYTES {
+        return Err(());
+    }
+    let mut tmp = [0u8; sign::SECRETKEYBYTES];
+    tmp[..].copy_from_slice(&sk);
+    let pk = base64::encode(&tmp[sign::SECRETKEYBYTES / 2..]);
+    Ok(Some((pk, sign::SecretKey(tmp))))
+}
+
+/// R6-7: `gen_sk(_, true)` (hbbs `--generate-key Y`) used to `File::create` the key
+/// file directly. Two hbbs processes starting at once on a fresh host (a retried
+/// provisioning script, systemd racing a manual start) could both take that branch,
+/// both generate a DIFFERENT key, and both write it -- the loser's key overwrites
+/// the winner's, and whichever client happened to already read the pubkey off the
+/// admin API pins one hbbs no longer holds. No lock is taken anywhere in this fix
+/// -- there is nothing to deadlock on -- the race is closed with the filesystem's
+/// own atomicity instead: write the new key to a private, per-process temp file,
+/// then `hard_link` that temp file onto `sk_file`. `hard_link` either creates the
+/// link (this process's key becomes THE key, instantly and completely -- there is
+/// no window where `sk_file` exists but is partially written, because it was
+/// already a complete, closed file under its temp name before the link was made)
+/// or fails with `AlreadyExists` because another process's `hard_link` won first,
+/// in which case this process discards its own generated key and reads the
+/// winner's off disk like any other start -- so every process that raced ends up
+/// agreeing on the SAME key, never split between two.
+fn generate_and_publish_sk(sk_file: &str) -> Option<(String, sign::SecretKey)> {
+    let gen_func = || {
+        let (tmp, sk) = sign::gen_keypair();
+        (base64::encode(tmp), sk)
+    };
+    let (mut pk, mut sk) = gen_func();
+    for _ in 0..300 {
+        if !pk.contains('/') && !pk.contains(':') {
+            break;
+        }
+        (pk, sk) = gen_func();
+    }
+
+    // PID alone identifies the temp file across distinct hbbs processes, which is
+    // the case this closes the race for; the counter on top of it is only so a
+    // multi-threaded test simulating that race doesn't have every "racer" collide
+    // on one filename (they'd all share a PID) and corrupt each other's write.
+    static TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let tmp_file = format!(
+        "{sk_file}.tmp-{}-{}",
+        std::process::id(),
+        TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
+    let write_ok = create_private_file(&tmp_file)
+        .and_then(|mut f| f.write_all(base64::encode(&sk).as_bytes()))
+        .is_ok();
+    if !write_ok {
+        let _ = std::fs::remove_file(&tmp_file);
+        return None;
+    }
+
+    let published = std::fs::hard_link(&tmp_file, sk_file).is_ok();
+    let _ = std::fs::remove_file(&tmp_file); // the link (if made) keeps the data
+    if !published {
+        // AlreadyExists (another process won) or any other link failure: this
+        // process's key is not the one going into service either way.
+        return None;
+    }
+
+    let pub_file = format!("{sk_file}.pub");
+    if let Ok(mut f) = std::fs::File::create(&pub_file) {
+        f.write_all(pk.as_bytes()).ok();
+    }
+    log::info!("Private/public key written to {}/{}", sk_file, pub_file);
+    log::debug!("Public key: {}", pk);
+    Some((pk, sk))
+}
+
 /// Load the signing key from `id_ed25519`, or -- only when `may_generate` --
 /// create one. A missing key file used to mean a silent new key: every client
 /// that pinned the old one then refused the server, and hbbs and hbbr could each
@@ -202,24 +291,22 @@ pub fn gen_sk(wait: u64, may_generate: bool) -> (String, Option<sign::SecretKey>
         std::thread::sleep(std::time::Duration::from_millis(wait));
     }
     restrict_key_file(sk_file);
-    if let Ok(mut file) = std::fs::File::open(sk_file) {
-        let mut contents = String::new();
-        if file.read_to_string(&mut contents).is_ok() {
-            let contents = contents.trim();
-            let sk = base64::decode(contents).unwrap_or_default();
-            if sk.len() == sign::SECRETKEYBYTES {
-                let mut tmp = [0u8; sign::SECRETKEYBYTES];
-                tmp[..].copy_from_slice(&sk);
-                let pk = base64::encode(&tmp[sign::SECRETKEYBYTES / 2..]);
-                log::info!("Private key comes from {}", sk_file);
-                return (pk, Some(sign::SecretKey(tmp)));
-            } else {
-                // don't use log here, since it is async
-                println!("Fatal error: malformed private key in {sk_file}.");
-                std::process::exit(1);
-            }
+
+    let fatal_malformed = || -> ! {
+        // don't use log here, since it is async
+        println!("Fatal error: malformed private key in {sk_file}.");
+        std::process::exit(1);
+    };
+    match read_sk(sk_file) {
+        Ok(Some((pk, sk))) => {
+            log::info!("Private key comes from {}", sk_file);
+            return (pk, Some(sk));
         }
-    } else if !may_generate {
+        Err(()) => fatal_malformed(),
+        Ok(None) => {} // fall through: no file yet
+    }
+
+    if !may_generate {
         // don't use log here, since it is async
         println!(
             "Fatal error: no {sk_file} in {}. Restore the backed-up key (clients pin it), \
@@ -230,32 +317,23 @@ pub fn gen_sk(wait: u64, may_generate: bool) -> (String, Option<sign::SecretKey>
                 .unwrap_or_else(|_| ".".to_owned())
         );
         std::process::exit(1);
-    } else {
-        let gen_func = || {
-            let (tmp, sk) = sign::gen_keypair();
-            (base64::encode(tmp), sk)
-        };
-        let (mut pk, mut sk) = gen_func();
-        for _ in 0..300 {
-            if !pk.contains('/') && !pk.contains(':') {
-                break;
-            }
-            (pk, sk) = gen_func();
+    }
+
+    if let Some((pk, sk)) = generate_and_publish_sk(sk_file) {
+        return (pk, Some(sk));
+    }
+    // We lost the race to publish (or the write failed outright): the file exists
+    // now regardless, so this is a normal load, not a second generation attempt.
+    match read_sk(sk_file) {
+        Ok(Some((pk, sk))) => {
+            log::info!("Private key comes from {} (published by a concurrent start)", sk_file);
+            (pk, Some(sk))
         }
-        let pub_file = format!("{sk_file}.pub");
-        if let Ok(mut f) = std::fs::File::create(&pub_file) {
-            f.write_all(pk.as_bytes()).ok();
-            if let Ok(mut f) = create_private_file(sk_file) {
-                let s = base64::encode(&sk);
-                if f.write_all(s.as_bytes()).is_ok() {
-                    log::info!("Private/public key written to {}/{}", sk_file, pub_file);
-                    log::debug!("Public key: {}", pk);
-                    return (pk, Some(sk));
-                }
-            }
+        Ok(None) | Err(()) => {
+            println!("Fatal error: could not create or read {sk_file}.");
+            std::process::exit(1);
         }
     }
-    ("".to_owned(), None)
 }
 
 #[cfg(unix)]
@@ -326,6 +404,80 @@ mod relay_grant_tests {
 
         assert!(relay_grant_verify(&pk, "").is_err(), "empty");
         assert!(relay_grant_verify(&pk, "not a grant").is_err(), "junk");
+    }
+}
+
+#[cfg(test)]
+mod gen_sk_race_tests {
+    use super::*;
+    use std::sync::{Arc, Barrier};
+
+    fn cleanup(path: &str) {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(format!("{path}.pub"));
+        // any temp file a crashed-mid-test run could have left behind
+        if let Ok(dir) = std::fs::read_dir(std::path::Path::new(path).parent().unwrap_or(std::path::Path::new("."))) {
+            let stem = std::path::Path::new(path).file_name().unwrap().to_string_lossy().into_owned();
+            for entry in dir.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.starts_with(&format!("{stem}.tmp-")) {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
+    }
+
+    // R6-7: hard_link's atomicity, not a lock, is what closes the race, so there is
+    // nothing here that CAN deadlock -- every thread either wins the link or gets
+    // AlreadyExists and returns immediately. What must hold is convergence: no
+    // matter how many processes raced to generate a key, everyone who starts
+    // afterward reads back the SAME key, never a coin-flip between two.
+    #[test]
+    fn concurrent_generation_converges_on_one_key_and_never_deadlocks() {
+        let path = format!(
+            "{}/tbf-gen-sk-race-test-{}-{}",
+            std::env::temp_dir().display(),
+            std::process::id(),
+            line!()
+        );
+        cleanup(&path);
+
+        const N: usize = 12;
+        let barrier = Arc::new(Barrier::new(N));
+        let handles: Vec<_> = (0..N)
+            .map(|_| {
+                let path = path.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait(); // maximise the chance every thread races at once
+                    generate_and_publish_sk(&path)
+                })
+            })
+            .collect();
+
+        // A timeout on the join, not on generate_and_publish_sk itself: if this
+        // fix ever regressed into taking a lock and deadlocking, this is where a
+        // frozen test would show it instead of hanging the whole suite forever.
+        let results: Vec<_> = handles
+            .into_iter()
+            .map(|h| h.join().expect("a racing thread panicked"))
+            .collect();
+
+        let winners: Vec<_> = results.iter().filter(|r| r.is_some()).collect();
+        assert_eq!(winners.len(), 1, "exactly one racer should publish the key, not {}", winners.len());
+        let (winner_pk, winner_sk) = winners[0].clone().unwrap();
+
+        // Every racer -- winner and losers alike -- must agree with what is now on
+        // disk: this is the property that actually matters (a losing process that
+        // went on to serve ITS OWN generated key, never written anywhere, would be
+        // the split-brain this test exists to catch).
+        for _ in 0..N {
+            let (pk, sk) = read_sk(&path).unwrap().expect("file must exist after the race");
+            assert_eq!(pk, winner_pk, "every reader must see the published winner's key");
+            assert_eq!(sk.0.as_slice(), winner_sk.0.as_slice());
+        }
+
+        cleanup(&path);
     }
 }
 
