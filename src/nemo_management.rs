@@ -1790,6 +1790,14 @@ async fn api_current_user(headers: HeaderMap) -> Json<serde_json::Value> {
     let Some(session) = integration::session_for_token(&token) else {
         return Json(serde_json::json!({ "error": "Invalid token" }));
     };
+    // R6-9: a user disabled after this token was issued must not still be able to
+    // read their own account back. In the normal ACL-save/directory-toggle path the
+    // token is already evicted by then (evict_sessions_with_changed_permissions), so
+    // this mostly guards the gap between those two events and any future write path
+    // that changes `enabled` without going through that eviction.
+    if !integration::user_is_enabled(&session.username) {
+        return Json(serde_json::json!({ "error": "Invalid token" }));
+    }
     let (is_admin, _targets) = integration::effective_permission(&session.username);
     Json(serde_json::json!({
         "name": session.username,
