@@ -835,8 +835,8 @@
         <div class="col-grid" style="padding:14px 16px;">
           <div class="span-all" style="font-size:12px;opacity:0.7;line-height:1.4;">Pushed to every TBFDesk client (including ones that register later) via signed managed policy. A per-peer policy overrides these.</div>
           <div class="fld">
-            <label for="gpApiServer" title="Clients use this for login and the address book. Point it at this server's HTTPS API.">API server (api-server)</label>
-            <input id="gpApiServer" type="text" placeholder="https://192.168.0.176:21120">
+            <label for="gpApiServer" title="Clients use this for login and the address book. Point it at this server's HTTPS API. One value goes to every client, so leave it empty while LAN clients use 192.168.1.14 and internet clients use 85.126.226.2 — set it once a split-horizon DNS name exists.">API server (api-server)</label>
+            <input id="gpApiServer" type="text" placeholder="https://tbfdesk.example.com:21120 (empty = clients keep their own)">
           </div>
           <label class="span-all" style="display:flex;gap:10px;align-items:flex-start;cursor:pointer;">
             <input id="gpInsecureTls" type="checkbox" style="margin-top:3px;">
