@@ -809,10 +809,18 @@ impl RendezvousServer {
                         // Record it so the target's eventual RelayResponse can be told
                         // apart from an unsolicited one; `addr` is the controller's
                         // address, the same bytes the target's reply carries back.
+                        //
+                        // Key it through `try_into_v4`, because that is the form the
+                        // lookup sees: the target echoes back the bytes we minted with
+                        // `AddrMangle::encode`, which normalises to v4 first, so
+                        // `AddrMangle::decode` hands the RelayResponse arm a V4 addr. A
+                        // dual-stack listener reports the controller as the v4-MAPPED v6
+                        // `::ffff:a.b.c.d`, and V6-mapped != V4 for HashMap equality, so
+                        // the raw key never matched and the grant was refused.
                         let mut pending = self.pending_relay.lock().await;
                         pending.retain(|_, p| p.expires > std::time::Instant::now());
                         pending.insert(
-                            addr,
+                            try_into_v4(addr),
                             PendingRelay {
                                 target_id,
                                 expires: std::time::Instant::now() + PENDING_RELAY_TTL,
@@ -1483,6 +1491,37 @@ impl RendezvousServer {
                     force_relay: ph.force_relay,
                     ..Default::default()
                 });
+                // A PunchHole is the OTHER way a target legitimately answers with a
+                // RelayResponse, and it carries no RequestRelay for the grant check to
+                // match against. The target relays when we stamped nat_type=SYMMETRIC
+                // above (forced relay: WAN<->LAN, ALWAYS_USE_RELAY, or force_relay), and
+                // also on its own initiative when ITS nat type is symmetric or it is on
+                // websocket/proxy -- decisions we cannot see from here. So record the
+                // pending entry for every PunchHole we push, not just the forced ones.
+                //
+                // Without this, `pending_relay` was only ever populated by the
+                // RequestRelay arm below, so every forced-relay session -- i.e. every
+                // roaming-controller-to-office-workstation session, the whole point of
+                // the middle-segment topology -- had its RelayResponse dropped as
+                // "unsolicited" and failed with "Verbindung über Rendezvous-Server ist
+                // fehlgeschlagen". Found end to end on the lab server: hbbs logged
+                // `forced_relay=true` and then dropped the target's answer.
+                //
+                // The grant property is unchanged: the entry is keyed by the controller
+                // address WE minted into `socket_addr` and the target echoes back
+                // untouched, it names the target we actually pushed to (cross-checked
+                // against the responder's proven device key), it is single-use, and it
+                // expires with the grant TTL. A RelayResponse still cannot get a grant
+                // for a session hbbs did not broker.
+                let mut pending = self.pending_relay.lock().await;
+                pending.retain(|_, p| p.expires > std::time::Instant::now());
+                pending.insert(
+                    try_into_v4(addr),
+                    PendingRelay {
+                        target_id: id.clone(),
+                        expires: std::time::Instant::now() + PENDING_RELAY_TTL,
+                    },
+                );
             }
             // H43: the id travels with the address so the caller can prefer the
             // peer's own rendezvous connection over a UDP datagram.
@@ -3026,6 +3065,70 @@ mod tests {
             }
             other => panic!("expected PunchHole, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn forced_relay_punch_records_a_pending_relay_entry() {
+        run_forced_relay_punch_records_a_pending_relay_entry();
+    }
+    /// Regression: a forced-relay session died because nothing told the grant check
+    /// that hbbs had brokered it.
+    ///
+    /// The target answers a PunchHole with a RelayResponse (rendezvous_mediator.rs
+    /// `handle_punch_hole` -> `create_relay` when nat_type is SYMMETRIC) and the
+    /// controller WAITS for that response (client.rs) -- no RequestRelay is ever sent
+    /// to hbbs in this flow. `pending_relay` used to be populated only by the
+    /// RequestRelay arm, so the answer was dropped as "unsolicited" and every
+    /// WAN->LAN session failed. Caught end to end on the lab server.
+    ///
+    /// The entry must be keyed by the CONTROLLER address, because that is what the
+    /// target echoes back in `RelayResponse.socket_addr` and what the grant check
+    /// decodes and looks up.
+    #[tokio::main(flavor = "current_thread")]
+    async fn run_forced_relay_punch_records_a_pending_relay_entry() {
+        ALWAYS_USE_RELAY.store(false, Ordering::SeqCst);
+        let db = temp_db();
+        let mut pm = PeerMap::new_for_test(&db.0).await.unwrap();
+        register(&pm, "ws-01", "192.168.0.50:41000", Some(1), true).await;
+        register_controller(&mut pm, "203.0.113.7:55000").await;
+        let mut rs = test_server(pm, "192.168.0.0/16");
+        // The v4-MAPPED v6 form a dual-stack listener actually reports, which is what
+        // made the first fix miss: the key went in as V6 and the lookup arrives as V4.
+        let controller: SocketAddr = "[::ffff:203.0.113.7]:55000".parse().unwrap();
+
+        assert!(
+            rs.pending_relay.lock().await.is_empty(),
+            "nothing brokered yet"
+        );
+
+        let (msg, _) = rs
+            .handle_punch_hole_request(controller, punch_request("ws-01"), "", false, Some(&authed_controller()))
+            .await
+            .unwrap();
+        // Precondition: this really is the forced-relay path.
+        let socket_addr = match &msg.union {
+            Some(rendezvous_message::Union::PunchHole(ph_out)) => {
+                assert_eq!(ph_out.nat_type.enum_value_or_default(), NatType::SYMMETRIC);
+                ph_out.socket_addr.clone()
+            }
+            other => panic!("expected PunchHole, got {other:?}"),
+        };
+
+        // Look it up exactly the way the RelayResponse arm does: the target echoes back
+        // the bytes we minted, so the key must survive encode -> decode. Asserting on
+        // `controller` directly would pass with the wrong key form and still fail live.
+        let lookup = AddrMangle::decode(&socket_addr);
+        let pending = rs.pending_relay.lock().await;
+        let entry = pending.get(&lookup).expect(
+            "a forced-relay punch must leave a pending entry under the address the target \
+             echoes back, or its RelayResponse is dropped as unsolicited and the session fails",
+        );
+        assert_eq!(
+            entry.target_id, "ws-01",
+            "the entry names the target hbbs actually pushed to, so a RelayResponse from \
+             anyone else is still refused"
+        );
+        assert!(entry.expires > std::time::Instant::now());
     }
 
     #[test]
