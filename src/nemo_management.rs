@@ -120,6 +120,11 @@ const MAX_MANAGEMENT_POLICY_VALUE_LEN: usize = 4096;
 const NEMO_SOURCE_PREFIX: &str = "nemo-source-v1:";
 const OPTION_NEMO_OUTBOUND_ENABLED: &str = "nemo-outbound-enabled";
 const OPTION_NEMO_OUTBOUND_TARGETS: &str = "nemo-outbound-targets";
+// Direct connections. The endpoint map is assembled per-controller from PEER_ENDPOINTS;
+// the knock keys are operator-set (global or per-device policy) and are secrets.
+const OPTION_NEMO_DIRECT_ENDPOINTS: &str = "nemo-direct-endpoints";
+const OPTION_NEMO_KNOCK_KEY: &str = "nemo-knock-key";
+const OPTION_NEMO_KNOCK_HMAC_KEY: &str = "nemo-knock-hmac-key";
 // Current client policy keys that are newer than this server fork's embedded
 // hbb_common key tables, plus Nemo-only GUI/management options.
 const CLIENT_MANAGEMENT_POLICY_KEYS: &[&str] = &[
@@ -141,6 +146,21 @@ const CLIENT_MANAGEMENT_POLICY_KEYS: &[&str] = &[
     "disable-udp",
     "nemo-sealed-request",
     "nemo-auto-update",
+    // Direct connections + the optional SPA knock (see nemo_direct.rs on the client).
+    // Named here so an operator can set them in the Global or a named device policy; the
+    // endpoint map is normally assembled per-controller by direct_endpoint_map, but a
+    // hand-written value still works when PEER_ENDPOINTS is empty. Pushing these as a
+    // policy with allow_user_override is what lets a technician adjust the knock locally
+    // while a locked policy keeps the fleet fixed.
+    OPTION_NEMO_DIRECT_ENDPOINTS,
+    "nemo-direct-timeout-ms",
+    "nemo-knock-enabled",
+    "nemo-knock-port",
+    OPTION_NEMO_KNOCK_KEY,
+    OPTION_NEMO_KNOCK_HMAC_KEY,
+    "nemo-knock-delay-ms",
+    "nemo-knock-user",
+    "nemo-knock-source-ip",
     "view_only",
     "show_monitors_toolbar",
     "collapse_toolbar",
@@ -704,6 +724,9 @@ struct PeerResponse {
     stats: NemoPeerStats,
     // S-DUALKEY: which key this peer used on its last poll — "device-key" / "default".
     auth_mode: String,
+    // Where controllers may reach this workstation without the relay, as the operator
+    // configured it ("host:port[,knockport]"). Empty => hole punch / relay only.
+    direct_endpoint: String,
 }
 
 #[derive(Serialize)]
@@ -712,6 +735,20 @@ struct PeerPolicyResponse {
     status: Option<i64>,
     policy: String,
     allowed_for_control: bool,
+}
+
+#[derive(Deserialize)]
+struct PeerEndpointRequest {
+    /// `host:port[,knockport]`. `None` or empty clears the endpoint.
+    #[serde(default)]
+    endpoint: Option<String>,
+}
+
+#[derive(Serialize)]
+struct PeerEndpointResponse {
+    id: String,
+    /// The stored, normalized value — empty when cleared.
+    endpoint: String,
 }
 
 #[derive(Serialize)]
@@ -926,6 +963,166 @@ fn peer_hostname(id: &str) -> String {
         .unwrap_or_default()
 }
 
+// ---- Direct endpoints: where a workstation is reachable without the relay ----
+//
+// The relay costs ~36% of the link (measured: 7.1 of 11.1 Mbit/s on the lab WAN path),
+// so a workstation behind a port forward should be dialled directly. This map holds
+// "host:port[,knockport]" per peer id and is pushed to controllers inside the signed
+// policy as `nemo-direct-endpoints`.
+//
+// Operator-supplied, NEVER self-reported: a peer that could nominate its own endpoint
+// could point controllers at an address it does not own. Nothing in the poll path writes
+// here -- only the authenticated dashboard route does.
+static PEER_ENDPOINTS: Lazy<std::sync::RwLock<HashMap<String, String>>> =
+    Lazy::new(|| std::sync::RwLock::new(load_peer_endpoints()));
+
+// "some.very.long.hostname:65535,65535" with room to spare. Bounds what one entry can
+// contribute to the policy string every client downloads.
+const MAX_ENDPOINT_LEN: usize = 128;
+
+fn peer_endpoints_path() -> String {
+    get_arg_or(
+        "nemo-peer-endpoints-file",
+        "nemo_peer_endpoints.json".to_owned(),
+    )
+}
+
+fn load_peer_endpoints() -> HashMap<String, String> {
+    std::fs::read_to_string(peer_endpoints_path())
+        .ok()
+        .and_then(|s| serde_json::from_str::<HashMap<String, String>>(&s).ok())
+        .map(|map| {
+            // Re-validate on load: a hand-edited file must not be able to inject a
+            // separator and smuggle extra entries into every client's policy.
+            map.into_iter()
+                .filter_map(|(id, ep)| normalize_direct_endpoint(&ep).map(|ep| (id, ep)))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Validate and normalize `host:port[,knockport]`, the exact shape
+/// `nemo_direct::parse_endpoints` reads on the client.
+///
+/// The client parser is deliberately lenient — one bad row there must not cost the fleet
+/// its other endpoints — which means a typo would be silently dropped and the operator
+/// would see "it still relays" with no explanation. So validation lives here, at the one
+/// place a human types the value, and a rejected endpoint is an API error.
+fn normalize_direct_endpoint(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    if raw.is_empty() || raw.len() > MAX_ENDPOINT_LEN {
+        return None;
+    }
+    // `;` separates entries and `,` separates fields in the pushed map, so a value
+    // containing either could forge additional entries. Whitespace inside would break
+    // the version-string style parsing the client does on it.
+    if raw.contains(';') || raw.chars().any(char::is_whitespace) {
+        return None;
+    }
+    let mut fields = raw.split(',');
+    let addr = fields.next()?;
+    let knock_port = match fields.next() {
+        Some(p) => Some(p.parse::<u16>().ok().filter(|p| *p > 0)?),
+        None => None,
+    };
+    if fields.next().is_some() {
+        return None; // more than host:port,knockport
+    }
+    // rsplit so a bracketed IPv6 literal survives: "[2001:db8::1]:21118".
+    let (host, port) = addr.rsplit_once(':')?;
+    let port = port.parse::<u16>().ok().filter(|p| *p > 0)?;
+    if host.is_empty() {
+        return None;
+    }
+    Some(match knock_port {
+        Some(kp) => format!("{host}:{port},{kp}"),
+        None => format!("{host}:{port}"),
+    })
+}
+
+fn save_peer_endpoints(snapshot: &HashMap<String, String>) {
+    match serde_json::to_string_pretty(snapshot) {
+        Ok(json) => {
+            let path = peer_endpoints_path();
+            if let Err(e) = std::fs::write(&path, json) {
+                log::error!("failed to persist peer endpoints to {}: {}", path, e);
+            }
+        }
+        Err(e) => log::error!("failed to serialize peer endpoints: {}", e),
+    }
+}
+
+/// Set (`Some`) or clear (`None`) one peer's direct endpoint. `Err` carries the reason a
+/// value was rejected, so the dashboard can show it instead of accepting a dead entry.
+fn set_peer_endpoint(id: &str, endpoint: Option<&str>) -> Result<String, String> {
+    let id = id.trim();
+    if id.is_empty() {
+        return Err("peer id is required".to_owned());
+    }
+    let normalized = match endpoint.map(str::trim).filter(|e| !e.is_empty()) {
+        Some(raw) => Some(normalize_direct_endpoint(raw).ok_or_else(|| {
+            format!(
+                "'{raw}' is not a valid direct endpoint: expected host:port, optionally \
+                 followed by ,knockport (e.g. 203.0.113.5:21118 or 203.0.113.5:21118,62201)"
+            )
+        })?),
+        None => None,
+    };
+    let snapshot = {
+        let mut map = PEER_ENDPOINTS.write().unwrap();
+        match &normalized {
+            Some(ep) => {
+                evict_one_if_full(&mut map, id);
+                map.insert(id.to_owned(), ep.clone());
+            }
+            None => {
+                map.remove(id);
+            }
+        }
+        map.clone()
+    };
+    save_peer_endpoints(&snapshot);
+    Ok(normalized.unwrap_or_default())
+}
+
+fn peer_endpoint(id: &str) -> String {
+    PEER_ENDPOINTS
+        .read()
+        .unwrap()
+        .get(id)
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// Build the `nemo-direct-endpoints` value for ONE controller.
+///
+/// Filtered, unlike `nemo-peer-keys`: a public key is harmless to hand out, but "here is
+/// a WAN address with a remote-desktop port behind it" is reconnaissance, so a client
+/// only learns the endpoints its own outbound-targets policy already lets it dial.
+///
+/// Blocked peers are withheld outright. A controller holding a blocked peer's endpoint
+/// would dial it directly, and the punch gate that enforces the block is not in that
+/// path — the controlled side still refuses via `nemo-blocked-ids`, but withholding the
+/// address keeps the block from depending on a single client-side check.
+///
+/// Sorted by id so the value is byte-identical between polls; an unstable string would
+/// make every client rewrite its stored policy every 30 seconds.
+fn direct_endpoint_map(blocked: &[String], targets: Option<&String>) -> String {
+    let endpoints = PEER_ENDPOINTS.read().unwrap().clone();
+    if endpoints.is_empty() {
+        return String::new();
+    }
+    let blocked: HashSet<&str> = blocked.iter().map(String::as_str).collect();
+    let mut rows: Vec<String> = endpoints
+        .into_iter()
+        .filter(|(id, _)| !blocked.contains(id.as_str()))
+        .filter(|(id, _)| target_allowed_by_controller_policy(targets, id))
+        .map(|(id, endpoint)| format!("{id},{endpoint}"))
+        .collect();
+    rows.sort();
+    rows.join(";")
+}
+
 pub(crate) fn init_from_args() {
     // CLI default first, then a persisted dashboard toggle wins if present.
     COMPANY_ONLY.store(is_truthy(&get_arg("nemo-company-only")), Ordering::SeqCst);
@@ -1029,6 +1226,12 @@ pub(crate) async fn spawn_hbbs_api(
         .route("/nemo/api/peers/:id/block", post(block_peer))
         .route("/nemo/api/peers/:id/allow", post(allow_peer))
         .route("/nemo/api/peers/:id/reset-policy", post(reset_peer_policy))
+        // Where this workstation is reachable without the relay (a port forward the
+        // operator configured on its site's routers).
+        .route(
+            "/nemo/api/peers/:id/direct-endpoint",
+            post(set_peer_direct_endpoint),
+        )
         .route(
             "/nemo/api/peers/:id/management-policy",
             get(get_peer_management_policy).put(update_peer_management_policy),
@@ -2953,7 +3156,11 @@ async fn get_global_policy(
     headers: HeaderMap,
 ) -> ApiResult<ManagementPolicy> {
     require_auth(&headers, &state.token)?;
-    Ok(Json(global_policy()))
+    // S4 masking applied to the GLOBAL policy too. It was only applied per-peer, which
+    // was survivable while the global policy held nothing secret — the knock keys (shared
+    // secrets with the fwknopd on the edge, and the natural thing to set fleet-wide) make
+    // that no longer true.
+    Ok(Json(mask_secret_policy(global_policy())))
 }
 
 async fn put_global_policy(
@@ -2966,9 +3173,13 @@ async fn put_global_policy(
         allow_user_override: request.allow_user_override,
         options: request.options,
     });
+    // The dashboard was shown masks, so it sends masks back for anything it did not
+    // change. Without this a round-trip through the form would store the literal
+    // "<managed-secret>" as the fleet's SPA key and every knock would be rejected.
+    let policy = restore_masked_secrets_from(policy, &global_policy());
     *GLOBAL_POLICY.write().unwrap() = policy.clone();
     save_global_policy(&policy);
-    Ok(Json(policy))
+    Ok(Json(mask_secret_policy(policy)))
 }
 
 // ---- Live connections (see + cut) ----
@@ -3996,6 +4207,31 @@ async fn client_policy(
             .options
             .insert("nemo-peer-keys".to_owned(), peer_keys);
     }
+    // Direct endpoints: tell this controller where it can reach each workstation without
+    // the relay. Only overwrites when the operator has actually configured endpoints, so
+    // a map typed by hand into the global policy still works.
+    let endpoints = direct_endpoint_map(&blocked, policy.options.get(OPTION_NEMO_OUTBOUND_TARGETS));
+    if !endpoints.is_empty() {
+        policy
+            .options
+            .insert(OPTION_NEMO_DIRECT_ENDPOINTS.to_owned(), endpoints);
+    }
+    // The other half of a direct endpoint is a listener on the far side. Configuring an
+    // endpoint for a machine IS the instruction to make it reachable, so turn its direct
+    // access server on rather than leaving the operator to discover, after every attempt
+    // has timed out, that nothing was listening. `direct-access-port` is deliberately NOT
+    // derived from the endpoint: the endpoint's port is the router's EXTERNAL port, which
+    // a forward may well translate (31118 -> 21118). Set that in the peer's device policy
+    // when it must differ from the 21118 default.
+    //
+    // An operator who sets `direct-server` explicitly keeps their value, and clearing the
+    // endpoint stops this being pushed, which returns the machine to its own setting.
+    if !peer_endpoint(&peer.id).is_empty() {
+        policy
+            .options
+            .entry("direct-server".to_owned())
+            .or_insert_with(|| "Y".to_owned());
+    }
     if matches!(peer.status, Some(0)) {
         policy.allow_user_override = false;
         policy
@@ -4105,6 +4341,38 @@ async fn allow_peer(
 ) -> ApiResult<PeerPolicyResponse> {
     require_auth(&headers, &state.token)?;
     set_peer_policy(&state.pm, &id, Some(1)).await
+}
+
+/// Set or clear one workstation's direct endpoint. An empty/absent `endpoint` clears it,
+/// which returns that peer to hole punching and the relay.
+async fn set_peer_direct_endpoint(
+    Path(id): Path<String>,
+    Extension(state): Extension<HbbsApiState>,
+    headers: HeaderMap,
+    Json(request): Json<PeerEndpointRequest>,
+) -> ApiResult<PeerEndpointResponse> {
+    require_auth(&headers, &state.token)?;
+    // A rejected value is the operator's typo, not a server fault: 400 with the reason,
+    // because the client's parser would otherwise drop it silently and the only symptom
+    // would be "it still goes through the relay".
+    let endpoint = set_peer_endpoint(&id, request.endpoint.as_deref())
+        .map_err(|reason| api_error(StatusCode::BAD_REQUEST, &reason))?;
+    {
+        let mut store = STATS.write().await;
+        record_event_locked(
+            &mut store,
+            "peer-direct-endpoint",
+            Some(&id),
+            None,
+            if endpoint.is_empty() {
+                "direct endpoint cleared; this peer falls back to hole punch / relay"
+                    .to_owned()
+            } else {
+                format!("direct endpoint set to {endpoint}")
+            },
+        );
+    }
+    Ok(Json(PeerEndpointResponse { id, endpoint }))
 }
 
 async fn reset_peer_policy(
@@ -4345,6 +4613,7 @@ async fn peer_response(pm: &PeerMap, peer: RegisteredPeer) -> PeerResponse {
         online: runtime.as_ref().map(|snapshot| snapshot.online).unwrap_or(false),
         last_seen_ms_ago: runtime.and_then(|snapshot| snapshot.last_seen_ms_ago),
         auth_mode: peer_auth_mode(&peer.id),
+        direct_endpoint: peer_endpoint(&peer.id),
         stats: peer_stats(&peer.id).await,
     }
 }
@@ -4386,6 +4655,11 @@ const SECRET_POLICY_KEYS: &[&str] = &[
     "default-connect-password",
     "proxy-password",
     "preset-address-book-password",
+    // The SPA keys are shared secrets with the fwknopd on the edge: holding them is
+    // enough to open the forwarded port for yourself. They must be masked in dashboard
+    // responses and stripped from any policy we cannot seal, exactly like a password.
+    OPTION_NEMO_KNOCK_KEY,
+    OPTION_NEMO_KNOCK_HMAC_KEY,
 ];
 const MANAGED_SECRET_MASK: &str = "<managed-secret>";
 
@@ -4403,10 +4677,16 @@ fn mask_secret_policy(mut policy: ManagementPolicy) -> ManagementPolicy {
 // A dashboard round-trip sees the masks, not the plaintext; restore the stored
 // value for any secret left as the mask so saving does not clobber it.
 fn restore_masked_secrets(
-    mut policy: ManagementPolicy,
+    policy: ManagementPolicy,
     existing: &Option<String>,
 ) -> ManagementPolicy {
-    let current = management_policy_from_peer(existing);
+    restore_masked_secrets_from(policy, &management_policy_from_peer(existing))
+}
+
+fn restore_masked_secrets_from(
+    mut policy: ManagementPolicy,
+    current: &ManagementPolicy,
+) -> ManagementPolicy {
     for key in SECRET_POLICY_KEYS {
         let is_mask = policy
             .options
@@ -5414,6 +5694,189 @@ mod tests {
         assert!(!policy.options.contains_key("proxy-password"));
         assert_eq!(policy.options.get("view_only").map(String::as_str), Some("Y"));
         assert_eq!(strip_secret_options(&mut policy), 0);
+    }
+
+    // The client's endpoint parser is deliberately lenient (one bad row must not cost the
+    // fleet its other endpoints), so a typo would be dropped there in silence and the only
+    // symptom would be "it still relays". Validation therefore has to be strict HERE, at
+    // the one place a human types the value.
+    #[test]
+    fn direct_endpoints_are_validated_where_they_are_entered() {
+        use super::normalize_direct_endpoint as norm;
+        // Accepted, and normalized to the exact shape the client parses.
+        assert_eq!(norm("203.0.113.5:21118").as_deref(), Some("203.0.113.5:21118"));
+        assert_eq!(
+            norm("  203.0.113.5:21118,62201  ").as_deref(),
+            Some("203.0.113.5:21118,62201")
+        );
+        assert_eq!(
+            norm("vpn.example.com:31118").as_deref(),
+            Some("vpn.example.com:31118")
+        );
+        // A bracketed IPv6 literal survives the rsplit on ':'.
+        assert_eq!(
+            norm("[2001:db8::1]:21118,62202").as_deref(),
+            Some("[2001:db8::1]:21118,62202")
+        );
+        // Refused: no port, unparseable or out-of-range port, port 0.
+        assert_eq!(norm("203.0.113.5"), None);
+        assert_eq!(norm("203.0.113.5:http"), None);
+        assert_eq!(norm("203.0.113.5:70000"), None);
+        assert_eq!(norm("203.0.113.5:0"), None);
+        assert_eq!(norm(":21118"), None);
+        assert_eq!(norm(""), None);
+        assert_eq!(norm("   "), None);
+        // Refused: a bad knock port is an error, not something to quietly drop -- the
+        // operator would otherwise get an endpoint that never knocks.
+        assert_eq!(norm("203.0.113.5:21118,0"), None);
+        assert_eq!(norm("203.0.113.5:21118,nope"), None);
+        assert_eq!(norm("203.0.113.5:21118,62201,extra"), None);
+        // Refused: separator injection. `;` ends an entry and `,` ends a field in the
+        // pushed map, so accepting either would let one stored value forge extra rows in
+        // every client's policy.
+        assert_eq!(norm("203.0.113.5:21118;evil,198.51.100.1:21118"), None);
+        assert_eq!(norm("203.0.113.5:21118 ,62201"), None);
+        // Refused: bounded, so one entry cannot bloat the policy every client downloads.
+        assert_eq!(norm(&format!("{}:21118", "h".repeat(MAX_ENDPOINT_LEN))), None);
+    }
+
+    // What each controller is told. Touches the process-wide PEER_ENDPOINTS, so every
+    // assertion that needs it lives in this one test rather than racing sibling tests.
+    #[test]
+    fn direct_endpoint_map_is_filtered_and_stable() {
+        {
+            let mut map = PEER_ENDPOINTS.write().unwrap();
+            map.clear();
+            map.insert("300".to_owned(), "203.0.113.30:21118".to_owned());
+            map.insert("100".to_owned(), "203.0.113.10:21118,62201".to_owned());
+            map.insert("200".to_owned(), "203.0.113.20:21118".to_owned());
+        }
+        // No outbound-targets restriction: everything, sorted by id. The order matters --
+        // an unstable value would make every client rewrite its stored policy every poll.
+        assert_eq!(
+            direct_endpoint_map(&[], None),
+            "100,203.0.113.10:21118,62201;200,203.0.113.20:21118;300,203.0.113.30:21118"
+        );
+        // A blocked peer's address is withheld, so a controller cannot route around the
+        // block by dialling it directly.
+        assert_eq!(
+            direct_endpoint_map(&["200".to_owned()], None),
+            "100,203.0.113.10:21118,62201;300,203.0.113.30:21118"
+        );
+        // A controller restricted to one target learns only that target's address; the
+        // rest of the fleet's WAN endpoints stay unknown to it.
+        let targets = "300".to_owned();
+        assert_eq!(
+            direct_endpoint_map(&[], Some(&targets)),
+            "300,203.0.113.30:21118"
+        );
+        // "*" is the existing wildcard in that ACL and must keep meaning "all".
+        let all = "*".to_owned();
+        assert_eq!(direct_endpoint_map(&[], Some(&all)).split(';').count(), 3);
+        // Blocked wins over an explicit grant.
+        assert_eq!(direct_endpoint_map(&["300".to_owned()], Some(&targets)), "");
+        {
+            PEER_ENDPOINTS.write().unwrap().clear();
+        }
+        // Nothing configured => the key is never pushed, so the whole fleet keeps today's
+        // hole-punch / relay behaviour untouched.
+        assert_eq!(direct_endpoint_map(&[], None), "");
+    }
+
+    fn policy_with_knock_keys() -> ManagementPolicy {
+        let mut policy = ManagementPolicy::default();
+        policy
+            .options
+            .insert(OPTION_NEMO_KNOCK_KEY.to_owned(), "aGVsbG8=".to_owned());
+        policy.options.insert(
+            OPTION_NEMO_KNOCK_HMAC_KEY.to_owned(),
+            "d29ybGQ=".to_owned(),
+        );
+        policy.options.insert(
+            OPTION_NEMO_DIRECT_ENDPOINTS.to_owned(),
+            "100,203.0.113.10:21118".to_owned(),
+        );
+        policy
+    }
+
+    // The SPA keys open the forwarded port for whoever holds them, so they have to be
+    // handled exactly like a password everywhere a policy is read, written or pushed.
+    #[test]
+    fn knock_keys_are_treated_as_secrets() {
+        let policy = policy_with_knock_keys();
+        // Masked in dashboard responses...
+        let masked = mask_secret_policy(policy.clone());
+        assert_eq!(
+            masked.options.get(OPTION_NEMO_KNOCK_KEY).map(String::as_str),
+            Some(MANAGED_SECRET_MASK)
+        );
+        assert_eq!(
+            masked
+                .options
+                .get(OPTION_NEMO_KNOCK_HMAC_KEY)
+                .map(String::as_str),
+            Some(MANAGED_SECRET_MASK)
+        );
+        // ...but the endpoint map is not a secret and must stay readable, or the operator
+        // cannot see what the fleet was told.
+        assert_eq!(
+            masked
+                .options
+                .get(OPTION_NEMO_DIRECT_ENDPOINTS)
+                .map(String::as_str),
+            Some("100,203.0.113.10:21118")
+        );
+        // Stripped from a policy we cannot seal, exactly like a password: handing the
+        // fleet's knock keys to an unprovisioned client over plaintext would defeat the
+        // layer they exist to add.
+        let mut policy = policy;
+        assert_eq!(strip_secret_options(&mut policy), 2);
+        assert!(policy.options.contains_key(OPTION_NEMO_DIRECT_ENDPOINTS));
+        // A dashboard round-trip must not store the mask as the key. The form shows a
+        // mask for anything already set and sends it back untouched; restoring it is the
+        // difference between "kept the fleet's SPA key" and "set it to the literal string
+        // <managed-secret>, every knock now rejected".
+        let mut edited = ManagementPolicy::default();
+        edited
+            .options
+            .insert(OPTION_NEMO_KNOCK_KEY.to_owned(), MANAGED_SECRET_MASK.to_owned());
+        edited
+            .options
+            .insert(OPTION_NEMO_KNOCK_HMAC_KEY.to_owned(), "bmV3".to_owned());
+        let restored = restore_masked_secrets_from(edited, &policy_with_knock_keys());
+        assert_eq!(
+            restored.options.get(OPTION_NEMO_KNOCK_KEY).map(String::as_str),
+            Some("aGVsbG8="),
+            "an untouched field must keep the stored key"
+        );
+        assert_eq!(
+            restored
+                .options
+                .get(OPTION_NEMO_KNOCK_HMAC_KEY)
+                .map(String::as_str),
+            Some("bmV3"),
+            "a field the operator actually edited must be taken as typed"
+        );
+        // And all nine keys survive sanitize_management_policy, i.e. an operator can
+        // actually set them in a global or device policy (an unlisted key is dropped).
+        for key in [
+            OPTION_NEMO_DIRECT_ENDPOINTS,
+            "nemo-direct-timeout-ms",
+            "nemo-knock-enabled",
+            "nemo-knock-port",
+            OPTION_NEMO_KNOCK_KEY,
+            OPTION_NEMO_KNOCK_HMAC_KEY,
+            "nemo-knock-delay-ms",
+            "nemo-knock-user",
+            "nemo-knock-source-ip",
+        ] {
+            let mut p = ManagementPolicy::default();
+            p.options.insert(key.to_owned(), "x".to_owned());
+            assert!(
+                sanitize_management_policy(p).options.contains_key(key),
+                "{key} would be silently dropped by the server"
+            );
+        }
     }
 
     fn now_secs() -> u64 {

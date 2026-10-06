@@ -727,6 +727,7 @@
                 <th title="Admission decision: allowed (can be connected to), blocked (refused), or open/unapproved.">Access</th>
                 <th title="Which key this client used on its last settings poll: its own provisioned device key, or only the shared server key. Rollout: every peer must read 'device key' before you rely on the device-key requirement — 'server key only' is a machine that gets locked out.">Key<br>auth</th>
                 <th title="The named policy applied to this device (session settings). A logged-in user's own policy overrides it. Assign it in the peer's detail panel or in ACL &amp; Policy.">Policy</th>
+                <th title="The WAN address and forwarded port where controllers may reach this workstation WITHOUT the relay. The relay costs about a third of the link, so a port-forwarded machine should be dialled directly. Set it in the peer's detail panel; empty means hole punch / relay only.">Direct<br>endpoint</th>
                 <th title="The network address the peer registered from, as the server sees it.">Registered IP</th>
                 <th title="The public IP:port the server hands out to other peers for hole punching to reach this machine.">Public<br>Addr</th>
                 <th title="How long ago the peer last checked in (registration heartbeat).">Seen</th>
@@ -845,6 +846,60 @@
               <span style="display:block;font-size:12px;opacity:0.75;margin-top:3px;line-height:1.4;">Lets clients accept the server's self-signed certificate (trust-on-first-use). <b>Weakens client TLS</b> and is only a stopgap until a CA-signed certificate is installed — see the TODO. Leave off once you deploy a trusted cert.</span>
             </span>
           </label>
+          <label class="span-all" style="display:flex;gap:10px;align-items:flex-start;cursor:pointer;">
+            <input id="gpAllowUserOverride" type="checkbox" style="margin-top:3px;">
+            <span>
+              <span style="font-weight:600;">Allow clients to change these</span>
+              <span style="display:block;font-size:12px;opacity:0.75;margin-top:3px;line-height:1.4;">Off (recommended): every value here is <b>enforced</b> &mdash; a client cannot change it locally. On: these go out as <b>defaults</b> a user may override on their own machine. The switch applies to the whole global policy, including the knock settings below, so use a named device policy when only some machines should be adjustable.</span>
+            </span>
+          </label>
+          <hr class="span-all" style="border:0;border-top:1px solid rgba(0,0,0,0.08);margin:6px 0 2px;">
+          <div class="span-all" style="font-weight:600;">Port knocking (Single Packet Authorization)</div>
+          <div class="span-all" style="font-size:12px;opacity:0.75;line-height:1.5;">
+            A direct endpoint means a port forwarded to the internet. With this on, a client sends one
+            encrypted UDP packet before connecting, and the <code>fwknopd</code> on that site's edge opens the
+            forwarded port <b>for that client's source IP only</b>, for a few seconds &mdash; so the port is
+            not answering the whole internet between sessions.
+            <br>The packets are fwknop-compatible (FKO 3.0.0, Rijndael + HMAC-SHA256), so the keys below are
+            the <b>same</b> <code>KEY_BASE64</code> and <code>HMAC_KEY_BASE64</code> you put in that host's
+            <code>access.conf</code>.
+            <br><b>Knocking is a hardening layer over the forward, not the session's authentication.</b> The
+            session is always Ed25519-anchored and encrypted regardless, and a client that cannot knock falls
+            back to hole punching and the relay &mdash; it never loses connectivity.
+            <br>Leave <b>Allow clients to change these</b> (above) off to lock the knock fleet-wide; turn it on
+            to push these as defaults a technician may adjust locally.
+          </div>
+          <label class="span-all" style="display:flex;gap:10px;align-items:flex-start;cursor:pointer;">
+            <input id="gpKnockEnabled" type="checkbox" style="margin-top:3px;">
+            <span>
+              <span style="font-weight:600;">Knock before connecting to a direct endpoint</span>
+              <span style="display:block;font-size:12px;opacity:0.75;margin-top:3px;line-height:1.4;">Off = connect straight to the forwarded port (it must then be open permanently).</span>
+            </span>
+          </label>
+          <div class="fld">
+            <label for="gpKnockPort" title="UDP port fwknopd listens on. Default 62201. A per-peer endpoint may override it with ',port'.">SPA port (nemo-knock-port)</label>
+            <input id="gpKnockPort" type="text" inputmode="numeric" placeholder="62201">
+          </div>
+          <div class="fld">
+            <label for="gpKnockDelay" title="How long the client waits after sending the packet before it connects, giving the daemon time to open the port. Default 300ms.">Knock delay, ms (nemo-knock-delay-ms)</label>
+            <input id="gpKnockDelay" type="text" inputmode="numeric" placeholder="300">
+          </div>
+          <div class="fld">
+            <label for="gpKnockKey" title="base64 Rijndael (AES-256) key — the KEY_BASE64 from fwknopd's access.conf. Stored as a secret: it is masked on reload, and leaving the mask in place keeps the stored value.">SPA key, base64 (nemo-knock-key)</label>
+            <input id="gpKnockKey" type="password" autocomplete="new-password" placeholder="(not set)">
+          </div>
+          <div class="fld">
+            <label for="gpKnockHmacKey" title="base64 HMAC-SHA256 key — the HMAC_KEY_BASE64 from fwknopd's access.conf. Without it fwknopd will not even decrypt the packet when it requires HMAC.">SPA HMAC key, base64 (nemo-knock-hmac-key)</label>
+            <input id="gpKnockHmacKey" type="password" autocomplete="new-password" placeholder="(not set)">
+          </div>
+          <div class="fld">
+            <label for="gpKnockSourceIp" title="Which source address to request access for. 0.0.0.0 tells fwknopd to use the packet's own source IP, which is what you want from behind NAT. Only change this if fwknopd sets REQUIRE_SOURCE_ADDRESS.">Request access for (nemo-knock-source-ip)</label>
+            <input id="gpKnockSourceIp" type="text" placeholder="0.0.0.0 (use the packet's source IP)">
+          </div>
+          <div class="fld">
+            <label for="gpDirectTimeout" title="Whole-attempt budget for a direct connection: knock delay + TCP connect + handshake. When it runs out the client falls back to hole punching / relay. Default 2500ms — deliberately short, so a broken port forward costs little.">Direct attempt budget, ms (nemo-direct-timeout-ms)</label>
+            <input id="gpDirectTimeout" type="text" inputmode="numeric" placeholder="2500">
+          </div>
           <div class="span-all" style="display:flex;gap:10px;align-items:center;">
             <button id="gpSave" class="primary">Save global defaults</button>
             <span id="gpSaveMsg" style="font-size:12px;opacity:0.8;"></span>
@@ -1807,6 +1862,7 @@
           <td>${badge(peer.policy)}</td>
           <td>${peer.auth_mode === 'device-key' ? '<span style="color:#1a7a34;font-weight:600">device key</span>' : (peer.auth_mode === 'default' ? '<span style="color:#8a6d1a">server key only</span>' : '<span style="opacity:0.5">unknown</span>')}</td>
           <td>${((integ.devicePolicies || {})[peer.id]) ? escapeHtml(integ.devicePolicies[peer.id]) : '<span style="opacity:0.4">—</span>'}</td>
+          <td class="mono">${peer.direct_endpoint ? `<span style="color:#1a7a34;font-weight:600">${escapeHtml(peer.direct_endpoint)}</span>` : '<span style="opacity:0.4">—</span>'}</td>
           <td class="mono">${escapeHtml(peer.registered_ip || "")}</td>
           <td class="mono">${escapeHtml(peer.public_addr || "")}</td>
           <td>${formatSeen(peer.last_seen_ms_ago)}</td>
@@ -1950,6 +2006,34 @@
           <dt>Created</dt><dd>${escapeHtml(peer.created_at || "")}</dd>
         </dl>
         <div class="management-policy">
+          <h3>Direct connection</h3>
+          <div class="fld">
+            <label for="directEndpoint" title="WAN address and forwarded port of this workstation's site, e.g. 203.0.113.5:21118. Append ,62201 to override the global knock port for this site.">Reachable at</label>
+            <div style="display:flex;gap:8px;align-items:center;margin-top:3px;">
+              <input id="directEndpoint" type="text" class="mono" style="flex:1" placeholder="— none: hole punch, then relay —" value="${escapeHtml(peer.direct_endpoint || "")}">
+              <button id="directEndpointSave">Save</button>
+              <span id="directEndpointMsg" style="font-size:12px;opacity:0.8;"></span>
+            </div>
+          </div>
+          <div style="font-size:12px;opacity:0.75;line-height:1.5;margin-top:8px;">
+            <code>host:port</code>, optionally <code>,knockport</code>. This is where controllers dial this
+            machine <b>without the relay</b> &mdash; the WAN address of its site's router and the port
+            forwarded to its TBFDesk direct-access port. The relay costs about a third of the link, so a
+            port-forwarded workstation should be reached directly.
+            <br>Setting this also switches <b>this machine's</b> direct-access listener on
+            (<code>direct-server=Y</code>) so something is actually listening behind the forward. It listens on
+            port <b>21118</b> unless its device policy sets <code>direct-access-port</code> &mdash; the port above
+            is the <i>router's external</i> port, which a forward may translate.
+            <br>Leave it empty to keep the default behaviour: hole punching first, relay as the fallback.
+            A client that fails to reach this address falls back the same way, so a broken forward costs
+            latency, never connectivity. Only clients already permitted to control this peer are told the
+            address, and a <b>blocked</b> peer's address is never handed out at all.
+            <br>The optional knock port and the shared SPA keys are set fleet-wide under
+            <b>ACL &amp; Policy &rarr; Global policy</b> (<code>nemo-knock-enabled</code>,
+            <code>nemo-knock-key</code>, <code>nemo-knock-hmac-key</code>).
+          </div>
+        </div>
+        <div class="management-policy">
           <h3>Management</h3>
           <div class="fld" style="margin-bottom:10px;">
             <label for="devicePolicySelect" title="Assign a named policy to this device. Applies to its incoming sessions when no user is logged in; a logged-in user's own policy still wins.">Device policy</label>
@@ -1964,6 +2048,28 @@
           <div style="font-size:12px;opacity:0.75;line-height:1.5;margin-top:8px;">Session settings (file transfer, view-only, terminal, etc.) are managed through <b>named policies</b>. Assign one above, or create and edit them in <b>ACL &amp; Policy</b>. A logged-in user's own policy still overrides the device policy.</div>
         </div>
       `;
+      const dep = $("directEndpoint");
+      const depSave = $("directEndpointSave");
+      // A rejected endpoint is reported back verbatim: the client's parser is lenient on
+      // purpose, so a typo accepted here would just silently keep relaying.
+      const saveEndpoint = async () => {
+        try {
+          const res = await api(`/nemo/api/peers/${encodeURIComponent(peer.id)}/direct-endpoint`, {
+            method: "POST",
+            body: JSON.stringify({ endpoint: dep.value.trim() || null })
+          });
+          peer.direct_endpoint = res.endpoint || "";
+          dep.value = peer.direct_endpoint;
+          setMsg("directEndpointMsg", peer.direct_endpoint ? "Saved — clients pick it up on their next poll" : "Cleared — back to hole punch / relay", true);
+          renderPeers();
+        } catch (err) {
+          setMsg("directEndpointMsg", err.message, false);
+        }
+      };
+      if (depSave) depSave.addEventListener("click", saveEndpoint);
+      if (dep) dep.addEventListener("keydown", (event) => {
+        if (event.key === "Enter") { event.preventDefault(); saveEndpoint(); }
+      });
       const dps = $("devicePolicySelect");
       if (dps) dps.addEventListener("change", async () => {
         try {
@@ -2195,24 +2301,53 @@
       }
     }
 
+    // The two SPA keys come back from the server masked, never in plaintext (they are in
+    // SECRET_POLICY_KEYS). Showing the mask and sending it back unchanged is what tells
+    // the server "keep what you have" — see restore_masked_secrets.
+    const MANAGED_SECRET_MASK = "<managed-secret>";
+
     function renderGlobalPolicy() {
       const opts = (integ.globalPolicy && integ.globalPolicy.options) || {};
       $("gpApiServer").value = opts["api-server"] || "";
       $("gpInsecureTls").checked = opts["allow-insecure-tls-fallback"] === "Y";
+      $("gpAllowUserOverride").checked = !!(integ.globalPolicy || {}).allow_user_override;
+      $("gpKnockEnabled").checked = opts["nemo-knock-enabled"] === "Y";
+      $("gpKnockPort").value = opts["nemo-knock-port"] || "";
+      $("gpKnockDelay").value = opts["nemo-knock-delay-ms"] || "";
+      $("gpKnockSourceIp").value = opts["nemo-knock-source-ip"] || "";
+      $("gpDirectTimeout").value = opts["nemo-direct-timeout-ms"] || "";
+      for (const [id, key] of [["gpKnockKey", "nemo-knock-key"], ["gpKnockHmacKey", "nemo-knock-hmac-key"]]) {
+        const el = $(id);
+        el.value = opts[key] ? MANAGED_SECRET_MASK : "";
+        el.placeholder = opts[key] ? "(set — leave as-is to keep)" : "(not set)";
+      }
     }
 
     async function saveGlobalPolicy() {
-      // Preserve any other keys already in the global policy; only touch the two
-      // fields this panel exposes.
+      // Preserve any other keys already in the global policy; only touch the fields
+      // this panel exposes.
       const opts = Object.assign({}, (integ.globalPolicy && integ.globalPolicy.options) || {});
       const api_server = $("gpApiServer").value.trim();
       if (api_server) opts["api-server"] = api_server; else delete opts["api-server"];
       if ($("gpInsecureTls").checked) opts["allow-insecure-tls-fallback"] = "Y";
       else delete opts["allow-insecure-tls-fallback"];
+      if ($("gpKnockEnabled").checked) opts["nemo-knock-enabled"] = "Y";
+      else delete opts["nemo-knock-enabled"];
+      for (const [id, key] of [
+        ["gpKnockPort", "nemo-knock-port"],
+        ["gpKnockDelay", "nemo-knock-delay-ms"],
+        ["gpKnockSourceIp", "nemo-knock-source-ip"],
+        ["gpDirectTimeout", "nemo-direct-timeout-ms"],
+        ["gpKnockKey", "nemo-knock-key"],
+        ["gpKnockHmacKey", "nemo-knock-hmac-key"],
+      ]) {
+        const value = $(id).value.trim();
+        if (value) opts[key] = value; else delete opts[key];
+      }
       try {
         integ.globalPolicy = await api("/nemo/api/global-policy", {
           method: "PUT",
-          body: JSON.stringify({ allow_user_override: (integ.globalPolicy || {}).allow_user_override || false, options: opts })
+          body: JSON.stringify({ allow_user_override: $("gpAllowUserOverride").checked, options: opts })
         });
         renderGlobalPolicy();
         setMsg("gpSaveMsg", "Saved — applies to clients on their next policy poll.", true);

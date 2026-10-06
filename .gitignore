@@ -10,3 +10,16 @@ src/version.rs
 db_v2.sqlite3
 test.*
 .idea
+# Runtime state hbbs writes next to itself. Never commit these: they are per-deployment
+# (and nemo_global_policy.json / nemo_integration.json hold managed secrets).
+nemo_company_only
+nemo_log_history_limit
+nemo_global_policy.json
+nemo_integration.json
+nemo_peer_endpoints.json
+nemo_peer_hostnames.json
+nemo_peer_terminate.json
+nemo_sessions.json
+nemo_update.json
+nemo-api-cert.pem
+nemo-api-key.pem
