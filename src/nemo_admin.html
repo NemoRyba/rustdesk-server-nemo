@@ -2694,7 +2694,7 @@
           btn.addEventListener("click", async (e) => {
             const target = e.target.dataset.target;
             const source = e.target.dataset.source || "";
-            if (!confirm(`Cut connections to ${target}?\n\nThis blocks the target peer so it stops accepting new connections. Active direct sessions end when closed. You can allow it again from the Peers tab.`)) return;
+            if (!confirm(`Cut connections to ${target}?\n\nThis blocks the target peer so it stops accepting new connections, AND revokes the sessions it already has: the machine closes them itself on its next managed-policy poll, so expect them to drop within ~30 seconds rather than instantly. You can allow it again from the Peers tab.`)) return;
             try {
               await api("/nemo/api/connections/cut", { method: "POST", body: JSON.stringify({ target_id: target, source_id: source }) });
               loadConnections();

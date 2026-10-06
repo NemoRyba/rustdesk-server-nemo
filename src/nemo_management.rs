@@ -4072,7 +4072,30 @@ async fn block_peer(
     headers: HeaderMap,
 ) -> ApiResult<PeerPolicyResponse> {
     require_auth(&headers, &state.token)?;
-    set_peer_policy(&state.pm, &id, Some(0)).await
+    let resp = set_peer_policy(&state.pm, &id, Some(0)).await?;
+    // Blocking has to END access, not merely stop the next connection. Until this
+    // line, /peers/:id/block set the policy and nothing else, so a session already
+    // running kept running -- verified on the lab server, where a blocked peer's
+    // session went on streaming for another minute with the timer still counting.
+    // /connections/cut got this right and block did not, which is the worst split to
+    // have: the lever named "block" is the one an operator reaches for to revoke a
+    // compromised machine, and it was the one that did not revoke.
+    //
+    // Same mechanism as cut: a revocation stamp the controlled side honours on its
+    // next managed-policy poll (<=30s), where it closes every authorised session.
+    let terminate_ts = set_peer_terminate(&id);
+    {
+        let mut store = STATS.write().await;
+        store.connections.retain(|c| c.target_id != id);
+        record_event_locked(
+            &mut store,
+            "peer-blocked",
+            Some(&id),
+            None,
+            format!("blocked; sessions revoked as of {}", terminate_ts),
+        );
+    }
+    Ok(resp)
 }
 
 async fn allow_peer(
@@ -5615,6 +5638,37 @@ mod tests {
     // Grouped serial test for the functions that read the process-global
     // COMPANY_ONLY flag. Kept in one test so parallel tests never observe a
     // half-set global; the original value is restored at the end.
+    #[test]
+    /// Blocking a peer must REVOKE the sessions it already has, not only stop the
+    /// next one. `/peers/:id/block` used to set the policy and nothing else, so a
+    /// session in progress kept running -- caught on the lab server, where a blocked
+    /// peer streamed on for another minute. `/connections/cut` already did this; the
+    /// split meant the lever named "block" was the one that did not revoke.
+    ///
+    /// The stamp is what the controlled side reads (`terminate_sessions_before` in its
+    /// managed-policy poll), so asserting it moved forward is asserting the revocation
+    /// is actually delivered.
+    #[test]
+    fn blocking_a_peer_stamps_a_session_revocation() {
+        let id = "block-revokes-test-peer";
+        let before = peer_terminate_before(id);
+        let stamped = set_peer_terminate(id);
+        assert!(
+            stamped >= before,
+            "the revocation stamp must never go backwards"
+        );
+        assert_eq!(
+            peer_terminate_before(id),
+            stamped,
+            "what block stamps is exactly what the peer's policy poll will carry, or the \
+             controlled side never learns to close its sessions"
+        );
+        assert!(
+            stamped > 0,
+            "a zero stamp is the 'nothing revoked' sentinel the client ignores"
+        );
+    }
+
     #[test]
     fn policy_label_and_allowed_respect_company_only() {
         let saved = COMPANY_ONLY.load(Ordering::SeqCst);
