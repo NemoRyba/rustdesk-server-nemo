@@ -759,7 +759,7 @@
       <div class="panel-board">
       <section class="panel" data-panel-id="connections">
         <div class="panel-head">
-          <h2 class="panel-title">Connections <small class="mini-stats"><b id="mConnActive">0</b> active · <b id="mConnDirect">0</b> direct · <b id="mConnRelay">0</b> relay</small></h2>
+          <h2 class="panel-title">Connections <small class="mini-stats"><b id="mConnActive">0</b> active · <b id="mConnDirect">0</b> direct · <b id="mConnRelay">0</b> relay · <b id="mRelayBytes">0 B</b> relayed</small></h2>
           <div class="peer-tools">
             <label class="switch"><input id="connAutoRefresh" type="checkbox" checked>Auto</label>
             <button id="connRefresh">Refresh</button>
@@ -783,6 +783,30 @@
             <tbody id="connections"></tbody>
           </table>
           <div id="connEmpty" class="empty">No connections recorded yet</div>
+        </div>
+      </section>
+      <section class="panel" data-panel-id="relay-bytes">
+        <div class="panel-head">
+          <h2 class="panel-title">Relayed bytes <small class="mini-stats"><b id="mRelayLive">0</b> live</small></h2>
+        </div>
+        <div style="padding:6px 16px 0;font-size:12px;opacity:0.7;line-height:1.4;">What the <b>relay actually carried</b>, measured by the relay itself (hbbr) and joined to the session this server brokered. The Connections panel shows which <i>path</i> was negotiated; this shows the bytes, which is the only way to prove a session stayed direct. A row with <b>no bytes</b> is the good case: the relay was offered, the two machines went direct, and the grant expired unused. <b>Live</b> rows are sessions the relay still has open.</div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th title="The controlling peer, as it proved itself to the server.">From (source)</th>
+                <th title="The peer being connected to.">To (target)</th>
+                <th title="Bytes the relay has carried for this session, both directions. Final value once the session ends.">Relayed</th>
+                <th title="Current rate reported by the relay (0 once the session has ended).">Rate</th>
+                <th title="Highest rate the relay saw during this session.">Peak</th>
+                <th title="How long the relay has been carrying this session.">Duration</th>
+                <th title="When the server brokered the session.">Brokered</th>
+                <th title="live = the relay still has it open; ended = the relay closed and forgot it; unused = brokered but never carried a byte, i.e. the machines went direct.">State</th>
+              </tr>
+            </thead>
+            <tbody id="relaySessions"></tbody>
+          </table>
+          <div id="relayEmpty" class="empty">No relayed sessions recorded</div>
         </div>
       </section>
       <section class="panel" data-panel-id="log">
@@ -1901,6 +1925,7 @@
         renderBuildInfo(health.build_id);
         renderServerKey(health.server_public_key, health.server_public_key_on_disk);
         renderSummary();
+        renderRelaySessions();
         renderPeers();
         renderDeviceKeyPeerList();
         renderEvents();
@@ -2025,6 +2050,60 @@
       $("mPeers").textContent = state.peers.length;
       $("mOnline").textContent = state.peers.filter((p) => p.online).length;
       $("mReject").textContent = totals.policy_rejections || 0;
+      if ($("mRelayBytes")) $("mRelayBytes").textContent = formatBytes(totals.relay_bytes);
+    }
+
+    // Binary units, like every other tool an operator will compare this against.
+    function formatBytes(value) {
+      const n = Number(value || 0);
+      if (!n) return "0 B";
+      const units = ["B", "KiB", "MiB", "GiB", "TiB"];
+      let i = 0;
+      let v = n;
+      while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+      return (i === 0 ? v : v.toFixed(v < 10 ? 2 : 1)) + " " + units[i];
+    }
+
+    function formatDuration(seconds) {
+      const s = Number(seconds || 0);
+      if (!s) return '<span style="opacity:0.4">&mdash;</span>';
+      if (s < 60) return s + "s";
+      const m = Math.floor(s / 60);
+      if (m < 60) return m + "m " + (s % 60) + "s";
+      return Math.floor(m / 60) + "h " + (m % 60) + "m";
+    }
+
+    // TODO 7: the relay's own byte counters. The server only ever saw negotiations, so a
+    // session that fell back to the relay and pushed gigabytes looked exactly like one
+    // that was offered the relay and then went direct. These rows tell them apart.
+    function renderRelaySessions() {
+      const body = $("relaySessions");
+      if (!body) return;
+      const rows = state.stats?.relay_sessions || [];
+      $("mRelayLive").textContent = rows.filter((r) => r.live).length;
+      if (!rows.length) {
+        body.innerHTML = "";
+        $("relayEmpty").style.display = "";
+        return;
+      }
+      $("relayEmpty").style.display = "none";
+      body.innerHTML = rows.map((r) => {
+        const unused = !r.last_sample_at;
+        const stateCell = r.live
+          ? '<span class="badge allowed">live</span>'
+          : (unused ? '<span style="color:#1a7a34;font-weight:600" title="Brokered but never used: the two machines connected directly.">unused &mdash; went direct</span>'
+                    : '<span style="opacity:0.6">ended</span>');
+        return `<tr>
+          <td>${r.source_id ? `<code>${escapeHtml(r.source_id)}</code>` : '<span style="opacity:0.5" title="The controller proved no identity on this handshake.">unknown</span>'}${peerHostAlias(r.source_id)}</td>
+          <td>${r.target_id ? `<code>${escapeHtml(r.target_id)}</code>` : '<span style="opacity:0.5">unknown</span>'}${peerHostAlias(r.target_id)}</td>
+          <td style="font-weight:600">${unused ? '<span style="opacity:0.4">&mdash;</span>' : escapeHtml(formatBytes(r.bytes))}</td>
+          <td>${r.kbps ? escapeHtml(r.kbps + " kb/s") : '<span style="opacity:0.4">&mdash;</span>'}</td>
+          <td>${r.peak_kbps ? escapeHtml(r.peak_kbps + " kb/s") : '<span style="opacity:0.4">&mdash;</span>'}</td>
+          <td>${formatDuration(r.seconds)}</td>
+          <td>${escapeHtml((r.brokered_at || "").replace("T", " ").slice(0, 19))}</td>
+          <td>${stateCell}</td>
+        </tr>`;
+      }).join("");
     }
 
     function filteredPeers() {
@@ -2242,6 +2321,7 @@
               ${peer.pending_claim_denied ? "" : '<button class="danger" id="detailClaimDeny">Deny</button>'}
             </div></dd>` : ""}
           <dt>Local Addr</dt><dd>${stats.local_addr_attempts || 0}</dd>
+          <dt title="Bytes the relay actually carried for sessions this machine took part in, at either end. The two counters below only say a relay was offered or asked for.">Relayed bytes</dt><dd>${stats.relay_bytes ? `<span style="color:#8a6d1a;font-weight:600">${escapeHtml(formatBytes(stats.relay_bytes))}</span>` : '<span style="color:#1a7a34;font-weight:600">0 &mdash; nothing relayed</span>'}</dd>
           <dt>Relay Requests</dt><dd>${stats.relay_requests || 0}</dd>
           <dt>Relay Responses</dt><dd>${stats.relay_responses || 0}</dd>
           <dt>NAT</dt><dd>${escapeHtml(stats.last_nat_type || "")}</dd>

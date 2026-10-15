@@ -132,6 +132,17 @@ pub fn now() -> u64 {
         .unwrap_or_default()
 }
 
+/// TODO 7: the label both servers use for one relayed session, so hbbr's byte counters
+/// can be joined to the peer ids hbbs knows -- without hbbr ever learning an id and
+/// without the live GRANT travelling anywhere. The grant is a 60s capability to join a
+/// session: handing it to the metrics channel (loopback, but still) would mean a reader
+/// of that channel could race the real peer into the session. A hash cannot be replayed.
+#[allow(dead_code)]
+pub fn relay_session_label(grant: &str) -> String {
+    let digest = sodiumoxide::crypto::hash::sha256::hash(grant.as_bytes());
+    digest.0[..8].iter().map(|b| format!("{:02x}", b)).collect()
+}
+
 #[allow(dead_code)]
 pub fn relay_grant_verify(pk: &sign::PublicKey, grant: &str) -> ResultType<()> {
     let raw = base64::decode(grant).context("relay grant is not base64")?;

@@ -14,7 +14,7 @@ use hbb_common::{
     bail,
     config::keys,
     log,
-    rendezvous_proto::{control_permissions, ControlPermissions},
+    rendezvous_proto::{control_permissions, ControlPermissions, NemoSource},
     tokio, ResultType,
 };
 use once_cell::sync::Lazy;
@@ -500,6 +500,8 @@ struct NemoStatsStore {
     // admin view. Direct sessions have no server-side teardown signal, so entries
     // age out by CONNECTION_TTL rather than on true session end.
     connections: Vec<ConnectionRecord>,
+    // TODO 7: relayed sessions, live and recently ended, as hbbr measures them.
+    relay_sessions: Vec<RelaySessionRecord>,
 }
 
 // Connection history is retained by COUNT (the most-recent N negotiations), not
@@ -527,6 +529,9 @@ struct ConnectionRecord {
 
 #[derive(Clone, Default, Serialize)]
 struct NemoTotals {
+    // TODO 7: bytes hbbr actually carried, counted once per session. The per-peer twin
+    // below charges both ends, so these two do not add up to each other.
+    relay_bytes: u64,
     registered_messages: u64,
     register_pk_messages: u64,
     direct_attempts: u64,
@@ -541,6 +546,10 @@ struct NemoTotals {
 
 #[derive(Clone, Default, Serialize)]
 pub(crate) struct NemoPeerStats {
+    // TODO 7: bytes relayed in sessions this peer took part in, as either end. This is
+    // the number that says a machine is NOT going direct - `relay_forced` only ever
+    // said a relay was offered.
+    relay_bytes: u64,
     registered_messages: u64,
     register_pk_messages: u64,
     direct_attempts: u64,
@@ -862,6 +871,8 @@ struct StatsPeerResponse {
 
 #[derive(Serialize)]
 struct StatsResponse {
+    // TODO 7: live and recent relayed sessions with their byte counts.
+    relay_sessions: Vec<RelaySessionRecord>,
     company_only: bool,
     totals: NemoTotals,
     peers: Vec<StatsPeerResponse>,
@@ -1579,6 +1590,10 @@ pub(crate) async fn spawn_hbbs_api(
             addr
         );
     }
+
+    // TODO 7: the relayed-byte poller runs with the dashboard, because the dashboard is
+    // the only consumer of what it collects. Before the TLS branch below, which returns.
+    spawn_relay_usage_poller();
 
     if use_tls {
         #[cfg(feature = "nemo-tls")]
@@ -3853,6 +3868,39 @@ fn controller_source_identity(source_field: &str) -> Option<(String, Vec<u8>, Op
     Some((source_id.to_owned(), source_uuid, token))
 }
 
+/// TODO 8: the controller identity, from the TYPED field when the client sends one and
+/// from the legacy smuggled marker otherwise.
+///
+/// Both are client-asserted and neither is proved - what proves a controller is the
+/// device-key handshake, which `resolve_controller_identity` prefers over either of
+/// these. So this is only about which of the two the client managed to express, and the
+/// typed field wins because it cannot be confused with the version string it used to
+/// share. A client that sends both and disagrees with itself is a bug worth seeing in
+/// the log, not a refusal: the gates run on one of the two either way.
+fn controller_source_any(
+    proto: Option<&NemoSource>,
+    source_field: &str,
+) -> Option<(String, Vec<u8>, Option<String>)> {
+    let legacy = controller_source_identity(source_field);
+    let Some(src) = proto.filter(|s| !s.id.trim().is_empty()) else {
+        return legacy;
+    };
+    if let Some((claimed, _, _)) = legacy.as_ref() {
+        if claimed != src.id.trim() {
+            log::warn!(
+                "controller sent NemoSource id {} and legacy marker id {}; using the field",
+                src.id.trim(),
+                claimed
+            );
+        }
+    }
+    Some((
+        src.id.trim().to_owned(),
+        src.uuid.to_vec(),
+        Some(src.token.trim().to_owned()).filter(|t| !t.is_empty()),
+    ))
+}
+
 // Per-user connection ACL + require-login, enforced at the punch. `token` is the
 // controller's logged-in user session token (if any).
 fn nemo_user_connection_rejection(
@@ -3930,9 +3978,21 @@ const CONTROL_PERMISSION_KEYS: &[(&str, control_permissions::Permission)] = &[
 /// Returns None when no logged-in user can be resolved, or when their policy says
 /// nothing about any permission. None is the correct "no opinion" answer — it leaves the
 /// controlled machine's local settings in charge rather than implicitly granting access.
-pub(crate) fn control_permissions_for(source_field: &str) -> Option<ControlPermissions> {
+/// TODO 7/8: just the controller's asserted id, for attribution (a metric, a log line,
+/// a relay-session row) rather than for a gate. Gates go through
+/// `resolve_controller_identity`, which prefers the PROVED identity over this.
+pub(crate) fn controller_source_id(proto: Option<&NemoSource>, source_field: &str) -> String {
+    controller_source_any(proto, source_field)
+        .map(|(id, _, _)| id)
+        .unwrap_or_default()
+}
+
+pub(crate) fn control_permissions_for(
+    proto: Option<&NemoSource>,
+    source_field: &str,
+) -> Option<ControlPermissions> {
     use hbb_common::protobuf::Enum;
-    let (_, _, token) = controller_source_identity(source_field)?;
+    let (_, _, token) = controller_source_any(proto, source_field)?;
     let session = integration::session_for_token(token.as_deref()?)?;
     if !integration::user_is_enabled(&session.username) {
         return None;
@@ -3962,6 +4022,7 @@ pub(crate) fn control_permissions_for(source_field: &str) -> Option<ControlPermi
 }
 
 pub(crate) fn nemo_user_rejection_from_field(
+    proto: Option<&NemoSource>,
     source_field: &str,
     target_id: &str,
     // TASK #19: the device key this rendezvous connection proved, if any.
@@ -3969,7 +4030,7 @@ pub(crate) fn nemo_user_rejection_from_field(
 ) -> Option<(String, String)> {
     // Parse best-effort: a controller with no source marker still gets the
     // require-login gate (token = None) so it cannot bypass mandatory login.
-    let parsed = controller_source_identity(source_field);
+    let parsed = controller_source_any(proto, source_field);
     let token = parsed.as_ref().and_then(|(_, _, t)| t.clone());
     let source_id = parsed.map(|(id, _, _)| id).unwrap_or_default();
     let reason = nemo_user_connection_rejection(token.as_deref(), authed_device_pub, target_id)?;
@@ -4042,10 +4103,11 @@ async fn controller_policy_rejection(
 ///
 /// Split out as a pure fn so the decision is unit-testable without a PeerMap.
 fn resolve_controller_identity(
+    proto: Option<&NemoSource>,
     source_field: &str,
     authed_peer_id: Option<&str>,
 ) -> Result<(String, Option<Vec<u8>>), (String, String)> {
-    match (authed_peer_id, controller_source_identity(source_field)) {
+    match (authed_peer_id, controller_source_any(proto, source_field)) {
         (Some(proven), Some((claimed, uuid, _))) => {
             if claimed != proven {
                 log::warn!(
@@ -4075,11 +4137,13 @@ fn resolve_controller_identity(
 
 pub(crate) async fn controller_policy_rejection_from_field(
     pm: &PeerMap,
+    proto: Option<&NemoSource>,
     source_field: &str,
     target_id: &str,
     authed_peer_id: Option<&str>,
 ) -> Option<(String, String)> {
-    let (source_id, source_uuid) = match resolve_controller_identity(source_field, authed_peer_id) {
+    let (source_id, source_uuid) = match resolve_controller_identity(proto, source_field, authed_peer_id)
+    {
         Ok(identity) => identity,
         Err(rejection) => return Some(rejection),
     };
@@ -4176,6 +4240,233 @@ pub(crate) const DEVICE_KEY_CLAIM_PENDING: &str =
 pub(crate) const DEVICE_KEY_CLAIM_DENIED: &str =
     "device key claim was denied by the operator";
 
+// --- TODO 7: relayed BYTES, per session and per peer ------------------------
+//
+// The claim this fork rests on is "sessions go direct; the relay is the fallback".
+// Until now the dashboard could only show how many relay NEGOTIATIONS it saw
+// (`relay_requests`, `relay_forced`): a negotiation says a path was offered, not that a
+// byte went through it. A session that fell back to the relay and pushed 4 GB looked
+// exactly like one that was offered the relay and then went direct.
+//
+// hbbr has the real counters, but it is a separate process -- possibly a separate host
+// -- and it deliberately knows no peer ids: a relayed session is a grant and two
+// sockets. So the join is done here, with the session LABEL (a hash of the grant hbbs
+// minted, see common::relay_session_label) as the key:
+//
+//   hbbs mints a grant -> remembers label -> (controller id, workstation id)
+//   hbbr counts bytes  -> reports         -> (label, bytes, rate)
+//
+// The transport is hbbr's existing loopback admin channel (`uj`, the machine-readable
+// twin of `usage`), which is why this needs no new authentication: that channel already
+// only answers connections from 127.0.0.1, and nothing but a hash crosses it.
+
+/// Relay sessions kept for the dashboard, live and recently ended. Bounded: an
+/// unauthenticated peer cannot create entries (a grant is minted only for a session
+/// hbbs brokered over gated connections), but a busy fleet should still not grow this
+/// without limit.
+const RELAY_SESSION_MEMORY: usize = 256;
+
+/// One relayed session as the dashboard sees it: who hbbs brokered it for, and what
+/// hbbr actually carried.
+#[derive(Clone, Default, Serialize)]
+pub(crate) struct RelaySessionRecord {
+    /// Hash of the grant. Not the grant: that is a live capability to join the session.
+    session: String,
+    /// The controller, as it identified itself on the RequestRelay. Empty when the
+    /// controller is an older client that sends no source marker.
+    source_id: String,
+    target_id: String,
+    brokered_at: String,
+    /// Cumulative, as last reported by hbbr. Stays at its final value once the session
+    /// ends -- hbbr forgets a session when it closes, so this is the total it carried.
+    bytes: u64,
+    kbps: u64,
+    peak_kbps: u64,
+    seconds: u64,
+    /// Last time hbbr reported this session. None = it was brokered but never relayed a
+    /// byte, which is the GOOD case: the peers went direct and never used the grant.
+    last_sample_at: Option<String>,
+    /// hbbr still has it open.
+    live: bool,
+}
+
+/// What hbbr's `uj` command reports per session.
+#[derive(Deserialize)]
+struct RelayUsageSample {
+    #[serde(default)]
+    session: String,
+    #[serde(default)]
+    bytes: u64,
+    #[serde(default)]
+    kbps: u64,
+    #[serde(default)]
+    peak_kbps: u64,
+    #[serde(default)]
+    ms: u64,
+}
+
+/// TODO 7: hbbs brokered a relayed session. Recorded BEFORE any byte moves, so a
+/// session that was offered the relay and then went direct is visible as exactly that:
+/// a row with no samples.
+pub(crate) async fn record_relay_grant(session: String, source_id: &str, target_id: &str) {
+    let mut store = STATS.write().await;
+    // Evict ended sessions first (oldest brokered), then, only if everything is live,
+    // the oldest live one: a stale "live" row is a session whose end hbbr never
+    // reported, and keeping those forever would crowd out the real ones.
+    while store.relay_sessions.len() >= RELAY_SESSION_MEMORY {
+        let victim = store
+            .relay_sessions
+            .iter()
+            .enumerate()
+            .min_by_key(|(idx, r)| (r.live, r.brokered_at.clone(), *idx))
+            .map(|(idx, _)| idx);
+        match victim {
+            Some(idx) => {
+                store.relay_sessions.remove(idx);
+            }
+            None => break,
+        }
+    }
+    store.relay_sessions.push(RelaySessionRecord {
+        session,
+        source_id: source_id.to_owned(),
+        target_id: target_id.to_owned(),
+        brokered_at: now_iso(),
+        ..Default::default()
+    });
+}
+
+/// Fold one sample set into the store: per-session absolutes, per-peer and fleet
+/// deltas. Pure over the store so the delta arithmetic is testable without a relay.
+fn apply_relay_usage(store: &mut NemoStatsStore, samples: Vec<RelayUsageSample>, at: &str) {
+    let mut seen: HashSet<String> = HashSet::new();
+    for sample in samples {
+        if sample.session.is_empty() {
+            continue;
+        }
+        seen.insert(sample.session.clone());
+        let Some(idx) = store
+            .relay_sessions
+            .iter()
+            .position(|r| r.session == sample.session)
+        else {
+            // A session this hbbs did not broker (another hbbs shares the relay, or we
+            // restarted and lost the mapping). Counted in the fleet total, which is
+            // measured traffic either way, but not attributed to any peer.
+            store.totals.relay_bytes += sample.bytes;
+            continue;
+        };
+        // hbbr reports cumulative totals per session, so the increment is what is new
+        // since the last poll. `saturating_sub` covers the one case that would
+        // otherwise underflow: a label reused after a restart with a lower count.
+        let delta = sample.bytes.saturating_sub(store.relay_sessions[idx].bytes);
+        let (source_id, target_id) = {
+            let row = &mut store.relay_sessions[idx];
+            row.bytes = sample.bytes;
+            row.kbps = sample.kbps;
+            row.peak_kbps = sample.peak_kbps;
+            row.seconds = sample.ms / 1000;
+            row.last_sample_at = Some(at.to_owned());
+            row.live = true;
+            (row.source_id.clone(), row.target_id.clone())
+        };
+        store.totals.relay_bytes += delta;
+        // Charged to BOTH ends: the question a dashboard answers is "is this machine
+        // relaying", and both are. So the sum over peers is not the fleet total -- the
+        // fleet total is the one that counts bytes once.
+        for id in [source_id, target_id] {
+            if id.is_empty() {
+                continue;
+            }
+            peer_stats_mut(store, &id).relay_bytes += delta;
+        }
+    }
+    // hbbr drops a session the moment it closes, so "absent from the sample" is how a
+    // session ends. The row keeps its final totals.
+    for row in store.relay_sessions.iter_mut() {
+        if row.live && !seen.contains(&row.session) {
+            row.live = false;
+            row.kbps = 0;
+        }
+    }
+}
+
+/// Ask hbbr for its per-session counters over the loopback admin channel.
+async fn fetch_relay_usage(addr: &str) -> ResultType<Vec<RelayUsageSample>> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut stream = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        tokio::net::TcpStream::connect(addr),
+    )
+    .await??;
+    stream.write_all(b"uj").await?;
+    stream.flush().await?;
+    let mut body = Vec::new();
+    // hbbr answers and closes, so read to EOF; the timeout is the only bound needed.
+    tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        stream.read_to_end(&mut body),
+    )
+    .await??;
+    Ok(serde_json::from_slice(&body)?)
+}
+
+/// TODO 7: poll hbbr for relayed bytes and fold them into the dashboard's stats.
+///
+/// Opt-out, not opt-in: the shipped unit runs hbbs and hbbr on the same host, so the
+/// default target is right there, and a fleet that cannot prove it stays direct is the
+/// thing this exists to fix. `--nemo-relay-metrics ""` turns it off; point it at
+/// another host:port only if that host's admin channel is reachable (it binds loopback,
+/// so in practice that means an SSH tunnel).
+pub(crate) fn spawn_relay_usage_poller() {
+    let addr = get_arg_or("nemo-relay-metrics", "127.0.0.1:21117".to_owned());
+    let addr = addr.trim().to_owned();
+    if addr.is_empty() || is_truthy_off(&addr) {
+        log::info!("Nemo relay byte metrics disabled (--nemo-relay-metrics)");
+        return;
+    }
+    let interval = get_arg("nemo-relay-metrics-interval")
+        .parse::<u64>()
+        .unwrap_or(5)
+        .clamp(1, 3600);
+    log::info!(
+        "Nemo relay byte metrics: polling hbbr at {} every {}s",
+        addr,
+        interval
+    );
+    tokio::spawn(async move {
+        // One warning per outage, not one every interval: hbbr not being there (a
+        // relay on another host, or simply not started yet) must not fill the log.
+        let mut complained = false;
+        loop {
+            match fetch_relay_usage(&addr).await {
+                Ok(samples) => {
+                    if complained {
+                        log::info!("Nemo relay byte metrics: {} is answering again", addr);
+                        complained = false;
+                    }
+                    let at = now_iso();
+                    let mut store = STATS.write().await;
+                    apply_relay_usage(&mut store, samples, &at);
+                }
+                Err(err) => {
+                    if !complained {
+                        log::warn!(
+                            "Nemo relay byte metrics: cannot read hbbr usage from {} ({}). \
+                             Relayed-byte columns stay empty until it answers; pass \
+                             --nemo-relay-metrics \"\" to stop trying.",
+                            addr,
+                            err
+                        );
+                        complained = true;
+                    }
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+        }
+    });
+}
+
 pub(crate) async fn record_register_pk(id: &str, addr: SocketAddr, accepted: bool) {
     let mut store = STATS.write().await;
     store.totals.register_pk_messages += 1;
@@ -4197,6 +4488,8 @@ pub(crate) async fn record_register_pk(id: &str, addr: SocketAddr, accepted: boo
 
 pub(crate) async fn record_connection_negotiation(
     id: &str,
+    // TODO 8: the typed identity field, when the controller sends one.
+    proto: Option<&NemoSource>,
     source_field: &str,
     from_addr: SocketAddr,
     to_addr: SocketAddr,
@@ -4211,7 +4504,7 @@ pub(crate) async fn record_connection_negotiation(
     // H1: log ONLY the parsed source id, never the raw `source_field` — it carries the
     // logged-in user's session token (`nemo-source-v1:<id>:<uuid>:<token>`), and printing
     // it would leak a live bearer credential into the server log.
-    let source_id = controller_source_identity(source_field)
+    let source_id = controller_source_any(proto, source_field)
         .map(|(sid, _, _)| sid)
         .unwrap_or_else(|| "?".to_owned());
     log::info!(
@@ -4278,7 +4571,7 @@ pub(crate) async fn record_connection_negotiation(
     } else {
         "direct-punch"
     };
-    let source_id = controller_source_identity(source_field)
+    let source_id = controller_source_any(proto, source_field)
         .map(|(sid, _, _)| sid)
         .unwrap_or_default();
     upsert_connection(
@@ -5078,9 +5371,18 @@ async fn get_stats(
         })
         .collect();
     peers.sort_by(|a, b| a.id.cmp(&b.id));
+    // TODO 7: newest first, and live sessions ahead of ended ones - the dashboard shows
+    // the top of this list, and what matters is what is relaying right now.
+    let mut relay_sessions = store.relay_sessions.clone();
+    relay_sessions.sort_by(|a, b| {
+        b.live
+            .cmp(&a.live)
+            .then(b.brokered_at.cmp(&a.brokered_at))
+    });
     Ok(Json(StatsResponse {
         company_only: company_only(),
         totals: store.totals.clone(),
+        relay_sessions,
         peers,
     }))
 }
@@ -5498,6 +5800,15 @@ pub(crate) fn now_iso() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
+/// TODO 7: the off switch for a value that is normally an address, so an operator can
+/// write `--nemo-relay-metrics N` as well as `--nemo-relay-metrics ""`.
+fn is_truthy_off(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "n" | "no" | "off" | "false" | "0" | "none" | "disabled"
+    )
+}
+
 pub(crate) fn is_truthy(value: &str) -> bool {
     matches!(
         value.trim().to_ascii_lowercase().as_str(),
@@ -5709,7 +6020,7 @@ mod tests {
     #[test]
     fn relay_gate_treats_a_missing_marker_and_a_forged_token_alike() {
         assert!(controller_source_identity("1.4.6").is_none());
-        assert!(nemo_user_rejection_from_field("1.4.6", "target", None).is_none() == !integration::require_login());
+        assert!(nemo_user_rejection_from_field(None, "1.4.6", "target", None).is_none() == !integration::require_login());
         assert_eq!(
             nemo_user_connection_rejection(None, None, "target"),
             nemo_user_connection_rejection(Some("not-a-real-session-token"), None, "target"),
@@ -5752,19 +6063,19 @@ mod tests {
         let field = format!("1.4.6 {}", source_field("tech-01", &uuid));
         // Proven + matching marker: the proven id wins, uuid still cross-checked.
         assert_eq!(
-            resolve_controller_identity(&field, Some("tech-01")),
+            resolve_controller_identity(None, &field, Some("tech-01")),
             Ok(("tech-01".to_owned(), Some(uuid.clone()))),
         );
         // Proven + no marker: the device key IS the identity, so there is no uuid to
         // compare and the gates must still run.
         assert_eq!(
-            resolve_controller_identity("1.4.6", Some("tech-01")),
+            resolve_controller_identity(None, "1.4.6", Some("tech-01")),
             Ok(("tech-01".to_owned(), None)),
         );
         // Unproven + marker: staged rollout with require-device-key off; the marker is
         // all there is, exactly as before.
         assert_eq!(
-            resolve_controller_identity(&field, None),
+            resolve_controller_identity(None, &field, None),
             Ok(("tech-01".to_owned(), Some(uuid))),
         );
     }
@@ -5772,7 +6083,7 @@ mod tests {
     #[test]
     fn controller_identity_refuses_a_marker_that_impersonates_someone_else() {
         let field = format!("1.4.6 {}", source_field("tech-02", &[9u8, 9]));
-        let err = resolve_controller_identity(&field, Some("tech-01")).unwrap_err();
+        let err = resolve_controller_identity(None, &field, Some("tech-01")).unwrap_err();
         assert_eq!(err.0, "tech-01");
         assert!(
             err.1.contains("does not match the proven device key"),
@@ -5787,7 +6098,7 @@ mod tests {
     #[test]
     fn controller_identity_fails_closed_when_nothing_identifies_the_caller() {
         assert!(controller_source_identity("1.4.6").is_none());
-        let err = resolve_controller_identity("1.4.6", None).unwrap_err();
+        let err = resolve_controller_identity(None, "1.4.6", None).unwrap_err();
         assert_eq!(err.0, "?");
         assert!(err.1.contains("could not be established"), "{}", err.1);
     }
@@ -6620,6 +6931,122 @@ mod tests {
             "claim-peer-9"
         ));
         integration::unpin_device_key_for_test(&pub_b64);
+    }
+
+    // TODO 8: where the controller identity comes from now that there is a field for
+    // it. The typed field wins, the legacy marker still works, and a field that names
+    // nobody is not an identity.
+    #[test]
+    fn controller_source_prefers_the_typed_field_over_the_smuggled_marker() {
+        let marker = format!(
+            "1.4.6 nemo-source-v1:old-peer:{}:old-token",
+            base64::encode(b"old-uuid")
+        );
+        // No field: unchanged behaviour, the marker is parsed as before.
+        let (id, uuid, token) = controller_source_any(None, &marker).unwrap();
+        assert_eq!(id, "old-peer");
+        assert_eq!(uuid, b"old-uuid");
+        assert_eq!(token.as_deref(), Some("old-token"));
+
+        // Field present: it decides, and the uuid no longer needs base64 to survive.
+        let src = NemoSource {
+            id: "new-peer".to_owned(),
+            uuid: b"new-uuid".to_vec().into(),
+            token: "new-token".to_owned(),
+            ..Default::default()
+        };
+        let (id, uuid, token) = controller_source_any(Some(&src), &marker).unwrap();
+        assert_eq!(id, "new-peer");
+        assert_eq!(uuid, b"new-uuid");
+        assert_eq!(token.as_deref(), Some("new-token"));
+
+        // No token (not signed in, or a plaintext socket the client refuses to put it
+        // on) is None, not Some("") -- the user gates key off that difference.
+        let anon = NemoSource {
+            id: "new-peer".to_owned(),
+            uuid: b"new-uuid".to_vec().into(),
+            token: "   ".to_owned(),
+            ..Default::default()
+        };
+        assert_eq!(controller_source_any(Some(&anon), "1.4.6").unwrap().2, None);
+
+        // An empty field is not an identity: fall back rather than reporting a
+        // controller called "". resolve_controller_identity fails closed on an empty id,
+        // so reading the field as authoritative here would refuse a connection that the
+        // marker could have identified.
+        let blank = NemoSource {
+            id: "  ".to_owned(),
+            ..Default::default()
+        };
+        assert_eq!(
+            controller_source_any(Some(&blank), &marker).unwrap().0,
+            "old-peer"
+        );
+        assert!(controller_source_any(Some(&blank), "1.4.6").is_none());
+    }
+
+    // TODO 7: the relayed-byte bookkeeping. hbbr reports CUMULATIVE totals per session
+    // and forgets a session when it closes, so the three things worth pinning down are
+    // the delta arithmetic, what "absent from the sample" means, and that a session
+    // nobody here brokered still counts as measured traffic.
+    #[test]
+    fn relay_usage_folds_cumulative_samples_into_deltas() {
+        fn sample(session: &str, bytes: u64) -> RelayUsageSample {
+            RelayUsageSample {
+                session: session.to_owned(),
+                bytes,
+                kbps: 100,
+                peak_kbps: 900,
+                ms: 4_000,
+            }
+        }
+        let mut store = NemoStatsStore::default();
+        store.relay_sessions.push(RelaySessionRecord {
+            session: "aaaa".to_owned(),
+            source_id: "ctrl-1".to_owned(),
+            target_id: "work-1".to_owned(),
+            brokered_at: "t0".to_owned(),
+            ..Default::default()
+        });
+
+        // First sample: the whole count is new.
+        apply_relay_usage(&mut store, vec![sample("aaaa", 1_000)], "t1");
+        assert_eq!(store.totals.relay_bytes, 1_000);
+        assert_eq!(store.peers["ctrl-1"].relay_bytes, 1_000);
+        assert_eq!(store.peers["work-1"].relay_bytes, 1_000);
+        assert_eq!(store.relay_sessions[0].seconds, 4);
+        assert_eq!(store.relay_sessions[0].peak_kbps, 900);
+        assert!(store.relay_sessions[0].live);
+
+        // Second sample of the SAME session adds only what is new - the bug this test
+        // exists for would charge 2_500 again and treble the fleet total in 10 seconds.
+        apply_relay_usage(&mut store, vec![sample("aaaa", 2_500)], "t2");
+        assert_eq!(store.totals.relay_bytes, 2_500);
+        assert_eq!(store.peers["ctrl-1"].relay_bytes, 2_500);
+
+        // A session this hbbs never brokered: measured traffic, so it counts in the
+        // fleet total, but it is attributed to nobody.
+        apply_relay_usage(
+            &mut store,
+            vec![sample("aaaa", 2_500), sample("bbbb", 70)],
+            "t3",
+        );
+        assert_eq!(store.totals.relay_bytes, 2_570);
+        assert_eq!(store.peers.len(), 2);
+
+        // Absent from the sample = hbbr closed it. The row keeps its final total and
+        // stops claiming a rate.
+        apply_relay_usage(&mut store, vec![], "t4");
+        assert!(!store.relay_sessions[0].live);
+        assert_eq!(store.relay_sessions[0].bytes, 2_500);
+        assert_eq!(store.relay_sessions[0].kbps, 0);
+        assert_eq!(store.totals.relay_bytes, 2_570, "an end is not a new sample");
+
+        // A label reused after a restart reports a LOWER cumulative count; that must not
+        // underflow the delta.
+        apply_relay_usage(&mut store, vec![sample("aaaa", 10)], "t5");
+        assert_eq!(store.totals.relay_bytes, 2_570);
+        assert_eq!(store.relay_sessions[0].bytes, 10);
     }
 
     // S-DUALKEY + M1 + domain separation, against a key pinned in-memory.

@@ -34,6 +34,10 @@ type Usage = (usize, usize, usize, usize);
 lazy_static::lazy_static! {
     static ref PEERS: Mutex<HashMap<String, Box<dyn StreamTrait>>> = Default::default();
     static ref USAGE: RwLock<HashMap<String, Usage>> = Default::default();
+    /// TODO 7: `ip:port` of the joining side (the USAGE key) -> the session LABEL, i.e.
+    /// a hash of the relay grant. hbbr deliberately knows no peer ids; the label is what
+    /// lets hbbs join these byte counters to the two ids it brokered the session for.
+    static ref SESSION_LABELS: RwLock<HashMap<String, String>> = Default::default();
     static ref BLACKLIST: RwLock<HashSet<String>> = Default::default();
     static ref BLOCKLIST: RwLock<HashSet<String>> = Default::default();
 }
@@ -174,7 +178,7 @@ async fn check_cmd(cmd: &str, limiter: Limiter) -> String {
     match fds.next() {
         Some("h") => {
             res = format!(
-                "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
+                "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
                 "blacklist-add(ba) <ip>",
                 "blacklist-remove(br) <ip>",
                 "blacklist(b) <ip>",
@@ -186,7 +190,8 @@ async fn check_cmd(cmd: &str, limiter: Limiter) -> String {
                 "limit-speed(ls) [value(Mb/s)]",
                 "total-bandwidth(tb) [value(Mb/s)]",
                 "single-bandwidth(sb) [value(Mb/s)]",
-                "usage(u)"
+                "usage(u)",
+                "usage-json(uj)"
             )
         }
         Some("blacklist-add" | "ba") => {
@@ -334,6 +339,38 @@ async fn check_cmd(cmd: &str, limiter: Limiter) -> String {
                     speed
                 );
             }
+        }
+        // TODO 7: the machine-readable twin of `usage`, for hbbs's metrics poller. The
+        // text form above is for a human at the socket and stays byte-for-byte as it
+        // was; parsing it would have been a format no one promised to keep.
+        //
+        // Hand-rolled JSON on purpose: every value is a number, a hex label or an
+        // ip:port, so there is nothing to escape, and this keeps the relay binary free
+        // of a serializer it needs for nothing else.
+        Some("usage-json" | "uj") => {
+            let labels = SESSION_LABELS.read().await.clone();
+            let usage = USAGE.read().await.clone();
+            let mut rows: Vec<String> = Vec::with_capacity(usage.len());
+            for (addr, (elapsed, total_bits, highest_kbps, kbps)) in usage {
+                if elapsed == 0 {
+                    // Paired but nothing relayed yet: no sample to report.
+                    continue;
+                }
+                let label = labels.get(&addr).cloned().unwrap_or_default();
+                rows.push(format!(
+                    "{{\"session\":\"{}\",\"addr\":\"{}\",\"ms\":{},\"bytes\":{},\"kbps\":{},\"peak_kbps\":{}}}",
+                    label,
+                    addr,
+                    elapsed,
+                    // `total` counts BITS (nb = len * 8 at every consume), which the
+                    // human form divides by 8 on display. Report bytes, so the
+                    // dashboard is not the third place to remember that.
+                    total_bits / 8,
+                    kbps,
+                    highest_kbps
+                ));
+            }
+            res = format!("[{}]\n", rows.join(","));
         }
         _ => {}
     }
@@ -513,6 +550,10 @@ async fn make_pair_(stream: impl StreamTrait, addr: SocketAddr, key: &str, limit
                         log::info!("Relayrequest {} from {} got paired", rf.uuid, addr);
                         let id = format!("{}:{}", addr.ip(), addr.port());
                         USAGE.write().await.insert(id.clone(), Default::default());
+                        SESSION_LABELS
+                            .write()
+                            .await
+                            .insert(id.clone(), crate::common::relay_session_label(&rf.uuid));
                         if !stream.is_ws() && !peer.is_ws() {
                             peer.set_raw();
                             stream.set_raw();
@@ -525,6 +566,7 @@ async fn make_pair_(stream: impl StreamTrait, addr: SocketAddr, key: &str, limit
                             log::info!("Relay of {} closed", addr);
                         }
                         USAGE.write().await.remove(&id);
+                        SESSION_LABELS.write().await.remove(&id);
                     } else {
                         log::info!("New relay request {} from {}", rf.uuid, addr);
                         PEERS.lock().await.insert(rf.uuid.clone(), Box::new(stream));

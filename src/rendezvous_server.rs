@@ -176,6 +176,11 @@ type PeerPush = tokio::sync::mpsc::UnboundedSender<RendezvousMessage>;
 /// this table records at the point hbbs actually pushed the request to that target.
 struct PendingRelay {
     target_id: String,
+    /// TODO 7: the controller's own id, as it identified itself on the RequestRelay.
+    /// Carried through to the grant so the relayed BYTES hbbr later reports can be
+    /// attributed to both ends of the session, not just the workstation. Empty for a
+    /// controller that sends no source marker.
+    source_id: String,
     expires: std::time::Instant,
 }
 const PENDING_RELAY_TTL: std::time::Duration = std::time::Duration::from_secs(RELAY_GRANT_TTL_SECS);
@@ -697,6 +702,23 @@ impl RendezvousServer {
                     }
                     #[cfg(feature = "nemo-management-api")]
                     let nemo_id = rf.id.clone();
+                    // TODO 7: who is ASKING, as opposed to `nemo_id` above, which is the
+                    // machine being asked for. Captured here because the two fields it
+                    // can come from are both wiped further down before the frame is
+                    // forwarded to the workstation. The proved identity wins; the
+                    // asserted one is the fallback for a connection with no device
+                    // proof. Only used for attribution (the relayed-byte rows), never
+                    // for a gate.
+                    #[cfg(feature = "nemo-management-api")]
+                    let nemo_source_id = authed
+                        .map(|who| who.peer_id.clone())
+                        .filter(|id| !id.is_empty())
+                        .unwrap_or_else(|| {
+                            crate::nemo_management::controller_source_id(
+                                rf.nemo_source.as_ref(),
+                                &rf.licence_key,
+                            )
+                        });
                     #[cfg(feature = "nemo-management-api")]
                     if !nemo_id.is_empty()
                         && !crate::nemo_management::is_peer_allowed(&self.pm, &nemo_id).await
@@ -720,6 +742,9 @@ impl RendezvousServer {
                     #[cfg(feature = "nemo-management-api")]
                     if let Some((controller_id, reason)) = crate::nemo_management::controller_policy_rejection_from_field(
                         &self.pm,
+                        // TODO 8: the typed field when the controller sends one, the
+                        // marker smuggled in licence_key when it is an older client.
+                        rf.nemo_source.as_ref(),
                         &rf.licence_key,
                         &nemo_id,
                         // H44: the identity the gates key off now comes from the device
@@ -754,6 +779,7 @@ impl RendezvousServer {
                     #[cfg(feature = "nemo-management-api")]
                     if let Some((controller_id, reason)) =
                         crate::nemo_management::nemo_user_rejection_from_field(
+                            rf.nemo_source.as_ref(),
                             &rf.licence_key,
                             &nemo_id,
                             // TASK #19: the token in the marker is bound to the device
@@ -786,8 +812,11 @@ impl RendezvousServer {
                         #[cfg(feature = "nemo-management-api")]
                         {
                             rf.control_permissions =
-                                crate::nemo_management::control_permissions_for(&rf.licence_key)
-                                    .into();
+                                crate::nemo_management::control_permissions_for(
+                                    rf.nemo_source.as_ref(),
+                                    &rf.licence_key,
+                                )
+                                .into();
                         }
                         rf.socket_addr = AddrMangle::encode(addr).into();
                         let target_id = rf.id.clone();
@@ -798,6 +827,12 @@ impl RendezvousServer {
                         // so forwarding it whole handed the technician's bearer token to
                         // the workstation on every relayed session. Found by the sweep.
                         rf.licence_key = Default::default();
+                        // TODO 8: the same reason, for the same reason. The typed field
+                        // carries the controller's session token as well, and the target
+                        // never reads an inbound RequestRelay's source - it sends its
+                        // own to hbbr. Forwarding either field whole would hand the
+                        // technician's bearer token to every machine they connect to.
+                        rf.nemo_source = Default::default();
                         msg_out.set_request_relay(rf);
                         let peer_addr = peer.read().await.socket_addr;
                         // H43: the target may be on TCP/WS, not UDP.
@@ -823,6 +858,10 @@ impl RendezvousServer {
                             try_into_v4(addr),
                             PendingRelay {
                                 target_id,
+                                #[cfg(feature = "nemo-management-api")]
+                                source_id: nemo_source_id.clone(),
+                                #[cfg(not(feature = "nemo-management-api"))]
+                                source_id: String::new(),
                                 expires: std::time::Instant::now() + PENDING_RELAY_TTL,
                             },
                         );
@@ -872,6 +911,18 @@ impl RendezvousServer {
                         return false;
                     };
                     rr.uuid = relay_grant_mint(sk, RELAY_GRANT_TTL_SECS);
+                    // TODO 7: remember which session this grant IS, before any byte
+                    // moves. hbbr counts bytes against a hash of the grant and knows no
+                    // peer ids; this is the only place both halves exist at once. A row
+                    // that never gets a sample is the good outcome: the relay was
+                    // offered, the peers went direct, the grant expired unused.
+                    #[cfg(feature = "nemo-management-api")]
+                    crate::nemo_management::record_relay_grant(
+                        crate::common::relay_session_label(&rr.uuid),
+                        &pending.source_id,
+                        &pending.target_id,
+                    )
+                    .await;
                     let mut grant_out = RendezvousMessage::new();
                     grant_out.set_relay_response(RelayResponse {
                         uuid: rr.uuid.clone(),
@@ -1320,6 +1371,9 @@ impl RendezvousServer {
         #[cfg(feature = "nemo-management-api")]
         if let Some((controller_id, reason)) = crate::nemo_management::controller_policy_rejection_from_field(
             &self.pm,
+            // TODO 8: the typed field when the controller sends one, the marker smuggled
+            // in the version string when it is an older client.
+            ph.nemo_source.as_ref(),
             &ph.version,
             &id,
             // H44: see the RequestRelay arm. The marker in `ph.version` is a hint now,
@@ -1342,6 +1396,7 @@ impl RendezvousServer {
         #[cfg(feature = "nemo-management-api")]
         if let Some((controller_id, reason)) =
             crate::nemo_management::nemo_user_rejection_from_field(
+                ph.nemo_source.as_ref(),
                 &ph.version,
                 &id,
                 // TASK #19: see the RequestRelay arm.
@@ -1435,12 +1490,16 @@ impl RendezvousServer {
             // only the target's own local toggles applied.
             #[cfg(feature = "nemo-management-api")]
             let control_permissions =
-                crate::nemo_management::control_permissions_for(&ph.version);
+                crate::nemo_management::control_permissions_for(
+                    ph.nemo_source.as_ref(),
+                    &ph.version,
+                );
             #[cfg(not(feature = "nemo-management-api"))]
             let control_permissions: Option<ControlPermissions> = None;
             #[cfg(feature = "nemo-management-api")]
             crate::nemo_management::record_connection_negotiation(
                 &id,
+                ph.nemo_source.as_ref(),
                 &ph.version,
                 addr,
                 peer_addr,
@@ -1519,6 +1578,12 @@ impl RendezvousServer {
                     try_into_v4(addr),
                     PendingRelay {
                         target_id: id.clone(),
+                        // TODO 7: the PROVED controller identity (the device key this
+                        // rendezvous connection authenticated with), not the unsigned
+                        // marker in `ph.version` - this one only feeds a metric, so
+                        // there is no reason to take the weaker of the two. Empty when
+                        // the handshake carried no device proof.
+                        source_id: authed.map(|who| who.peer_id.clone()).unwrap_or_default(),
                         expires: std::time::Instant::now() + PENDING_RELAY_TTL,
                     },
                 );
