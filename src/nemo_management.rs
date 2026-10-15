@@ -3008,50 +3008,99 @@ async fn delete_update_manifest(
 // is fresh (replay window). A non-numeric ts is REJECTED (it used to silently skip
 // the freshness check).
 fn verify_device_signature(pub_b64: &str, sig_b64: &str, domain: &str, id: &str) -> bool {
+    verify_device_signature_proof(pub_b64, sig_b64, domain, id).ok
+}
+
+/// The result of checking a device proof. `newly_claimed` is true exactly once per
+/// key — on the request whose signature took an unbound provisioning token (M1-CLAIM)
+/// — so the handler can audit the moment a key became that peer's key.
+struct DeviceProof {
+    ok: bool,
+    newly_claimed: bool,
+}
+
+const PROOF_REFUSED: DeviceProof = DeviceProof {
+    ok: false,
+    newly_claimed: false,
+};
+
+fn verify_device_signature_proof(
+    pub_b64: &str,
+    sig_b64: &str,
+    domain: &str,
+    id: &str,
+) -> DeviceProof {
     if !integration::is_device_key_pinned(pub_b64) {
-        return false;
+        return PROOF_REFUSED;
     }
     // TASK #14: the binding rule is shared with the rendezvous handshake
-    // (integration::device_key_binding_check): a bound key authenticates only its
-    // peer, an unbound one nothing at all unless --allow-unbound-device-keys is on.
+    // (integration::device_key_binding_decision): a bound key authenticates only its
+    // peer; an unbound one is a one-shot provisioning token when claiming is on
+    // (M1-CLAIM), and nothing at all when it is off, unless
+    // --allow-unbound-device-keys is set.
     let Some(bound) = integration::device_key_binding(pub_b64) else {
-        return false; // unpinned (racing delete)
+        return PROOF_REFUSED; // unpinned (racing delete)
     };
-    if let Err(reason) = integration::device_key_binding_check(
+    let claim_needed = match integration::device_key_binding_decision(
         &bound,
         id,
         integration::allow_unbound_device_keys(),
+        integration::claim_unbound_device_keys(),
     ) {
-        log::debug!("device signature refused: {}", reason);
-        return false;
-    }
+        integration::BindingDecision::Proven => false,
+        integration::BindingDecision::ClaimOnProof => true,
+        integration::BindingDecision::Refused(reason) => {
+            log::debug!("device signature refused: {}", reason);
+            return PROOF_REFUSED;
+        }
+    };
     let (Ok(pk_bytes), Ok(sig_bytes)) =
         (base64::decode(pub_b64.trim()), base64::decode(sig_b64.trim()))
     else {
-        return false;
+        return PROOF_REFUSED;
     };
     let Some(pk) = sign::PublicKey::from_slice(&pk_bytes) else {
-        return false;
+        return PROOF_REFUSED;
     };
     let Ok(msg) = sign::verify(&sig_bytes, &pk) else {
-        return false;
+        return PROOF_REFUSED;
     };
     let msg = String::from_utf8_lossy(&msg);
     let parts: Vec<&str> = msg.splitn(3, ':').collect();
     if parts.len() != 3 || parts[0] != domain || parts[1] != id {
-        return false;
+        return PROOF_REFUSED;
     }
     let Ok(ts) = parts[2].parse::<u64>() else {
-        return false;
+        return PROOF_REFUSED;
     };
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
     if now.saturating_sub(ts) > 300 || ts.saturating_sub(now) > 60 {
-        return false;
+        return PROOF_REFUSED;
     }
-    true
+    // M1-CLAIM: the signature is valid, fresh, for this domain AND for the id the
+    // client claims — only now may it take the token. Doing this after the checks
+    // above is the whole point: a claim requires the private half, so naming someone
+    // else's unclaimed key cannot steal it.
+    if claim_needed {
+        return match integration::claim_device_key(pub_b64, id, now_iso()) {
+            Ok(newly_claimed) => DeviceProof {
+                ok: true,
+                newly_claimed,
+            },
+            Err(reason) => {
+                // Lost a race with another id, or the key was deleted mid-request.
+                log::warn!("device key claim refused for peer {}: {}", id, reason);
+                PROOF_REFUSED
+            }
+        };
+    }
+    DeviceProof {
+        ok: true,
+        newly_claimed: false,
+    }
 }
 
 // TASK-25: the client's audit uploads (connection open/close/login, file
@@ -3081,14 +3130,14 @@ fn session_device_binding_ok(bound: &str, proven: Option<&str>) -> bool {
     bound.is_empty() || proven == Some(bound)
 }
 
-fn verify_device_key(request: &ClientPolicyRequest) -> bool {
+fn verify_device_key(request: &ClientPolicyRequest) -> DeviceProof {
     let (Some(pub_b64), Some(sig_b64)) = (
         request.device_key_pub.as_deref(),
         request.device_key_sig.as_deref(),
     ) else {
-        return false;
+        return PROOF_REFUSED;
     };
-    verify_device_signature(pub_b64, sig_b64, "nemo-poll", &request.id)
+    verify_device_signature_proof(pub_b64, sig_b64, "nemo-poll", &request.id)
 }
 
 // TASK-25: the event detail of an audit body: everything but the proof fields,
@@ -3862,6 +3911,34 @@ pub(crate) async fn record_peer_seen(id: &str, addr: SocketAddr) {
     );
 }
 
+/// M1-CLAIM: a device key just bound itself to a peer by first use. Audited rather
+/// than only logged, because this is the one binding the operator did not type: the
+/// dashboard's event list is where they confirm the right machine took the token (and
+/// spot it if the wrong one did, while the key can still be deleted).
+pub(crate) async fn record_device_key_claim(id: &str, device_key_pub: &str, via: &str) {
+    // Short prefix only, like the rendezvous handshake log: enough to match the row in
+    // the Device keys table, not the whole public key in every event line.
+    let short: String = device_key_pub.chars().take(12).collect();
+    log::info!(
+        "Device key {}... claimed by peer {} on its {} - it now authenticates only that peer",
+        short,
+        id,
+        via
+    );
+    let mut store = STATS.write().await;
+    record_event_locked(
+        &mut store,
+        "device-key-claimed",
+        Some(id),
+        None,
+        format!(
+            "device key {}... bound to this peer by first use ({}); it no longer authenticates \
+             any other id",
+            short, via
+        ),
+    );
+}
+
 pub(crate) async fn record_register_pk(id: &str, addr: SocketAddr, accepted: bool) {
     let mut store = STATS.write().await;
     store.totals.register_pk_messages += 1;
@@ -4287,8 +4364,21 @@ async fn client_policy(
     validate_client_policy_request(&peer, &request)?;
     // S-DUALKEY: note which key the client authenticated with, and enforce the
     // "require provisioned device key" setting.
-    let device_key_ok = verify_device_key(&request);
+    let proof = verify_device_key(&request);
+    let device_key_ok = proof.ok;
     record_peer_auth_mode(&request.id, if device_key_ok { "device-key" } else { "default" });
+    // M1-CLAIM: the poll is normally the first request a freshly provisioned client
+    // makes, so this is where an unbound token usually becomes that peer's key. Audit
+    // it: the binding was decided by the client, not by the operator, so the operator
+    // has to be able to see which machine took which key, and when.
+    if proof.newly_claimed {
+        record_device_key_claim(
+            &request.id,
+            request.device_key_pub.as_deref().unwrap_or(""),
+            "settings poll",
+        )
+        .await;
+    }
     if integration::require_device_key() && !device_key_ok {
         return Err(api_error(
             StatusCode::FORBIDDEN,
@@ -5123,7 +5213,7 @@ fn nat_type_name(value: i32) -> &'static str {
     }
 }
 
-fn now_iso() -> String {
+pub(crate) fn now_iso() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
@@ -5751,6 +5841,7 @@ mod tests {
             public_key: pub_b64.clone(),
             created_at: String::new(),
             peer_id: "peer-a".to_owned(),
+            claimed_at: String::new(),
         });
         assert!(login_device_key_ok(&opened(&pub_b64, &login_sig), "peer-a"));
         // A captured POLL signature is useless as a login proof.
@@ -6196,6 +6287,7 @@ mod tests {
             public_key: pub_b64.clone(),
             created_at: String::new(),
             peer_id: String::new(),
+            claimed_at: String::new(),
         });
         assert!(!verify_device_signature(
             &pub_b64,
@@ -6211,6 +6303,7 @@ mod tests {
             public_key: pub_b64.clone(),
             created_at: String::new(),
             peer_id: "peer-a".to_owned(),
+            claimed_at: String::new(),
         });
         // Domain separation: a poll signature is useless against the ab endpoint.
         assert!(!verify_device_signature(

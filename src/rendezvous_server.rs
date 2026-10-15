@@ -234,6 +234,9 @@ fn warn_udp_refused_throttled(kind: &str, addr: SocketAddr) {
 pub(crate) struct AuthedDevice {
     pub device_pub_b64: String,
     pub peer_id: String,
+    /// M1-CLAIM: this handshake is what bound an unclaimed provisioning token to this
+    /// peer. Reported out so the caller (which is async, unlike the check) can audit it.
+    pub newly_claimed: bool,
 }
 
 impl RendezvousServer {
@@ -2266,19 +2269,23 @@ impl RendezvousServer {
             bail!("device key is not pinned on this server");
         }
         // TASK #14: bound-peer check, the ONE rule the management API applies too
-        // (device_key_binding_check). A key registered against one machine must not
-        // authenticate another, and an UNBOUND key authenticates nothing unless the
-        // operator started hbbs with --allow-unbound-device-keys Y.
+        // (device_key_binding_decision). A key registered against one machine must not
+        // authenticate another; an UNBOUND key is a one-shot provisioning token when
+        // first-use claiming is on (M1-CLAIM), and authenticates nothing when it is
+        // off, unless the operator started hbbs with --allow-unbound-device-keys Y.
         let Some(bound) = crate::nemo_integration::device_key_binding(&device_pub_b64) else {
             bail!("device key vanished from the registry mid-handshake");
         };
-        if let Err(reason) = crate::nemo_integration::device_key_binding_check(
+        let claim_needed = match crate::nemo_integration::device_key_binding_decision(
             &bound,
             &auth.peer_id,
             crate::nemo_integration::allow_unbound_device_keys(),
+            crate::nemo_integration::claim_unbound_device_keys(),
         ) {
-            bail!("{}", reason);
-        }
+            crate::nemo_integration::BindingDecision::Proven => false,
+            crate::nemo_integration::BindingDecision::ClaimOnProof => true,
+            crate::nemo_integration::BindingDecision::Refused(reason) => bail!("{}", reason),
+        };
         let Some(device_pk) = sign::PublicKey::from_slice(&auth.device_pub) else {
             bail!("device public key is not a valid Ed25519 key");
         };
@@ -2293,12 +2300,28 @@ impl RendezvousServer {
         if opened != payload {
             bail!("device signature covers the wrong payload");
         }
+        // M1-CLAIM: only now, with the signature verified against the id in the payload,
+        // may an unclaimed token be taken. A client that merely names a key it does not
+        // hold never reaches this line.
+        let mut newly_claimed = false;
+        if claim_needed {
+            match crate::nemo_integration::claim_device_key(
+                &device_pub_b64,
+                &auth.peer_id,
+                crate::nemo_management::now_iso(),
+            ) {
+                Ok(claimed) => newly_claimed = claimed,
+                // Lost the race to another id, or the key was deleted mid-handshake.
+                Err(reason) => bail!("{}", reason),
+            }
+        }
         let session = Encrypt::decode(&auth.sealed_key, &auth.client_box_pk, our_sk_b)?;
         Ok((
             session,
             AuthedDevice {
                 device_pub_b64,
                 peer_id: auth.peer_id.clone(),
+                newly_claimed,
             },
         ))
     }
@@ -2584,6 +2607,7 @@ mod tests {
         AuthedDevice {
             device_pub_b64: "dGVzdC1kZXZpY2Uta2V5".to_owned(),
             peer_id: TEST_CONTROLLER.to_owned(),
+            newly_claimed: false,
         }
     }
 
@@ -2802,6 +2826,7 @@ mod tests {
             public_key: device_pub_b64.clone(),
             created_at: String::new(),
             peer_id: "111111111".to_owned(),
+            claimed_at: String::new(),
         });
 
         // The server's per-connection ephemeral, and a second one standing in for a

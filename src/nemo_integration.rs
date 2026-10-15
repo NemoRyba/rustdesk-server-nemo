@@ -228,6 +228,52 @@ pub struct IntegrationConfig {
     /// same reason — an un-updated client is only locked out when the operator flips this.
     #[serde(default)]
     pub require_sealed_request: bool,
+    /// M1-CLAIM: when true, a pinned key with NO peer-id binding may *request* a
+    /// binding. The first client that PROVES the key (a valid signature over the id it
+    /// claims) does not get in: it files a **pending claim** that the operator confirms
+    /// or denies in the dashboard. Only that confirmation writes the binding, and from
+    /// then on the key authenticates that id and nothing else.
+    ///
+    /// This is what makes provisioning workable at all: a client shows no TBFDesk id
+    /// until it is past the provisioning gate, and it cannot pass the gate without a
+    /// key, so the operator cannot know the id at the moment they generate the key.
+    /// The pending claim closes that loop — the client reports the id, the operator
+    /// approves it — without ever letting the client decide its own trust.
+    ///
+    /// ON by default. With it off, the old fail-closed rule stands (an unbound key
+    /// authenticates nothing, and no claim is even filed) and every key has to be
+    /// bound by hand.
+    #[serde(default = "default_true")]
+    pub claim_unbound_device_keys: bool,
+    /// M1-CLAIM: binding requests awaiting the operator's confirmation. Persisted, so
+    /// a request filed overnight is still on the dashboard in the morning and a
+    /// restart does not forget a denial.
+    #[serde(default)]
+    pub pending_device_key_claims: Vec<PendingDeviceKeyClaim>,
+}
+
+/// M1-CLAIM: a client has proved a pinned-but-unbound key and asks for it to become
+/// *its* key. It is NOT authenticated while this row exists — the row is the request,
+/// not the grant.
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub struct PendingDeviceKeyClaim {
+    /// `DeviceKey::id`, so the dashboard can join the request to the key.
+    pub key_id: String,
+    pub public_key: String,
+    /// The id the client claims. Proved, in the sense that the signature covers it —
+    /// but a machine-derived id is self-reported, which is exactly why a human confirms.
+    pub peer_id: String,
+    pub first_seen: String,
+    pub last_seen: String,
+    /// How many times this client has asked (it re-asks on every poll while pending),
+    /// so a silent flap is visible.
+    pub attempts: u32,
+    /// Which endpoint it came in on ("settings poll", "rendezvous handshake").
+    pub via: String,
+    /// Denied by the operator: kept so the next poll does not re-raise it 30 s later.
+    /// The operator can forget the row to let the client ask again.
+    #[serde(default)]
+    pub denied: bool,
 }
 
 /// A provisioned client device key (public half pinned server-side).
@@ -237,11 +283,21 @@ pub struct DeviceKey {
     pub label: String,
     pub public_key: String, // base64 Ed25519 public key
     pub created_at: String,
-    /// M1: the peer id this key is bound to. Empty = legacy unbound key (any id).
+    /// M1: the peer id this key is bound to. Empty = not bound yet.
     /// A bound key only authenticates polls for exactly this peer id, so one leaked
     /// key no longer satisfies require_device_key for the whole fleet.
+    ///
+    /// Empty is not "any id": with `claim_unbound_device_keys` on (the default) the
+    /// key is a one-shot provisioning token that the first client to prove it claims
+    /// (see `claim_device_key_in`); with it off, an empty binding authenticates
+    /// nothing at all.
     #[serde(default)]
     pub peer_id: String,
+    /// M1-CLAIM: when the binding above was taken by first use, as an ISO timestamp.
+    /// Empty means the operator bound it by hand (or it is still unclaimed), so the
+    /// dashboard can tell "I typed this id" apart from "a client took this key".
+    #[serde(default)]
+    pub claimed_at: String,
 }
 
 /// Full-access baseline for admin users: every capability allowed, full control,
@@ -291,6 +347,8 @@ impl Default for IntegrationConfig {
             strip_unsealed_secrets: true,
             require_sealed_login: true,
             require_sealed_request: false,
+            claim_unbound_device_keys: true,
+            pending_device_key_claims: Vec::new(),
         }
     }
 }
@@ -936,6 +994,7 @@ pub fn add_device_key(
         public_key: public_key.clone(),
         created_at,
         peer_id: peer_id.trim().to_owned(),
+        claimed_at: String::new(),
     };
     // Re-adding the SAME public key replaces its entry (label/binding update);
     // a different key never displaces an existing one (ids are unique by now).
@@ -1046,6 +1105,204 @@ pub(crate) fn device_key_binding_check(
 /// TASK #14 escape hatch, read like insecure_ldap_allowed (CLI/.env only).
 pub(crate) fn allow_unbound_device_keys() -> bool {
     crate::nemo_management::is_truthy(&get_arg("allow-unbound-device-keys"))
+}
+
+/// M1-CLAIM: what the binding rule says about a key whose signature has not been
+/// checked yet. `Proven` and `Refused` are final; `ClaimOnProof` means "let the
+/// signature decide" — the caller verifies it and only then calls `claim_device_key`.
+///
+/// The order matters and is the whole security argument for first-use binding: the
+/// claim is written AFTER the signature verifies, so claiming a key requires holding
+/// its private half. Naming someone else's unbound key cannot take it.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum BindingDecision {
+    /// The binding is already satisfied (bound to this id, or the CLI escape hatch).
+    Proven,
+    /// Pinned but unbound, and claiming is on: bind it to `claimed` once the
+    /// signature verifies.
+    ClaimOnProof,
+    Refused(String),
+}
+
+/// TASK #14 + M1-CLAIM: the one binding rule both enforcement points apply
+/// (`nemo_client_auth_open`, `verify_device_signature`), now with the claim arm.
+///
+/// Precedence is deliberate, so no existing deployment changes behaviour silently:
+/// 1. a bound key authenticates exactly its peer, nothing else — unchanged;
+/// 2. `--allow-unbound-device-keys Y` still means "unbound authenticates anything",
+///    and does NOT claim: an operator who asked for the loose rule keeps it, including
+///    the (bad) one-key-many-machines workflow it enables;
+/// 3. otherwise an unbound key is claimable, if claiming is on;
+/// 4. otherwise it authenticates nothing — the original fail-closed rule.
+pub(crate) fn device_key_binding_decision(
+    bound: &str,
+    claimed: &str,
+    allow_unbound: bool,
+    claim_enabled: bool,
+) -> BindingDecision {
+    if !bound.is_empty() {
+        return if bound == claimed {
+            BindingDecision::Proven
+        } else {
+            BindingDecision::Refused(format!(
+                "device key is bound to peer {} but the client claims {}",
+                bound, claimed
+            ))
+        };
+    }
+    if allow_unbound {
+        return BindingDecision::Proven;
+    }
+    if claim_enabled {
+        if claimed.trim().is_empty() {
+            return BindingDecision::Refused(
+                "device key has no peer-id binding and the client claims no id".to_owned(),
+            );
+        }
+        return BindingDecision::ClaimOnProof;
+    }
+    BindingDecision::Refused(format!(
+        "device key has no peer-id binding (client claims {}); bind it, enable first-use \
+         claiming, or pass --allow-unbound-device-keys Y",
+        claimed
+    ))
+}
+
+/// M1-CLAIM: take an unbound key for `peer_id`. Pure over the key list so the rule is
+/// testable without writing the on-disk config. `Ok(true)` = the binding was just
+/// written (the caller persists and audits it), `Ok(false)` = already bound to this
+/// same peer (a re-poll, or two of its own requests racing), `Err` = refuse.
+///
+/// Re-checking the binding HERE, under the same lock that writes it, is what makes two
+/// different ids racing for one token safe: whichever gets the lock first binds it, the
+/// other is refused by the `bound != peer_id` arm rather than overwriting the winner.
+fn claim_device_key_in(
+    keys: &mut [DeviceKey],
+    public_key: &str,
+    peer_id: &str,
+    claimed_at: &str,
+) -> Result<bool, String> {
+    let pk = public_key.trim();
+    let peer_id = peer_id.trim();
+    if peer_id.is_empty() {
+        return Err("cannot claim a device key for an empty peer id".to_owned());
+    }
+    let Some(key) = keys.iter_mut().find(|k| k.public_key == pk) else {
+        // Deleted between the decision and the claim: fail closed.
+        return Err("device key is no longer pinned on this server".to_owned());
+    };
+    if key.peer_id == peer_id {
+        return Ok(false);
+    }
+    if !key.peer_id.is_empty() {
+        return Err(format!(
+            "device key was claimed by peer {} first; {} is refused",
+            key.peer_id, peer_id
+        ));
+    }
+    key.peer_id = peer_id.to_owned();
+    key.claimed_at = claimed_at.to_owned();
+    Ok(true)
+}
+
+/// M1-CLAIM: `claim_device_key_in` against the live config, persisting a new binding.
+/// `claimed_at` is passed in (like `add_device_key`'s `created_at`) so this module
+/// stays free of a clock and the tests stay deterministic.
+pub fn claim_device_key(
+    public_key: &str,
+    peer_id: &str,
+    claimed_at: String,
+) -> Result<bool, String> {
+    let mut cfg = CONFIG.lock().unwrap();
+    let claimed = claim_device_key_in(&mut cfg.device_keys, public_key, peer_id, &claimed_at)?;
+    if claimed {
+        persist(&cfg);
+    }
+    Ok(claimed)
+}
+
+/// Peer ids are the client's own machine-derived id, and they end up in log lines,
+/// JSON and the dashboard, so keep them to the shape hbbs already accepts
+/// (`register_pk_core` refuses anything under 6 characters).
+pub fn valid_peer_id(id: &str) -> bool {
+    let id = id.trim();
+    id.len() >= 6
+        && id.len() <= 64
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// Set (or clear) a key's binding by hand. Pure half, for the same reason as
+/// `claim_device_key_in`.
+fn set_device_key_peer_id_in(
+    keys: &mut [DeviceKey],
+    id: &str,
+    peer_id: &str,
+) -> Result<DeviceKey, String> {
+    let peer_id = peer_id.trim();
+    if !peer_id.is_empty() && !valid_peer_id(peer_id) {
+        return Err(
+            "not a TBFDesk id: use 6-64 characters, letters, digits, '-' or '_' (empty clears \
+             the binding)"
+                .to_owned(),
+        );
+    }
+    let Some(key) = keys.iter_mut().find(|k| k.id == id) else {
+        return Err("no such device key".to_owned());
+    };
+    key.peer_id = peer_id.to_owned();
+    // An operator typing the id is not a first-use claim: clearing this is what keeps
+    // the dashboard's "claimed by the client" badge honest, and clearing the binding
+    // re-arms the key as a fresh provisioning token.
+    key.claimed_at = String::new();
+    Ok(key.clone())
+}
+
+/// Bind a key to a peer id after the fact (the GUI's editable "Bound to ID" field), or
+/// clear it to re-arm the key as a claimable provisioning token.
+pub fn set_device_key_peer_id(id: &str, peer_id: &str) -> Result<DeviceKey, String> {
+    let mut cfg = CONFIG.lock().unwrap();
+    let updated = set_device_key_peer_id_in(&mut cfg.device_keys, id, peer_id)?;
+    persist(&cfg);
+    Ok(updated)
+}
+
+/// The key provisioned for a peer, if any: what the dashboard needs to tell a
+/// provisioned machine from one that is merely registered at the rendezvous server
+/// and still unverified. Unlike the poll-derived auth mode this survives a restart,
+/// because it is read from the pinned registry rather than from runtime state.
+pub fn device_key_for_peer(peer_id: &str) -> Option<DeviceKey> {
+    let peer_id = peer_id.trim();
+    if peer_id.is_empty() {
+        return None;
+    }
+    CONFIG
+        .lock()
+        .unwrap()
+        .device_keys
+        .iter()
+        .find(|k| k.peer_id == peer_id)
+        .cloned()
+}
+
+pub fn claim_unbound_device_keys() -> bool {
+    CONFIG.lock().unwrap().claim_unbound_device_keys
+}
+pub fn set_claim_unbound_device_keys(v: bool) {
+    let mut cfg = CONFIG.lock().unwrap();
+    cfg.claim_unbound_device_keys = v;
+    persist(&cfg);
+}
+/// Keys still waiting for a first use, for the dashboard's provisioning view.
+pub fn unclaimed_device_key_count() -> usize {
+    CONFIG
+        .lock()
+        .unwrap()
+        .device_keys
+        .iter()
+        .filter(|k| k.peer_id.is_empty())
+        .count()
 }
 pub fn require_device_key() -> bool {
     CONFIG.lock().unwrap().require_device_key
@@ -2495,6 +2752,7 @@ mod tests {
             public_key: key_a.clone(),
             created_at: String::new(),
             peer_id: String::new(),
+            claimed_at: String::new(),
         }];
         let id_b = device_key_id_for(&key_b, &existing);
         assert_ne!(id_b, id_a, "colliding prefix must not reuse the id");
