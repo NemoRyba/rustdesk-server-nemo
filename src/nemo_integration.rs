@@ -491,6 +491,23 @@ fn atomic_write(path: &std::path::Path, text: &str) -> std::io::Result<()> {
 }
 
 fn persist(cfg: &IntegrationConfig) {
+    // A unit test must never write the operator's config. Several tests enter through
+    // an enforcement point (verify_device_signature, the rendezvous handshake), which
+    // reaches the locking wrappers and so this function -- and that once left a real
+    // nemo_integration.json, full of test keys, in the repo checkout. The pure `*_in`
+    // halves keep the rules testable; this closes the hole for every present and future
+    // test in one place, including the ones that cannot avoid the wrapper.
+    #[cfg(test)]
+    {
+        let _ = cfg;
+        return;
+    }
+    #[cfg(not(test))]
+    persist_to_disk(cfg)
+}
+
+#[cfg(not(test))]
+fn persist_to_disk(cfg: &IntegrationConfig) {
     let path = config_path();
     match serde_json::to_string_pretty(cfg) {
         Ok(text) => {
@@ -1013,6 +1030,10 @@ pub fn remove_device_key(id: &str) -> Option<DeviceKey> {
     let mut cfg = CONFIG.lock().unwrap();
     let pos = cfg.device_keys.iter().position(|k| k.id == id)?;
     let removed = cfg.device_keys.remove(pos);
+    // M1-CLAIM: a request against a key that no longer exists can neither be approved
+    // nor mean anything, so it goes with the key instead of haunting the dashboard.
+    cfg.pending_device_key_claims
+        .retain(|c| c.public_key != removed.public_key);
     persist(&cfg);
     drop(cfg);
     let mut sessions = SESSIONS.lock().unwrap();
@@ -1075,32 +1096,6 @@ pub fn device_key_binding(public_key: &str) -> Option<String> {
         .iter()
         .find(|k| k.public_key == pk)
         .map(|k| k.peer_id.clone())
-}
-/// TASK #14: the ONE binding rule both enforcement points apply (nemo_client_auth_open,
-/// verify_device_signature). A bound key authenticates exactly its peer; an UNBOUND key
-/// authenticates NOTHING unless --allow-unbound-device-keys is on, because the admin
-/// peer-id box is optional free text and "blank = any id" was a fleet-wide skeleton key.
-pub(crate) fn device_key_binding_check(
-    bound: &str,
-    claimed: &str,
-    allow_unbound: bool,
-) -> Result<(), String> {
-    if bound.is_empty() && allow_unbound {
-        return Ok(());
-    }
-    if bound.is_empty() {
-        return Err(format!(
-            "device key has no peer-id binding (client claims {}); bind it or pass --allow-unbound-device-keys Y",
-            claimed
-        ));
-    }
-    if bound != claimed {
-        return Err(format!(
-            "device key is bound to peer {} but the client claims {}",
-            bound, claimed
-        ));
-    }
-    Ok(())
 }
 /// TASK #14 escape hatch, read like insecure_ldap_allowed (CLI/.env only).
 pub(crate) fn allow_unbound_device_keys() -> bool {
@@ -1205,22 +1200,6 @@ fn claim_device_key_in(
     Ok(true)
 }
 
-/// M1-CLAIM: `claim_device_key_in` against the live config, persisting a new binding.
-/// `claimed_at` is passed in (like `add_device_key`'s `created_at`) so this module
-/// stays free of a clock and the tests stay deterministic.
-pub fn claim_device_key(
-    public_key: &str,
-    peer_id: &str,
-    claimed_at: String,
-) -> Result<bool, String> {
-    let mut cfg = CONFIG.lock().unwrap();
-    let claimed = claim_device_key_in(&mut cfg.device_keys, public_key, peer_id, &claimed_at)?;
-    if claimed {
-        persist(&cfg);
-    }
-    Ok(claimed)
-}
-
 /// Peer ids are the client's own machine-derived id, and they end up in log lines,
 /// JSON and the dashboard, so keep them to the shape hbbs already accepts
 /// (`register_pk_core` refuses anything under 6 characters).
@@ -1264,6 +1243,12 @@ fn set_device_key_peer_id_in(
 pub fn set_device_key_peer_id(id: &str, peer_id: &str) -> Result<DeviceKey, String> {
     let mut cfg = CONFIG.lock().unwrap();
     let updated = set_device_key_peer_id_in(&mut cfg.device_keys, id, peer_id)?;
+    // M1-CLAIM: the operator has just answered the question the pending rows ask, one
+    // way or the other. Binding by hand settles it; CLEARING the binding re-arms the key
+    // as a fresh provisioning token, and a stale denial must not then refuse the first
+    // client that proves it.
+    cfg.pending_device_key_claims
+        .retain(|c| c.public_key != updated.public_key);
     persist(&cfg);
     Ok(updated)
 }
@@ -1304,6 +1289,240 @@ pub fn unclaimed_device_key_count() -> usize {
         .filter(|k| k.peer_id.is_empty())
         .count()
 }
+// --- M1-CLAIM: pending binding requests ------------------------------------
+//
+// A pending claim is a REQUEST, never a grant: while the row exists the client is
+// still refused (it sits in its provisioning gate), and only the operator's
+// confirmation writes the binding. Because the row is only ever filed AFTER a
+// signature over the claimed id verifies, filing one requires holding the key's
+// private half -- naming someone else's unclaimed key cannot even raise a request
+// against it.
+
+/// How many different ids one key may have waiting at once, and how many requests the
+/// whole table holds. A claim needs a valid signature over a pinned key, so this is not
+/// an open flood -- but one key must not be able to fill a PERSISTED table with ids.
+pub const MAX_PENDING_PER_KEY: usize = 5;
+pub const MAX_PENDING_CLAIMS: usize = 200;
+
+/// What `register_pending_claim` did with a request. Every variant means "refused for
+/// now" to the caller -- it only decides what to tell the operator and the log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PendingOutcome {
+    /// Filed now: the operator has something new to confirm.
+    New,
+    /// Already filed and still waiting; `attempts`/`last_seen` were bumped.
+    Repeat,
+    /// The operator denied this pairing. Deliberately NOT re-raised, or the denial
+    /// would reappear on the next poll 30 s later; the operator can forget the row to
+    /// let the client ask again.
+    Denied,
+    /// This key already has `MAX_PENDING_PER_KEY` ids waiting, or the table is full of
+    /// denied rows. Dropped.
+    Full,
+    /// The key was deleted between the decision and the claim, or the id is not a
+    /// TBFDesk id. Nothing is filed -- a junk id must not reach the persisted table.
+    Rejected,
+}
+
+fn register_pending_claim_in(
+    claims: &mut Vec<PendingDeviceKeyClaim>,
+    key_id: &str,
+    public_key: &str,
+    peer_id: &str,
+    via: &str,
+    now: &str,
+) -> PendingOutcome {
+    let pk = public_key.trim();
+    let peer_id = peer_id.trim();
+    if !valid_peer_id(peer_id) {
+        return PendingOutcome::Rejected;
+    }
+    if let Some(existing) = claims
+        .iter_mut()
+        .find(|c| c.public_key == pk && c.peer_id == peer_id)
+    {
+        existing.last_seen = now.to_owned();
+        existing.attempts = existing.attempts.saturating_add(1);
+        existing.via = via.to_owned();
+        // The key id is derived from the public key's prefix and can be re-derived on a
+        // re-pin, so keep the dashboard's join column current.
+        existing.key_id = key_id.to_owned();
+        return if existing.denied {
+            PendingOutcome::Denied
+        } else {
+            PendingOutcome::Repeat
+        };
+    }
+    if claims.iter().filter(|c| c.public_key == pk).count() >= MAX_PENDING_PER_KEY {
+        return PendingOutcome::Full;
+    }
+    // Global cap: make room by dropping the oldest row that is still merely waiting,
+    // rather than refusing a real provisioning request because a stale one was never
+    // cleared. A DENIED row is never evicted -- dropping it would let the denied client
+    // re-raise its request on the next poll, which is exactly what `denied` prevents.
+    while claims.len() >= MAX_PENDING_CLAIMS {
+        let Some(oldest) = claims
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| !c.denied)
+            .min_by(|(ai, a), (bi, b)| a.first_seen.cmp(&b.first_seen).then(ai.cmp(bi)))
+            .map(|(i, _)| i)
+        else {
+            return PendingOutcome::Full;
+        };
+        claims.remove(oldest);
+    }
+    claims.push(PendingDeviceKeyClaim {
+        key_id: key_id.to_owned(),
+        public_key: pk.to_owned(),
+        peer_id: peer_id.to_owned(),
+        first_seen: now.to_owned(),
+        last_seen: now.to_owned(),
+        attempts: 1,
+        via: via.to_owned(),
+        denied: false,
+    });
+    PendingOutcome::New
+}
+
+/// File (or refresh) a binding request against the live config. `now` is passed in for
+/// the same reason as `add_device_key`'s `created_at`: this module keeps no clock.
+///
+/// The caller MUST refuse the request regardless of the outcome.
+pub fn register_pending_claim(
+    public_key: &str,
+    peer_id: &str,
+    via: &str,
+    now: String,
+) -> PendingOutcome {
+    let mut cfg = CONFIG.lock().unwrap();
+    let pk = public_key.trim().to_owned();
+    let Some(key_id) = cfg
+        .device_keys
+        .iter()
+        .find(|k| k.public_key == pk)
+        .map(|k| k.id.clone())
+    else {
+        return PendingOutcome::Rejected;
+    };
+    let outcome = register_pending_claim_in(
+        &mut cfg.pending_device_key_claims,
+        &key_id,
+        &pk,
+        peer_id,
+        via,
+        &now,
+    );
+    // Only a change is worth a write: a client re-polling every 30 s while it waits
+    // must not rewrite the config file every 30 s. `Repeat` bumps counters in memory;
+    // losing them to a restart costs nothing, the request itself is already on disk.
+    if matches!(outcome, PendingOutcome::New) {
+        persist(&cfg);
+    }
+    outcome
+}
+
+pub fn pending_device_key_claims() -> Vec<PendingDeviceKeyClaim> {
+    CONFIG.lock().unwrap().pending_device_key_claims.clone()
+}
+
+/// The request this peer is waiting on, if any: what the peers panel needs to show an
+/// "unverified -- key claim pending" badge on a machine that is registered but refused.
+pub fn pending_claim_for_peer(peer_id: &str) -> Option<PendingDeviceKeyClaim> {
+    let peer_id = peer_id.trim();
+    if peer_id.is_empty() {
+        return None;
+    }
+    let cfg = CONFIG.lock().unwrap();
+    cfg.pending_device_key_claims
+        .iter()
+        .find(|c| c.peer_id == peer_id && !c.denied)
+        .or_else(|| {
+            cfg.pending_device_key_claims
+                .iter()
+                .find(|c| c.peer_id == peer_id)
+        })
+        .cloned()
+}
+
+/// The operator confirms a pairing: this is the ONLY path that writes a binding the
+/// operator did not type. The key's other pending rows go with it -- one token, one
+/// machine -- including denied ones, which have nothing left to deny.
+pub fn approve_device_key_claim(
+    key_id: &str,
+    peer_id: &str,
+    claimed_at: String,
+) -> Result<DeviceKey, String> {
+    let mut cfg = CONFIG.lock().unwrap();
+    let Some(public_key) = cfg
+        .pending_device_key_claims
+        .iter()
+        .find(|c| c.key_id == key_id && c.peer_id == peer_id)
+        .map(|c| c.public_key.clone())
+    else {
+        return Err("no such pending device-key claim".to_owned());
+    };
+    // Re-checks the binding under the lock that writes it, so two approvals racing (two
+    // browser tabs) cannot both bind.
+    claim_device_key_in(&mut cfg.device_keys, &public_key, peer_id, &claimed_at)?;
+    cfg.pending_device_key_claims
+        .retain(|c| c.public_key != public_key);
+    let Some(key) = cfg
+        .device_keys
+        .iter()
+        .find(|k| k.public_key == public_key)
+        .cloned()
+    else {
+        return Err("device key is no longer pinned on this server".to_owned());
+    };
+    persist(&cfg);
+    Ok(key)
+}
+
+/// The operator refuses a pairing. The row stays, marked, so the next poll does not
+/// re-raise it 30 s later and so the refusal survives a restart.
+pub fn deny_device_key_claim(key_id: &str, peer_id: &str) -> Result<PendingDeviceKeyClaim, String> {
+    let mut cfg = CONFIG.lock().unwrap();
+    let Some(claim) = cfg
+        .pending_device_key_claims
+        .iter_mut()
+        .find(|c| c.key_id == key_id && c.peer_id == peer_id)
+    else {
+        return Err("no such pending device-key claim".to_owned());
+    };
+    claim.denied = true;
+    let out = claim.clone();
+    persist(&cfg);
+    Ok(out)
+}
+
+/// Drop a row, denied or not: a denied client may ask again, and a request filed by a
+/// machine that no longer exists should not sit on the dashboard forever.
+pub fn forget_device_key_claim(key_id: &str, peer_id: &str) -> Result<bool, String> {
+    let mut cfg = CONFIG.lock().unwrap();
+    let before = cfg.pending_device_key_claims.len();
+    cfg.pending_device_key_claims
+        .retain(|c| !(c.key_id == key_id && c.peer_id == peer_id));
+    let removed = cfg.pending_device_key_claims.len() != before;
+    if removed {
+        persist(&cfg);
+    } else {
+        return Err("no such pending device-key claim".to_owned());
+    }
+    Ok(removed)
+}
+
+/// Requests waiting for a decision, for the dashboard badge and the boot warning.
+pub fn pending_device_key_claim_count() -> usize {
+    CONFIG
+        .lock()
+        .unwrap()
+        .pending_device_key_claims
+        .iter()
+        .filter(|c| !c.denied)
+        .count()
+}
+
 pub fn require_device_key() -> bool {
     CONFIG.lock().unwrap().require_device_key
 }
@@ -2761,23 +2980,49 @@ mod tests {
         assert_eq!(device_key_id_for(&key_a, &existing), id_a);
     }
 
-    // TASK #14: a bound key opens for exactly its peer; an UNBOUND key for nobody
-    // unless the escape hatch is on. The rule both enforcement points share.
+    // TASK #14 + M1-CLAIM: a bound key opens for exactly its peer; an UNBOUND key for
+    // nobody -- it may at most ASK, and only when claiming is on. The rule both
+    // enforcement points share, in its precedence order.
     #[test]
-    fn device_key_binding_check_fails_closed_on_an_unbound_key() {
-        assert!(device_key_binding_check("peer-a", "peer-a", false).is_ok());
-        assert!(device_key_binding_check("peer-a", "peer-b", false).is_err());
-        assert!(device_key_binding_check("peer-a", "peer-b", true).is_err());
-        assert!(device_key_binding_check("", "peer-a", false).is_err());
-        assert!(device_key_binding_check("", "", false).is_err());
-        assert!(device_key_binding_check("", "peer-a", true).is_ok());
-        let err = device_key_binding_check("peer-a", "peer-b", false).unwrap_err();
-        assert!(err.contains("bound to peer peer-a"), "{}", err);
-        let err = device_key_binding_check("", "peer-a", false).unwrap_err();
-        assert!(err.contains("allow-unbound-device-keys"), "{}", err);
+    fn device_key_binding_decision_covers_the_four_arms_in_order() {
+        use BindingDecision::*;
+        // 1. A bound key authenticates exactly its peer, whatever the two switches say.
+        for allow in [false, true] {
+            for claim in [false, true] {
+                assert_eq!(device_key_binding_decision("peer-a", "peer-a", allow, claim), Proven);
+                assert!(matches!(
+                    device_key_binding_decision("peer-a", "peer-b", allow, claim),
+                    Refused(_)
+                ));
+            }
+        }
+        // 2. The CLI escape hatch still means "unbound authenticates anything", and
+        //    files no claim -- an operator who asked for the loose rule keeps it.
+        assert_eq!(device_key_binding_decision("", "peer-a", true, true), Proven);
+        assert_eq!(device_key_binding_decision("", "peer-a", true, false), Proven);
+        // 3. Otherwise an unbound key may only ASK (the caller verifies the signature
+        //    and then files a pending claim; it is still refused meanwhile).
+        assert_eq!(device_key_binding_decision("", "peer-a", false, true), ClaimOnProof);
+        // ... and cannot ask on behalf of no id at all.
+        assert!(matches!(
+            device_key_binding_decision("", "", false, true),
+            Refused(_)
+        ));
+        // 4. With claiming off, TASK #14 exactly as it was: an unbound key
+        //    authenticates NOTHING, because "blank = any id" was a fleet-wide
+        //    skeleton key.
+        let err = match device_key_binding_decision("", "peer-a", false, false) {
+            Refused(e) => e,
+            other => panic!("an unbound key must authenticate nothing: {:?}", other),
+        };
+        assert!(err.contains("no peer-id binding"), "{}", err);
+        let err = match device_key_binding_decision("peer-a", "peer-b", false, false) {
+            Refused(e) => e,
+            other => panic!("a bound key must not authenticate another peer: {:?}", other),
+        };
+        assert!(err.contains("bound to peer"), "{}", err);
     }
 
-    // S-C: tls_verify=false is refused unless the loud override flag is set.
     #[test]
     fn ldap_tls_verify_off_requires_explicit_override() {
         assert_eq!(ldap_tls_verify_effective(true, false), Ok(true));
@@ -2810,6 +3055,274 @@ mod tests {
         let text = serde_json::to_string(&fresh).unwrap();
         assert!(text.contains("\"require_device_key\":true"));
         assert!(text.contains("\"strip_unsealed_secrets\":true"));
+    }
+
+
+    // ---- M1-CLAIM: first-use binding, with operator confirmation -------------
+    //
+    // These tests run against the live CONFIG (pin_device_key_for_test), which is safe
+    // only because persist() is a no-op under cfg(test) -- a test that reached the real
+    // one once wrote a nemo_integration.json full of test keys into the repo checkout.
+    // Each test uses its own public key, since the global config is shared.
+
+    fn test_key(tag: &str) -> String {
+        // Shaped like a real base64 Ed25519 key, but only ever compared as a string
+        // here: these tests exercise the claim bookkeeping, not the signature check
+        // (that one lives in nemo_management, through verify_device_signature).
+        format!("{:A<44}", tag)
+    }
+
+    fn pin_claimable(tag: &str) -> String {
+        let public_key = test_key(tag);
+        pin_device_key_for_test(DeviceKey {
+            id: tag.to_owned(),
+            label: tag.to_owned(),
+            public_key: public_key.clone(),
+            created_at: String::new(),
+            peer_id: String::new(),
+            claimed_at: String::new(),
+        });
+        public_key
+    }
+
+    fn drop_claimable(public_key: &str) {
+        unpin_device_key_for_test(public_key);
+        let mut cfg = CONFIG.lock().unwrap();
+        cfg.pending_device_key_claims
+            .retain(|c| c.public_key != public_key);
+    }
+
+    // The core of the design: proving an unbound key does NOT authenticate, it files a
+    // request. Nothing is bound until the operator confirms, and the confirmation binds
+    // the key to exactly that one id.
+    #[test]
+    fn first_use_files_a_claim_and_only_approval_binds() {
+        let pk = pin_claimable("claim1");
+        assert_eq!(
+            register_pending_claim(&pk, "111111111", "settings poll", "t0".to_owned()),
+            PendingOutcome::New
+        );
+        // Still unbound: a pending claim grants nothing.
+        assert_eq!(device_key_binding(&pk).as_deref(), Some(""));
+        assert_eq!(
+            device_key_binding_decision("", "111111111", false, true),
+            BindingDecision::ClaimOnProof,
+            "the client must keep being refused (and keep asking) while it waits"
+        );
+        // Re-polling every 30s is one request, not a new one each time.
+        assert_eq!(
+            register_pending_claim(&pk, "111111111", "settings poll", "t1".to_owned()),
+            PendingOutcome::Repeat
+        );
+        let claim = pending_claim_for_peer("111111111").expect("the request must be visible");
+        assert_eq!(claim.key_id, "claim1");
+        assert_eq!(claim.attempts, 2);
+        assert_eq!(claim.first_seen, "t0");
+        assert_eq!(claim.last_seen, "t1");
+
+        // The operator confirms: NOW it binds, and the request is gone.
+        let key = approve_device_key_claim("claim1", "111111111", "t2".to_owned())
+            .expect("approval must bind");
+        assert_eq!(key.peer_id, "111111111");
+        assert_eq!(key.claimed_at, "t2", "a first-use binding is marked as claimed");
+        assert!(pending_claim_for_peer("111111111").is_none());
+        assert_eq!(device_key_binding(&pk).as_deref(), Some("111111111"));
+
+        // And from here it is an ordinary bound key: it authenticates that id and
+        // nothing else, which is the whole point of binding on first use.
+        assert_eq!(
+            device_key_binding_decision("111111111", "222222222", false, true),
+            BindingDecision::Refused(
+                "device key is bound to peer 111111111 but the client claims 222222222".to_owned()
+            )
+        );
+        drop_claimable(&pk);
+    }
+
+    // Two machines with the same token: both may ask, only one can be approved, and the
+    // loser is refused rather than overwriting the winner.
+    #[test]
+    fn one_token_binds_one_machine_even_with_two_claims() {
+        let pk = pin_claimable("claim2");
+        assert_eq!(
+            register_pending_claim(&pk, "111111111", "rendezvous handshake", "t0".to_owned()),
+            PendingOutcome::New
+        );
+        assert_eq!(
+            register_pending_claim(&pk, "222222222", "rendezvous handshake", "t0".to_owned()),
+            PendingOutcome::New
+        );
+        approve_device_key_claim("claim2", "111111111", "t1".to_owned()).expect("first wins");
+        // Approving the other one is impossible: its row went with the key's binding,
+        // and the binding re-check under the write lock refuses it anyway.
+        assert!(approve_device_key_claim("claim2", "222222222", "t2".to_owned()).is_err());
+        assert_eq!(device_key_binding(&pk).as_deref(), Some("111111111"));
+        // The race the lock actually settles, at the layer that writes it.
+        let mut keys = vec![DeviceKey {
+            id: "r".to_owned(),
+            label: String::new(),
+            public_key: "race".to_owned(),
+            created_at: String::new(),
+            peer_id: String::new(),
+            claimed_at: String::new(),
+        }];
+        assert_eq!(claim_device_key_in(&mut keys, "race", "111111111", "t"), Ok(true));
+        assert!(claim_device_key_in(&mut keys, "race", "222222222", "t").is_err());
+        // The winner re-polling is not a second claim.
+        assert_eq!(claim_device_key_in(&mut keys, "race", "111111111", "t"), Ok(false));
+        drop_claimable(&pk);
+    }
+
+    // A denial has to STICK: the client re-polls every 30s, so a forgotten denial would
+    // put the row back on the dashboard half a minute after it was dismissed. And it is
+    // persisted (here: survives in the config the same way), so a restart does not
+    // silently re-open the question.
+    #[test]
+    fn a_denied_claim_is_not_re_raised_until_it_is_forgotten() {
+        let pk = pin_claimable("claim3");
+        register_pending_claim(&pk, "333333333", "settings poll", "t0".to_owned());
+        deny_device_key_claim("claim3", "333333333").expect("deny must find the row");
+        assert_eq!(
+            register_pending_claim(&pk, "333333333", "settings poll", "t1".to_owned()),
+            PendingOutcome::Denied
+        );
+        assert!(pending_claim_for_peer("333333333").unwrap().denied);
+        // A denied row cannot be approved by accident -- it is still a row, so this is
+        // the operator changing their mind, which is allowed and explicit.
+        assert!(approve_device_key_claim("claim3", "333333333", "t2".to_owned()).is_ok());
+        assert_eq!(device_key_binding(&pk).as_deref(), Some("333333333"));
+        drop_claimable(&pk);
+
+        // Forgetting it lets the client ask again.
+        let pk = pin_claimable("claim4");
+        register_pending_claim(&pk, "444444444", "settings poll", "t0".to_owned());
+        deny_device_key_claim("claim4", "444444444").unwrap();
+        forget_device_key_claim("claim4", "444444444").expect("forget must find the row");
+        assert!(forget_device_key_claim("claim4", "444444444").is_err());
+        assert_eq!(
+            register_pending_claim(&pk, "444444444", "settings poll", "t1".to_owned()),
+            PendingOutcome::New
+        );
+        drop_claimable(&pk);
+    }
+
+    // The table is persisted, so one key must not be able to fill it with ids. A claim
+    // costs a valid signature over a pinned key, so this is not an open flood -- it is
+    // the bound on a client (or a leaked key) that cycles its id.
+    #[test]
+    fn pending_claims_are_capped_per_key() {
+        let pk = pin_claimable("claim5");
+        for i in 0..MAX_PENDING_PER_KEY {
+            assert_eq!(
+                register_pending_claim(&pk, &format!("peer-{:04}", i), "poll", "t".to_owned()),
+                PendingOutcome::New
+            );
+        }
+        assert_eq!(
+            register_pending_claim(&pk, "peer-9999", "poll", "t".to_owned()),
+            PendingOutcome::Full
+        );
+        // An id already in the list still gets through: a waiting client must not be
+        // starved by its own neighbours.
+        assert_eq!(
+            register_pending_claim(&pk, "peer-0000", "poll", "t2".to_owned()),
+            PendingOutcome::Repeat
+        );
+        drop_claimable(&pk);
+    }
+
+    // The global cap is the second half of that bound. It makes room by dropping the
+    // OLDEST row that is merely waiting, and never a denied one: evicting a denial would
+    // let that client re-raise its request on the next poll, which is the one thing
+    // `denied` exists to prevent. Pure, so it does not touch the shared live table.
+    #[test]
+    fn the_global_pending_cap_evicts_the_oldest_waiting_row_not_a_denial() {
+        let mut claims: Vec<PendingDeviceKeyClaim> = Vec::new();
+        for i in 0..MAX_PENDING_CLAIMS {
+            claims.push(PendingDeviceKeyClaim {
+                key_id: format!("k{}", i),
+                public_key: format!("pk{}", i),
+                peer_id: format!("peer-{:04}", i),
+                // Oldest first, and the oldest of all is a DENIED row.
+                first_seen: format!("t{:04}", i),
+                last_seen: format!("t{:04}", i),
+                attempts: 1,
+                via: "poll".to_owned(),
+                denied: i == 0,
+            });
+        }
+        assert_eq!(
+            register_pending_claim_in(
+                &mut claims, "knew", "pknew", "999999999", "poll", "t9999"
+            ),
+            PendingOutcome::New
+        );
+        assert_eq!(claims.len(), MAX_PENDING_CLAIMS);
+        assert!(
+            claims.iter().any(|c| c.peer_id == "peer-0000" && c.denied),
+            "the denial must survive the eviction"
+        );
+        assert!(
+            !claims.iter().any(|c| c.peer_id == "peer-0001"),
+            "the oldest WAITING row is the one that goes"
+        );
+        assert!(claims.iter().any(|c| c.peer_id == "999999999"));
+
+        // A table that is full of denials refuses rather than forgetting one.
+        claims.iter_mut().for_each(|c| c.denied = true);
+        assert_eq!(
+            register_pending_claim_in(
+                &mut claims, "kfull", "pkfull", "888888888", "poll", "t9999"
+            ),
+            PendingOutcome::Full
+        );
+    }
+
+    // A junk id must never reach the persisted table (it ends up in the dashboard, the
+    // log and an API response), and a key deleted between the decision and the claim
+    // fails closed.
+    #[test]
+    fn a_claim_needs_a_real_peer_id_and_a_pinned_key() {
+        assert!(valid_peer_id("111111111"));
+        assert!(valid_peer_id("desk-01_a"));
+        assert!(!valid_peer_id("short"));
+        assert!(!valid_peer_id(""));
+        assert!(!valid_peer_id("has spaces"));
+        assert!(!valid_peer_id("semi;colon"));
+        assert!(!valid_peer_id(&"x".repeat(65)));
+
+        let pk = pin_claimable("claim6");
+        assert_eq!(
+            register_pending_claim(&pk, "bad id", "poll", "t".to_owned()),
+            PendingOutcome::Rejected
+        );
+        assert_eq!(
+            register_pending_claim("not-pinned-at-all", "555555555", "poll", "t".to_owned()),
+            PendingOutcome::Rejected
+        );
+        drop_claimable(&pk);
+    }
+
+    // Binding by hand answers the pending question; CLEARING the binding re-arms the key
+    // as a fresh token, and a stale denial must not then refuse the first client that
+    // proves it.
+    #[test]
+    fn editing_the_binding_clears_the_keys_pending_rows() {
+        let pk = pin_claimable("claim7");
+        register_pending_claim(&pk, "666666666", "poll", "t0".to_owned());
+        deny_device_key_claim("claim7", "666666666").unwrap();
+        let key = set_device_key_peer_id("claim7", "777777777").expect("bind by hand");
+        assert_eq!(key.peer_id, "777777777");
+        assert_eq!(key.claimed_at, "", "the operator typed this one, it is not a claim");
+        assert!(pending_claim_for_peer("666666666").is_none());
+        // Cleared: claimable again, with no memory of the old denial.
+        set_device_key_peer_id("claim7", "").expect("clear the binding");
+        assert_eq!(
+            register_pending_claim(&pk, "666666666", "poll", "t1".to_owned()),
+            PendingOutcome::New
+        );
+        assert!(set_device_key_peer_id("claim7", "no").is_err(), "junk id refused");
+        drop_claimable(&pk);
     }
 
     #[test]

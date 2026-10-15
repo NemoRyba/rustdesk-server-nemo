@@ -234,9 +234,6 @@ fn warn_udp_refused_throttled(kind: &str, addr: SocketAddr) {
 pub(crate) struct AuthedDevice {
     pub device_pub_b64: String,
     pub peer_id: String,
-    /// M1-CLAIM: this handshake is what bound an unclaimed provisioning token to this
-    /// peer. Reported out so the caller (which is async, unlike the check) can audit it.
-    pub newly_claimed: bool,
 }
 
 impl RendezvousServer {
@@ -2301,18 +2298,37 @@ impl RendezvousServer {
             bail!("device signature covers the wrong payload");
         }
         // M1-CLAIM: only now, with the signature verified against the id in the payload,
-        // may an unclaimed token be taken. A client that merely names a key it does not
-        // hold never reaches this line.
-        let mut newly_claimed = false;
+        // may an unclaimed token be ASKED for. A client that merely names a key it does
+        // not hold never reaches this line -- which is why filing the request here is
+        // safe, and why it is still only a request: the handshake is REFUSED, and stays
+        // refused on every retry, until the operator confirms the pairing in the
+        // dashboard. That keeps the TASK #14 rule exactly as it was for any client the
+        // operator has not confirmed.
         if claim_needed {
-            match crate::nemo_integration::claim_device_key(
+            use crate::nemo_integration::PendingOutcome;
+            let outcome = crate::nemo_integration::register_pending_claim(
                 &device_pub_b64,
                 &auth.peer_id,
+                "rendezvous handshake",
                 crate::nemo_management::now_iso(),
-            ) {
-                Ok(claimed) => newly_claimed = claimed,
-                // Lost the race to another id, or the key was deleted mid-handshake.
-                Err(reason) => bail!("{}", reason),
+            );
+            match outcome {
+                PendingOutcome::New | PendingOutcome::Repeat => bail!(
+                    "device key is not bound yet: filed a claim for peer {}, awaiting operator \
+                     confirmation in the dashboard",
+                    auth.peer_id
+                ),
+                PendingOutcome::Denied => bail!(
+                    "the operator denied this device key for peer {}",
+                    auth.peer_id
+                ),
+                PendingOutcome::Full => bail!(
+                    "too many pending claims against this device key; clear them in the dashboard"
+                ),
+                PendingOutcome::Rejected => bail!(
+                    "cannot claim this device key for peer id {:?}",
+                    auth.peer_id
+                ),
             }
         }
         let session = Encrypt::decode(&auth.sealed_key, &auth.client_box_pk, our_sk_b)?;
@@ -2321,7 +2337,6 @@ impl RendezvousServer {
             AuthedDevice {
                 device_pub_b64,
                 peer_id: auth.peer_id.clone(),
-                newly_claimed,
             },
         ))
     }
@@ -2607,7 +2622,6 @@ mod tests {
         AuthedDevice {
             device_pub_b64: "dGVzdC1kZXZpY2Uta2V5".to_owned(),
             peer_id: TEST_CONTROLLER.to_owned(),
-            newly_claimed: false,
         }
     }
 

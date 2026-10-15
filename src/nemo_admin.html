@@ -942,10 +942,15 @@
             <input id="stripUnsealedSecrets" type="checkbox" style="margin-top:3px;flex:0 0 auto;">
             <span><span style="font-weight:600;">Only deliver secrets sealed to a device key</span><span style="display:block;font-size:12px;opacity:0.7;margin-top:3px;line-height:1.4;">Strip managed passwords from any policy response that cannot be encrypted to a verified device key. <b>On by default.</b> A client without an imported device key never receives the pushed access password in readable form (everything else still works); with the requirement above on, such a client is refused before this matters.</span></span>
           </label>
+          <label style="display:flex;gap:10px;align-items:flex-start;cursor:pointer;max-width:760px;">
+            <input id="claimUnboundDeviceKeys" type="checkbox" style="margin-top:3px;flex:0 0 auto;">
+            <span><span style="font-weight:600;">Let an unbound key be claimed on first use (with your confirmation)</span><span style="display:block;font-size:12px;opacity:0.7;margin-top:3px;line-height:1.4;">A key you generate <b>without</b> a TBFDesk ID becomes a <b>one-shot provisioning token</b>. The first client that proves it (it must hold the private half) does <b>not</b> get in &mdash; it appears below as a <b>claim waiting for you</b>, reporting the ID it calls itself. <b>Your Approve is what binds the key</b>; until then the client stays refused and sits in its provisioning gate. This is how you provision a machine whose ID you cannot know yet: a client shows no ID until it is past that gate. <b>On by default.</b> Untick it and an unbound key authenticates nothing at all &mdash; every key must then be bound by hand.</span></span>
+          </label>
           <div style="display:flex;gap:8px;align-items:center;">
             <button id="reqDeviceKeySave" class="primary">Save requirement</button>
             <span id="reqDeviceKeyMsg" style="font-size:12px;opacity:0.8;"></span>
           </div>
+          <div id="deviceKeyClaims" style="display:none;"></div>
           <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
             <input id="deviceKeyLabel" type="text" placeholder="label (e.g. Reception-PC)" style="min-width:220px;">
             <input id="deviceKeyPeerId" list="deviceKeyPeerList" type="text" placeholder="bind to TBFDesk ID — pick or type (empty = any client)" style="min-width:300px;">
@@ -956,7 +961,7 @@
           <div id="deviceKeyGenerated" style="display:none;"></div>
           <div class="table-wrap">
             <table>
-              <thead><tr><th>Label</th><th>Bound to ID</th><th>Public key</th><th>Created</th><th></th></tr></thead>
+              <thead><tr><th>Label</th><th title="Which TBFDesk ID this key authenticates. Editable: type an ID to bind it by hand, or clear it to re-arm the key as a claimable provisioning token.">Bound to ID</th><th title="Empty binding = a one-shot provisioning token waiting for its first client; 'claimed' = you confirmed the machine that took it.">Claim</th><th>Public key</th><th>Created</th><th></th></tr></thead>
               <tbody id="deviceKeysBody"></tbody>
             </table>
             <div id="deviceKeysEmpty" class="empty">No device keys yet.</div>
@@ -1637,14 +1642,97 @@
         return `<option value="${escapeHtml(p.id)}" label="${escapeHtml(label)}"></option>`;
       }).join("");
     }
+    // M1-CLAIM: a pending claim is a REQUEST, never a grant -- the client it names is
+    // refused until one of these three buttons is pressed. Approve is the only thing
+    // that writes a binding the operator did not type, which is why it says which
+    // machine asked, from where, and how many times.
+    async function approveDeviceKeyClaim(keyId, peerId, label) {
+      if (!confirm("Bind device key " + (label || keyId) + " to " + peerId + "?\n\nThat machine becomes the ONLY one this key authenticates, and it is let in from its next attempt. Approve only if you recognise the ID as the machine you gave this key to.")) return false;
+      await api("/nemo/api/device-keys/" + encodeURIComponent(keyId) + "/claim/approve", { method: "POST", body: JSON.stringify({ peer_id: peerId }) });
+      return true;
+    }
+    async function denyDeviceKeyClaim(keyId, peerId) {
+      if (!confirm("Deny " + peerId + "?\n\nIt stays refused and will not ask again until you clear the request. If you did not expect this ID, consider deleting the key as well - something that holds its private half is using it.")) return false;
+      await api("/nemo/api/device-keys/" + encodeURIComponent(keyId) + "/claim/deny", { method: "POST", body: JSON.stringify({ peer_id: peerId }) });
+      return true;
+    }
+    async function forgetDeviceKeyClaim(keyId, peerId) {
+      await api("/nemo/api/device-keys/" + encodeURIComponent(keyId) + "/claim/forget", { method: "POST", body: JSON.stringify({ peer_id: peerId }) });
+      return true;
+    }
+    // The peers table cannot show every claim: the rendezvous handshake happens BEFORE
+    // register_pk, so a claim can name an ID this server has never registered. This
+    // section is the complete list.
+    function renderDeviceKeyClaims(claims, keys, claimingOn) {
+      const box = $("deviceKeyClaims");
+      if (!box) return;
+      const byKey = {};
+      (keys || []).forEach((k) => { byKey[k.id] = k; });
+      const rows = (claims || []).slice().sort((a, b) => (a.first_seen || "").localeCompare(b.first_seen || ""));
+      if (!rows.length) {
+        box.style.display = claimingOn ? "none" : "block";
+        box.innerHTML = claimingOn ? "" : '<div style="padding:8px 12px;border:1px solid #e3e3e3;border-radius:6px;font-size:12px;opacity:0.75;">First-use claiming is <b>off</b>: an unbound key authenticates nothing and no client can ask for one. Bind each key to an ID by hand, or tick the box above.</div>';
+        return;
+      }
+      box.style.display = "block";
+      const waiting = rows.filter((c) => !c.denied).length;
+      box.innerHTML = `<div style="border:1px solid #f0d98c;background:#fff8e6;border-radius:6px;padding:10px 12px;">
+        <div style="font-weight:600;margin-bottom:4px;">${waiting ? waiting + " client(s) waiting for your confirmation" : "Denied claims"}</div>
+        <div style="font-size:12px;opacity:0.8;line-height:1.45;margin-bottom:8px;">Each row is a client that <b>proved</b> it holds the private half of an unbound key and reported the TBFDesk ID it calls itself. It is <b>refused right now</b>. The ID is self-reported &mdash; the signature proves the key, only you can confirm the machine &mdash; so approve it only if the ID is the machine you handed that key to.</div>
+        <div class="table-wrap"><table>
+          <thead><tr><th>Key</th><th>Claims ID</th><th>Via</th><th>First asked</th><th>Last asked</th><th title="How many times it has retried while waiting.">Tries</th><th></th></tr></thead>
+          <tbody>${rows.map((c) => {
+            const k = byKey[c.key_id];
+            const label = (k && k.label) ? k.label : c.key_id;
+            return `<tr${c.denied ? ' style="opacity:0.6;"' : ''}>
+              <td>${escapeHtml(label)}${c.denied ? ' <span class="badge blocked">denied</span>' : ''}</td>
+              <td class="mono">${escapeHtml(c.peer_id || "")}</td>
+              <td>${escapeHtml(c.via || "")}</td>
+              <td>${escapeHtml((c.first_seen || "").replace("T", " ").slice(0, 19))}</td>
+              <td>${escapeHtml((c.last_seen || "").replace("T", " ").slice(0, 19))}</td>
+              <td>${c.attempts || 0}</td>
+              <td><div class="row-actions">
+                <button class="primary" data-claim-approve="${escapeAttr(c.key_id)}" data-claim-peer="${escapeAttr(c.peer_id)}" data-claim-label="${escapeAttr(label)}">Approve</button>
+                ${c.denied ? "" : `<button class="danger" data-claim-deny="${escapeAttr(c.key_id)}" data-claim-peer="${escapeAttr(c.peer_id)}">Deny</button>`}
+                <button data-claim-forget="${escapeAttr(c.key_id)}" data-claim-peer="${escapeAttr(c.peer_id)}" title="Drop the request. A denied client may then ask again.">Clear</button>
+              </div></td>
+            </tr>`;
+          }).join("")}</tbody>
+        </table></div>
+      </div>`;
+      const after = async () => { await loadDeviceKeys(); loadAll(); };
+      box.querySelectorAll("[data-claim-approve]").forEach((btn) => btn.addEventListener("click", async () => {
+        try { if (await approveDeviceKeyClaim(btn.dataset.claimApprove, btn.dataset.claimPeer, btn.dataset.claimLabel)) await after(); }
+        catch (e) { alert(e.message); }
+      }));
+      box.querySelectorAll("[data-claim-deny]").forEach((btn) => btn.addEventListener("click", async () => {
+        try { if (await denyDeviceKeyClaim(btn.dataset.claimDeny, btn.dataset.claimPeer)) await after(); }
+        catch (e) { alert(e.message); }
+      }));
+      box.querySelectorAll("[data-claim-forget]").forEach((btn) => btn.addEventListener("click", async () => {
+        try { await forgetDeviceKeyClaim(btn.dataset.claimForget, btn.dataset.claimPeer); await after(); }
+        catch (e) { alert(e.message); }
+      }));
+    }
     async function loadDeviceKeys() {
       try {
         renderDeviceKeyPeerList();
-        const keys = await api("/nemo/api/device-keys");
+        const [keys, claims] = await Promise.all([
+          api("/nemo/api/device-keys"),
+          api("/nemo/api/device-key-claims"),
+        ]);
         const body = $("deviceKeysBody");
         body.innerHTML = (keys || []).map((k) => `<tr>
           <td>${escapeHtml(k.label || "")}</td>
-          <td>${k.peer_id ? escapeHtml(k.peer_id) : '<span style="opacity:0.55;">any (unbound)</span>'}</td>
+          <td><div style="display:flex;gap:6px;align-items:center;">
+            <input class="mono" data-devkey-peer-input="${escapeAttr(k.id)}" list="deviceKeyPeerList" type="text" style="width:150px;font-size:11px;" placeholder="— unbound —" value="${escapeAttr(k.peer_id || "")}">
+            <button data-devkey-peer-save="${escapeAttr(k.id)}" title="Bind this key to that ID, or leave it empty to clear the binding and re-arm the key as a claimable provisioning token.">Set</button>
+          </div></td>
+          <td>${k.peer_id
+              ? (k.claimed_at
+                  ? `<span style="color:#1a7a34;font-weight:600;" title="Bound by a first-use claim you approved.">claimed ${escapeHtml((k.claimed_at || "").replace("T", " ").slice(0, 19))}</span>`
+                  : '<span style="opacity:0.6;" title="You typed this ID yourself.">bound by hand</span>')
+              : '<span style="color:#8a6d1a;font-weight:600;" title="A one-shot provisioning token: the first client that proves it files a claim for your confirmation.">awaiting first use</span>'}</td>
           <td class="mono" style="word-break:break-all;font-size:11px;">${escapeHtml(k.public_key || "")}</td>
           <td>${escapeHtml((k.created_at || "").replace("T", " ").slice(0, 19))}</td>
           <td><button class="danger" data-devkey-del="${escapeHtml(k.id)}">Delete</button></td>
@@ -1655,6 +1743,20 @@
           await api("/nemo/api/device-keys/" + encodeURIComponent(btn.dataset.devkeyDel) + "/delete", { method: "POST" });
           loadDeviceKeys();
         }));
+        // The editable "Bound to ID" cell: bind a key after the fact (the provisioning
+        // deadlock's manual way out), or clear it to re-arm the key as a token.
+        body.querySelectorAll("[data-devkey-peer-save]").forEach((btn) => btn.addEventListener("click", async () => {
+          const id = btn.dataset.devkeyPeerSave;
+          const input = body.querySelector('[data-devkey-peer-input="' + id + '"]');
+          const peer_id = (input ? input.value : "").trim();
+          if (!peer_id && !confirm("Clear this key's binding?\n\nIt becomes a claimable provisioning token again: the next client that proves it will ask to be bound to it (and any earlier request against it, including a denial, is dropped).")) return;
+          try {
+            await api("/nemo/api/device-keys/" + encodeURIComponent(id) + "/peer-id", { method: "POST", body: JSON.stringify({ peer_id }) });
+            await loadDeviceKeys();
+            loadAll();
+          } catch (e) { alert(e.message); }
+        }));
+        renderDeviceKeyClaims(claims && claims.claims, keys, !!(claims && claims.claim_unbound_device_keys));
       } catch (e) {}
     }
     $("generateDeviceKey").addEventListener("click", async () => {
@@ -1680,8 +1782,10 @@
         await api("/nemo/api/policy", { method: "PUT", body: JSON.stringify({
           require_device_key: $("requireDeviceKey").checked,
           strip_unsealed_secrets: $("stripUnsealedSecrets").checked,
+          claim_unbound_device_keys: $("claimUnboundDeviceKeys").checked,
         }) });
         setMsg("reqDeviceKeyMsg", "Saved", true);
+        loadDeviceKeys();
       } catch (e) { setMsg("reqDeviceKeyMsg", e.message, false); }
     });
     // S-B: the two fail-closed switches for encrypted client requests. Sent on their
@@ -1777,6 +1881,9 @@
         }
         if (health.strip_unsealed_secrets != null && $("stripUnsealedSecrets") && document.activeElement !== $("stripUnsealedSecrets")) {
           $("stripUnsealedSecrets").checked = !!health.strip_unsealed_secrets;
+        }
+        if (health.claim_unbound_device_keys != null && $("claimUnboundDeviceKeys") && document.activeElement !== $("claimUnboundDeviceKeys")) {
+          $("claimUnboundDeviceKeys").checked = !!health.claim_unbound_device_keys;
         }
         if (health.require_sealed_login != null && $("requireSealedLogin") && document.activeElement !== $("requireSealedLogin")) {
           $("requireSealedLogin").checked = !!health.require_sealed_login;
@@ -1965,7 +2072,7 @@
           <td>${escapeHtml(peerAlias(peer))}</td>
           <td>${badge(peer.online ? "online" : "offline")}</td>
           <td>${badge(peer.policy)}</td>
-          <td>${peer.auth_mode === 'device-key' ? '<span style="color:#1a7a34;font-weight:600">device key</span>' : (peer.auth_mode === 'default' ? '<span style="color:#8a6d1a">server key only</span>' : '<span style="opacity:0.5">unknown</span>')}</td>
+          <td>${peerKeyAuthCell(peer)}</td>
           <td>${((integ.devicePolicies || {})[peer.id]) ? escapeHtml(integ.devicePolicies[peer.id]) : '<span style="opacity:0.4">—</span>'}</td>
           <td class="mono">${peer.direct_endpoint ? `<span style="color:#1a7a34;font-weight:600">${escapeHtml(peer.direct_endpoint)}</span>` : '<span style="opacity:0.4">—</span>'}</td>
           <td class="mono">${escapeHtml(peer.registered_ip || "")}</td>
@@ -1976,6 +2083,8 @@
           <td class="mono">${escapeHtml(peer.stats?.last_relay_server || "")}</td>
           <td>
             <div class="row-actions">
+              ${peer.pending_claim_key_id ? `<button class="primary" data-claim-approve-peer="${escapeAttr(peer.pending_claim_key_id)}" data-id="${escapeAttr(peer.id)}" data-claim-label="${escapeAttr(peer.pending_claim_key_label || "")}" title="Confirm that this machine is the one you gave that device key to. It is refused until you do.">Approve key</button>
+              <button class="danger" data-claim-deny-peer="${escapeAttr(peer.pending_claim_key_id)}" data-id="${escapeAttr(peer.id)}" title="Refuse this pairing. The machine stays locked out and stops asking.">Deny key</button>` : ""}
               <button data-action="allow" data-id="${escapeHtml(peer.id)}">Allow</button>
               <button class="danger" data-action="block" data-id="${escapeHtml(peer.id)}">Block</button>
               <button data-action="reset-policy" data-id="${escapeHtml(peer.id)}">Reset</button>
@@ -1999,6 +2108,30 @@
         });
       });
 
+      // M1-CLAIM: confirm/deny straight from the peer row, which is where an operator
+      // looks when a machine they are provisioning does not come up.
+      tbody.querySelectorAll("button[data-claim-approve-peer]").forEach((button) => {
+        button.addEventListener("click", async (event) => {
+          event.stopPropagation();
+          try {
+            if (await approveDeviceKeyClaim(button.dataset.claimApprovePeer, button.dataset.id, button.dataset.claimLabel)) {
+              await loadAll();
+              loadDeviceKeys();
+            }
+          } catch (e) { alert(e.message); }
+        });
+      });
+      tbody.querySelectorAll("button[data-claim-deny-peer]").forEach((button) => {
+        button.addEventListener("click", async (event) => {
+          event.stopPropagation();
+          try {
+            if (await denyDeviceKeyClaim(button.dataset.claimDenyPeer, button.dataset.id)) {
+              await loadAll();
+              loadDeviceKeys();
+            }
+          } catch (e) { alert(e.message); }
+        });
+      });
       tbody.querySelectorAll("button[data-action]").forEach((button) => {
         button.addEventListener("click", async (event) => {
           event.stopPropagation();
@@ -2100,7 +2233,14 @@
       detail.className = "detail";
       detail.innerHTML = `
         <dl class="kv">
-          <dt title="Which key this client used to authenticate its last policy poll: its own provisioned device key, or only the shared server key.">Key auth</dt><dd>${peer.auth_mode === 'device-key' ? '<span style="color:#1a7a34;font-weight:600">own device key</span>' : (peer.auth_mode === 'default' ? '<span style="color:#8a6d1a">server key only</span>' : '<span style="opacity:0.5">unknown</span>')}</dd>
+          <dt title="Which key this client used to authenticate its last policy poll: its own provisioned device key, or only the shared server key. A pending key claim is shown instead, because that is why the machine is refused.">Key auth</dt><dd>${peerKeyAuthCell(peer)}</dd>
+          <dt title="Whether a device key is bound to this machine. Read from the pinned key registry, so it survives a server restart.">Device key</dt><dd>${peer.provisioned ? escapeHtml(peer.device_key_label || peer.device_key_id || "bound") : '<span style="opacity:0.55">none &mdash; not provisioned</span>'}</dd>
+          ${peer.pending_claim_key_id ? `<dt title="This machine proved an unbound device key and asks to be bound to it. It is refused until you confirm. The ID is self-reported: the signature proves possession of the key, only you can attest the machine.">Key claim</dt><dd>
+            <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;">
+              <span>${peer.pending_claim_denied ? "denied" : "waiting for your confirmation"} &middot; ${escapeHtml(peer.pending_claim_key_label || peer.pending_claim_key_id)} &middot; ${peer.pending_claim_attempts || 0} tries via ${escapeHtml(peer.pending_claim_via || "")}</span>
+              <button class="primary" id="detailClaimApprove">Approve</button>
+              ${peer.pending_claim_denied ? "" : '<button class="danger" id="detailClaimDeny">Deny</button>'}
+            </div></dd>` : ""}
           <dt>Local Addr</dt><dd>${stats.local_addr_attempts || 0}</dd>
           <dt>Relay Requests</dt><dd>${stats.relay_requests || 0}</dd>
           <dt>Relay Responses</dt><dd>${stats.relay_responses || 0}</dd>
@@ -2153,6 +2293,26 @@
           <div style="font-size:12px;opacity:0.75;line-height:1.5;margin-top:8px;">Session settings (file transfer, view-only, terminal, etc.) are managed through <b>named policies</b>. Assign one above, or create and edit them in <b>ACL &amp; Policy</b>. A logged-in user's own policy still overrides the device policy.</div>
         </div>
       `;
+      // M1-CLAIM: the same confirm/deny the peer row offers, for the operator who got
+      // here by clicking the machine that will not come online.
+      const claimApprove = $("detailClaimApprove");
+      if (claimApprove) claimApprove.addEventListener("click", async () => {
+        try {
+          if (await approveDeviceKeyClaim(peer.pending_claim_key_id, peer.id, peer.pending_claim_key_label)) {
+            await loadAll();
+            loadDeviceKeys();
+          }
+        } catch (e) { alert(e.message); }
+      });
+      const claimDeny = $("detailClaimDeny");
+      if (claimDeny) claimDeny.addEventListener("click", async () => {
+        try {
+          if (await denyDeviceKeyClaim(peer.pending_claim_key_id, peer.id)) {
+            await loadAll();
+            loadDeviceKeys();
+          }
+        } catch (e) { alert(e.message); }
+      });
       const dep = $("directEndpoint");
       const depSave = $("directEndpointSave");
       // A rejected endpoint is reported back verbatim: the client's parser is lenient on
@@ -2205,6 +2365,30 @@
           <span>${escapeHtml(event.detail || "")}</span>
         </div>
       `).join("");
+    }
+
+    // M1-CLAIM: what the "Key auth" column says. A pending claim outranks the
+    // poll-derived auth mode, because it is the reason this machine is not working:
+    // it proved a key, it is refused, and it is waiting for a human. The mode itself
+    // comes from the last poll; "provisioned" comes from the pinned registry and so
+    // survives a restart, which is why a machine that has a key bound but has not
+    // polled since boot reads as provisioned rather than unknown.
+    function peerKeyAuthCell(peer) {
+      if (peer.pending_claim_key_id && !peer.pending_claim_denied) {
+        return `<span style="color:#8a6d1a;font-weight:600" title="This machine proved device key ${escapeAttr(peer.pending_claim_key_label || peer.pending_claim_key_id)} and reported this ID. It is REFUSED until you approve the pairing (${peer.pending_claim_attempts || 0} tries since ${escapeAttr((peer.pending_claim_first_seen || "").replace("T", " ").slice(0, 19))}, via ${escapeAttr(peer.pending_claim_via || "")}).">unverified &mdash; key claim pending</span>`;
+      }
+      if (peer.pending_claim_key_id && peer.pending_claim_denied) {
+        return '<span style="color:#a11" title="You denied this machine&apos;s device-key claim. It stays locked out and has stopped asking. Clear the request in Settings &rarr; Device keys to let it ask again.">key claim denied</span>';
+      }
+      if (peer.auth_mode === 'device-key') {
+        return `<span style="color:#1a7a34;font-weight:600" title="${peer.device_key_label ? 'Key: ' + escapeAttr(peer.device_key_label) : ''}">device key</span>`;
+      }
+      if (peer.auth_mode === 'default') {
+        return '<span style="color:#8a6d1a">server key only</span>';
+      }
+      return peer.provisioned
+        ? '<span style="opacity:0.6" title="A device key is bound to this machine, but it has not polled this server since it started.">provisioned, not polled</span>'
+        : '<span style="opacity:0.5">unknown</span>';
     }
 
     function badge(value) {

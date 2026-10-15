@@ -597,6 +597,9 @@ struct PolicyRequest {
     require_device_key: Option<bool>,
     #[serde(default)]
     strip_unsealed_secrets: Option<bool>,
+    /// M1-CLAIM: whether an unbound pinned key may request a binding on first use.
+    #[serde(default)]
+    claim_unbound_device_keys: Option<bool>,
     /// S-B (scope b): the two fail-closed switches for encrypted client requests.
     /// Option, like the rest: a PUT that omits them leaves them untouched.
     #[serde(default)]
@@ -724,6 +727,21 @@ struct PeerResponse {
     stats: NemoPeerStats,
     // S-DUALKEY: which key this peer used on its last poll — "device-key" / "default".
     auth_mode: String,
+    // M1-CLAIM: provisioning state read from the PINNED REGISTRY rather than from the
+    // last poll, so unlike auth_mode above it survives a server restart: a machine that
+    // has a key bound to it is provisioned even if it has not polled since boot.
+    provisioned: bool,
+    device_key_id: String,
+    device_key_label: String,
+    /// Set when this peer has proved a pinned-but-unbound key and is waiting for the
+    /// operator to confirm the pairing. It is NOT authenticated while this is set — the
+    /// peers panel shows it as "unverified — key claim pending" with Approve / Deny.
+    pending_claim_key_id: String,
+    pending_claim_key_label: String,
+    pending_claim_first_seen: String,
+    pending_claim_attempts: u32,
+    pending_claim_via: String,
+    pending_claim_denied: bool,
     // Where controllers may reach this workstation without the relay, as the operator
     // configured it ("host:port[,knockport]"). Empty => hole punch / relay only.
     direct_endpoint: String,
@@ -804,6 +822,12 @@ struct PolicyResponse {
     log_history_limit: usize,
     require_device_key: bool,
     strip_unsealed_secrets: bool,
+    // M1-CLAIM: on by default. With it off, an unbound key authenticates nothing and
+    // files no request — the original fail-closed rule, keys bound by hand only.
+    claim_unbound_device_keys: bool,
+    /// Requests waiting for a decision right now, so the dashboard can badge the panel
+    /// without a second call.
+    pending_device_key_claims: usize,
     // S-B (scope b): both ship false, so the dashboard shows "off" on a fleet that
     // has not been updated yet.
     require_sealed_login: bool,
@@ -1320,10 +1344,7 @@ pub(crate) fn init_from_args() {
     );
     // TASK #14: unbound device keys authenticate nothing unless the escape hatch is on;
     // say at boot how many pinned keys that affects instead of going dark silently.
-    let unbound = integration::list_device_keys()
-        .iter()
-        .filter(|k| k.peer_id.is_empty())
-        .count();
+    let unbound = integration::unclaimed_device_key_count();
     if integration::allow_unbound_device_keys() {
         log::warn!(
             "allow-unbound-device-keys=Y: every pinned device key with no peer-id binding \
@@ -1331,11 +1352,23 @@ pub(crate) fn init_from_args() {
              now). Bind or replace them, then drop the flag.",
             unbound
         );
+    } else if unbound > 0 && integration::claim_unbound_device_keys() {
+        // M1-CLAIM: unbound is now the NORMAL provisioning state, not a misconfiguration:
+        // each such key is a one-shot token waiting for the first client that proves it,
+        // and that client is refused until the operator confirms the pairing. So say what
+        // is waiting on whom instead of advising the skeleton-key flag.
+        log::warn!(
+            "{} pinned device key(s) have no peer-id binding: each is a one-shot \
+             provisioning token. The first client that proves one files a claim and stays \
+             REFUSED until you approve it in the admin dashboard ({} claim(s) waiting now).",
+            unbound,
+            integration::pending_device_key_claim_count()
+        );
     } else if unbound > 0 {
         log::warn!(
-            "{} pinned device key(s) have no peer-id binding and will NOT authenticate. \
-             Bind each to its peer id in the admin dashboard, or start hbbs with \
-             --allow-unbound-device-keys Y as a temporary escape hatch.",
+            "{} pinned device key(s) have no peer-id binding and will NOT authenticate, \
+             because first-use claiming is switched off. Bind each to its peer id in the \
+             admin dashboard, or switch claiming back on there.",
             unbound
         );
     }
@@ -1442,6 +1475,21 @@ pub(crate) async fn spawn_hbbs_api(
             get(list_device_keys).post(generate_device_key),
         )
         .route("/nemo/api/device-keys/:id/delete", post(delete_device_key))
+        // M1-CLAIM: the pending-claim queue and the editable "Bound to ID" field.
+        .route("/nemo/api/device-key-claims", get(list_device_key_claims))
+        .route(
+            "/nemo/api/device-keys/:id/claim/approve",
+            post(approve_device_key_claim),
+        )
+        .route(
+            "/nemo/api/device-keys/:id/claim/deny",
+            post(deny_device_key_claim),
+        )
+        .route(
+            "/nemo/api/device-keys/:id/claim/forget",
+            post(forget_device_key_claim),
+        )
+        .route("/nemo/api/device-keys/:id/peer-id", post(set_device_key_peer_id))
         .route(
             "/nemo/api/policies",
             get(get_policies).put(put_policies),
@@ -2763,6 +2811,144 @@ async fn delete_device_key(
     Ok(Json(serde_json::json!({ "removed": removed.is_some(), "sessions_ended_on": ended })))
 }
 
+// --- M1-CLAIM: pending binding requests, and binding by hand -----------------
+//
+// The provisioning deadlock these exist for: generating a key asks for the TBFDesk id,
+// but a client shows no id until it is past the provisioning gate, and it cannot pass
+// the gate without a key. So an unbound key is a one-shot provisioning token: the first
+// client that PROVES it files a request here, and the operator's confirmation -- not the
+// client -- writes the binding.
+
+#[derive(Deserialize)]
+struct DeviceKeyClaimRequest {
+    /// Which of the key's pending rows this decision is about. Required: one key can
+    /// have several ids waiting, and approving "the pending one" would be a guess.
+    #[serde(default)]
+    peer_id: String,
+}
+
+#[derive(Serialize)]
+struct DeviceKeyClaimsResponse {
+    claims: Vec<integration::PendingDeviceKeyClaim>,
+    /// So the dashboard can explain an empty list ("first-use claiming is off") instead
+    /// of leaving the operator to guess why nothing ever appears.
+    claim_unbound_device_keys: bool,
+}
+
+async fn list_device_key_claims(
+    Extension(state): Extension<HbbsApiState>,
+    headers: HeaderMap,
+) -> ApiResult<DeviceKeyClaimsResponse> {
+    require_auth(&headers, &state.token)?;
+    Ok(Json(DeviceKeyClaimsResponse {
+        claims: integration::pending_device_key_claims(),
+        claim_unbound_device_keys: integration::claim_unbound_device_keys(),
+    }))
+}
+
+async fn approve_device_key_claim(
+    Path(id): Path<String>,
+    Extension(state): Extension<HbbsApiState>,
+    headers: HeaderMap,
+    Json(req): Json<DeviceKeyClaimRequest>,
+) -> ApiResult<integration::DeviceKey> {
+    require_auth(&headers, &state.token)?;
+    let peer_id = req.peer_id.trim().to_owned();
+    // Read the row's own `via` before approving: approval drops the key's pending rows,
+    // and the audit line is more use with the endpoint the client actually came in on.
+    let via = integration::pending_device_key_claims()
+        .into_iter()
+        .find(|c| c.key_id == id && c.peer_id == peer_id)
+        .map(|c| c.via)
+        .unwrap_or_else(|| "management API".to_owned());
+    let key = integration::approve_device_key_claim(&id, &peer_id, now_iso())
+        .map_err(|e| api_error(StatusCode::BAD_REQUEST, &e))?;
+    record_device_key_claim(&peer_id, &key.public_key, &via).await;
+    Ok(Json(key))
+}
+
+async fn deny_device_key_claim(
+    Path(id): Path<String>,
+    Extension(state): Extension<HbbsApiState>,
+    headers: HeaderMap,
+    Json(req): Json<DeviceKeyClaimRequest>,
+) -> ApiResult<integration::PendingDeviceKeyClaim> {
+    require_auth(&headers, &state.token)?;
+    let peer_id = req.peer_id.trim().to_owned();
+    let claim = integration::deny_device_key_claim(&id, &peer_id)
+        .map_err(|e| api_error(StatusCode::BAD_REQUEST, &e))?;
+    let mut store = STATS.write().await;
+    record_event_locked(
+        &mut store,
+        "device-key-claim-denied",
+        Some(&peer_id),
+        None,
+        format!(
+            "operator denied device key {} for this peer; it stays refused and will not ask \
+             again until the request is forgotten",
+            id
+        ),
+    );
+    drop(store);
+    Ok(Json(claim))
+}
+
+async fn forget_device_key_claim(
+    Path(id): Path<String>,
+    Extension(state): Extension<HbbsApiState>,
+    headers: HeaderMap,
+    Json(req): Json<DeviceKeyClaimRequest>,
+) -> ApiResult<serde_json::Value> {
+    require_auth(&headers, &state.token)?;
+    let peer_id = req.peer_id.trim().to_owned();
+    integration::forget_device_key_claim(&id, &peer_id)
+        .map_err(|e| api_error(StatusCode::BAD_REQUEST, &e))?;
+    let mut store = STATS.write().await;
+    record_event_locked(
+        &mut store,
+        "device-key-claim-forgotten",
+        Some(&peer_id),
+        None,
+        format!("operator cleared the device key {} request for this peer; it may ask again", id),
+    );
+    drop(store);
+    Ok(Json(serde_json::json!({ "forgotten": true })))
+}
+
+#[derive(Deserialize)]
+struct DeviceKeyPeerIdRequest {
+    /// Empty clears the binding, which re-arms the key as a claimable provisioning
+    /// token (and drops its pending rows, denials included).
+    #[serde(default)]
+    peer_id: String,
+}
+
+async fn set_device_key_peer_id(
+    Path(id): Path<String>,
+    Extension(state): Extension<HbbsApiState>,
+    headers: HeaderMap,
+    Json(req): Json<DeviceKeyPeerIdRequest>,
+) -> ApiResult<integration::DeviceKey> {
+    require_auth(&headers, &state.token)?;
+    let peer_id = req.peer_id.trim().to_owned();
+    let key = integration::set_device_key_peer_id(&id, &peer_id)
+        .map_err(|e| api_error(StatusCode::BAD_REQUEST, &e))?;
+    let mut store = STATS.write().await;
+    record_event_locked(
+        &mut store,
+        "device-key-binding",
+        if peer_id.is_empty() { None } else { Some(&peer_id) },
+        None,
+        if peer_id.is_empty() {
+            format!("device key {} binding cleared; it is a claimable provisioning token again", id)
+        } else {
+            format!("device key {} bound to peer {} by the operator", id, peer_id)
+        },
+    );
+    drop(store);
+    Ok(Json(key))
+}
+
 // ---- Auto-update manifest (a Layer 1 consumer) ----
 //
 // The stock updater is unreachable from this fork (no api.rustdesk.com; the stock
@@ -3011,18 +3197,32 @@ fn verify_device_signature(pub_b64: &str, sig_b64: &str, domain: &str, id: &str)
     verify_device_signature_proof(pub_b64, sig_b64, domain, id).ok
 }
 
-/// The result of checking a device proof. `newly_claimed` is true exactly once per
-/// key — on the request whose signature took an unbound provisioning token (M1-CLAIM)
-/// — so the handler can audit the moment a key became that peer's key.
+/// The result of checking a device proof. `claim` is set when the request proved a
+/// pinned-but-unbound key and therefore filed a binding REQUEST (M1-CLAIM): `ok` is
+/// still false — a pending claim grants nothing — but the handler reports a different
+/// refusal for it, so the client can say "waiting for your administrator" instead of
+/// showing a bare 403, and audits the moment a new one is filed.
 struct DeviceProof {
     ok: bool,
-    newly_claimed: bool,
+    claim: Option<integration::PendingOutcome>,
 }
 
 const PROOF_REFUSED: DeviceProof = DeviceProof {
     ok: false,
-    newly_claimed: false,
+    claim: None,
 };
+
+/// Which endpoint a binding request came in on, for the dashboard's pending row. Taken
+/// from the signature domain so it cannot disagree with what was actually verified.
+fn claim_via_label(domain: &str) -> &'static str {
+    match domain {
+        "nemo-poll" => "settings poll",
+        "nemo-ab" => "address book",
+        "nemo-login" => "sign-in",
+        "nemo-audit" => "audit upload",
+        _ => "management API",
+    }
+}
 
 fn verify_device_signature_proof(
     pub_b64: &str,
@@ -3081,25 +3281,27 @@ fn verify_device_signature_proof(
         return PROOF_REFUSED;
     }
     // M1-CLAIM: the signature is valid, fresh, for this domain AND for the id the
-    // client claims — only now may it take the token. Doing this after the checks
-    // above is the whole point: a claim requires the private half, so naming someone
-    // else's unclaimed key cannot steal it.
+    // client claims — only now may it ASK for the token. Filing the request after the
+    // checks above is the whole security argument: a claim requires the private half,
+    // so naming someone else's unclaimed key cannot take it or even raise a request
+    // against it. The request is not the grant: this request stays refused, which is
+    // what keeps the TASK #14 rule intact for every client the operator has not yet
+    // confirmed.
     if claim_needed {
-        return match integration::claim_device_key(pub_b64, id, now_iso()) {
-            Ok(newly_claimed) => DeviceProof {
-                ok: true,
-                newly_claimed,
-            },
-            Err(reason) => {
-                // Lost a race with another id, or the key was deleted mid-request.
-                log::warn!("device key claim refused for peer {}: {}", id, reason);
-                PROOF_REFUSED
-            }
+        let outcome = integration::register_pending_claim(
+            pub_b64,
+            id,
+            claim_via_label(domain),
+            now_iso(),
+        );
+        return DeviceProof {
+            ok: false,
+            claim: Some(outcome),
         };
     }
     DeviceProof {
         ok: true,
-        newly_claimed: false,
+        claim: None,
     }
 }
 
@@ -3911,10 +4113,10 @@ pub(crate) async fn record_peer_seen(id: &str, addr: SocketAddr) {
     );
 }
 
-/// M1-CLAIM: a device key just bound itself to a peer by first use. Audited rather
-/// than only logged, because this is the one binding the operator did not type: the
-/// dashboard's event list is where they confirm the right machine took the token (and
-/// spot it if the wrong one did, while the key can still be deleted).
+/// M1-CLAIM: the operator confirmed a pairing, so a device key is now bound to a peer
+/// it was not generated for. Audited rather than only logged, because this is the one
+/// binding nobody typed into the "Bound to ID" field: the dashboard's event list is
+/// where it can be seen afterwards that the right machine took the token.
 pub(crate) async fn record_device_key_claim(id: &str, device_key_pub: &str, via: &str) {
     // Short prefix only, like the rendezvous handshake log: enough to match the row in
     // the Device keys table, not the whole public key in every event line.
@@ -3932,12 +4134,47 @@ pub(crate) async fn record_device_key_claim(id: &str, device_key_pub: &str, via:
         Some(id),
         None,
         format!(
-            "device key {}... bound to this peer by first use ({}); it no longer authenticates \
-             any other id",
+            "device key {}... bound to this peer by operator confirmation of a claim filed on \
+             its {}; it no longer authenticates any other id",
             short, via
         ),
     );
 }
+
+/// M1-CLAIM: a client proved a pinned-but-unbound key and asked for it. It was REFUSED
+/// and a request was filed. Audited because it is the operator's cue that a machine is
+/// sitting in its provisioning gate waiting for them, and because an unexpected id
+/// against a key is exactly what they must see while the key can still be deleted.
+pub(crate) async fn record_device_key_claim_pending(id: &str, device_key_pub: &str, via: &str) {
+    let short: String = device_key_pub.chars().take(12).collect();
+    log::info!(
+        "Device key {}... was proved by peer {} on its {} and is NOT bound: filed a claim for \
+         operator confirmation; the client stays refused until it is approved",
+        short,
+        id,
+        via
+    );
+    let mut store = STATS.write().await;
+    record_event_locked(
+        &mut store,
+        "device-key-claim-pending",
+        Some(id),
+        None,
+        format!(
+            "this peer proved unbound device key {}... on its {} and is waiting for approval; \
+             it is refused until then",
+            short, via
+        ),
+    );
+}
+
+/// The refusal a client whose claim is waiting (or was denied) gets instead of a bare
+/// "a provisioned device key is required". The client matches on these to tell the user
+/// that a human has to approve the machine, rather than that its key is wrong.
+pub(crate) const DEVICE_KEY_CLAIM_PENDING: &str =
+    "device key is awaiting operator confirmation";
+pub(crate) const DEVICE_KEY_CLAIM_DENIED: &str =
+    "device key claim was denied by the operator";
 
 pub(crate) async fn record_register_pk(id: &str, addr: SocketAddr, accepted: bool) {
     let mut store = STATS.write().await;
@@ -4368,11 +4605,11 @@ async fn client_policy(
     let device_key_ok = proof.ok;
     record_peer_auth_mode(&request.id, if device_key_ok { "device-key" } else { "default" });
     // M1-CLAIM: the poll is normally the first request a freshly provisioned client
-    // makes, so this is where an unbound token usually becomes that peer's key. Audit
-    // it: the binding was decided by the client, not by the operator, so the operator
-    // has to be able to see which machine took which key, and when.
-    if proof.newly_claimed {
-        record_device_key_claim(
+    // makes, so this is usually where an unbound token's binding is first REQUESTED.
+    // Audit a new request: this is the one binding the operator did not type, so they
+    // have to be able to see which machine asked for which key, and when.
+    if proof.claim == Some(integration::PendingOutcome::New) {
+        record_device_key_claim_pending(
             &request.id,
             request.device_key_pub.as_deref().unwrap_or(""),
             "settings poll",
@@ -4380,10 +4617,22 @@ async fn client_policy(
         .await;
     }
     if integration::require_device_key() && !device_key_ok {
-        return Err(api_error(
-            StatusCode::FORBIDDEN,
-            "a provisioned device key is required",
-        ));
+        // A client whose claim is pending is refused like any unprovisioned one, but it
+        // is refused for a reason the operator can act on — so say which, or the client
+        // would sit in its provisioning gate with a bare 403 and no idea that a human
+        // has to press Approve.
+        return Err(match proof.claim {
+            Some(integration::PendingOutcome::New) | Some(integration::PendingOutcome::Repeat) => {
+                api_error(StatusCode::FORBIDDEN, DEVICE_KEY_CLAIM_PENDING)
+            }
+            Some(integration::PendingOutcome::Denied) => {
+                api_error(StatusCode::FORBIDDEN, DEVICE_KEY_CLAIM_DENIED)
+            }
+            _ => api_error(
+                StatusCode::FORBIDDEN,
+                "a provisioned device key is required",
+            ),
+        });
     }
     // Learn this peer's hostname from its own poll so the address book can show
     // it -- only after the device-key gate, or anyone knowing id+uuid could rename it.
@@ -4793,6 +5042,13 @@ async fn update_policy(
     if let Some(strip) = request.strip_unsealed_secrets {
         integration::set_strip_unsealed_secrets(strip);
     }
+    // M1-CLAIM: turning this OFF is the fail-closed direction (an unbound key then
+    // authenticates nothing and asks for nothing), so it is logged like the S-B
+    // switches — that line is what explains a client that suddenly stops provisioning.
+    if let Some(claim) = request.claim_unbound_device_keys {
+        log::info!("Nemo claim-unbound-device-keys set to {}", claim);
+        integration::set_claim_unbound_device_keys(claim);
+    }
     // S-B (scope b): these lock out any client that has not been updated, so they are
     // logged at the moment an operator flips them — that log line is what explains a
     // sudden wave of refused logins/polls afterwards.
@@ -4909,6 +5165,9 @@ async fn peer_response(pm: &PeerMap, peer: RegisteredPeer) -> PeerResponse {
                 Some(info.ip)
             }
         });
+    // M1-CLAIM: both come from the pinned registry, not from runtime state.
+    let device_key = integration::device_key_for_peer(&peer.id);
+    let pending = integration::pending_claim_for_peer(&peer.id);
     PeerResponse {
         id: peer.id.clone(),
         hostname: peer_hostname(&peer.id),
@@ -4929,6 +5188,26 @@ async fn peer_response(pm: &PeerMap, peer: RegisteredPeer) -> PeerResponse {
         online: runtime.as_ref().map(|snapshot| snapshot.online).unwrap_or(false),
         last_seen_ms_ago: runtime.and_then(|snapshot| snapshot.last_seen_ms_ago),
         auth_mode: peer_auth_mode(&peer.id),
+        provisioned: device_key.is_some(),
+        device_key_id: device_key.as_ref().map(|k| k.id.clone()).unwrap_or_default(),
+        device_key_label: device_key.as_ref().map(|k| k.label.clone()).unwrap_or_default(),
+        pending_claim_key_id: pending.as_ref().map(|c| c.key_id.clone()).unwrap_or_default(),
+        pending_claim_key_label: pending
+            .as_ref()
+            .and_then(|c| {
+                integration::list_device_keys()
+                    .into_iter()
+                    .find(|k| k.public_key == c.public_key)
+                    .map(|k| k.label)
+            })
+            .unwrap_or_default(),
+        pending_claim_first_seen: pending
+            .as_ref()
+            .map(|c| c.first_seen.clone())
+            .unwrap_or_default(),
+        pending_claim_attempts: pending.as_ref().map(|c| c.attempts).unwrap_or(0),
+        pending_claim_via: pending.as_ref().map(|c| c.via.clone()).unwrap_or_default(),
+        pending_claim_denied: pending.as_ref().map(|c| c.denied).unwrap_or(false),
         direct_endpoint: peer_endpoint(&peer.id),
         stats: peer_stats(&peer.id).await,
     }
@@ -4959,6 +5238,8 @@ fn policy_response(server_public_key: &str) -> PolicyResponse {
         connection_history_limit: conn_history_limit(),
         log_history_limit: log_history_limit(),
         require_device_key: integration::require_device_key(),
+        claim_unbound_device_keys: integration::claim_unbound_device_keys(),
+        pending_device_key_claims: integration::pending_device_key_claim_count(),
         strip_unsealed_secrets: integration::strip_unsealed_secrets(),
         require_sealed_login: integration::require_sealed_login(),
         require_sealed_request: integration::require_sealed_request(),
@@ -6260,6 +6541,85 @@ mod tests {
             format!("{}:{}:{}", domain, id, ts).as_bytes(),
             sk,
         ))
+    }
+
+    // M1-CLAIM, at the enforcement point: proving a pinned-but-UNBOUND key does not
+    // authenticate the request -- it files a binding request and the request is refused.
+    // This is what keeps the TASK #14 rule above true while first-use provisioning
+    // exists: nothing a client can do binds its own key.
+    #[test]
+    fn an_unbound_key_files_a_claim_and_is_still_refused() {
+        sodiumoxide::init().ok();
+        let (pk, sk) = sign::gen_keypair();
+        let pub_b64 = base64::encode(pk.as_ref());
+        let now = now_secs();
+        integration::pin_device_key_for_test(integration::DeviceKey {
+            id: "claimtest".to_owned(),
+            label: "test".to_owned(),
+            public_key: pub_b64.clone(),
+            created_at: String::new(),
+            peer_id: String::new(),
+            claimed_at: String::new(),
+        });
+
+        // A valid, fresh signature over the id it claims: refused, because unbound.
+        assert!(!verify_device_signature(
+            &pub_b64,
+            &signed_for(&sk, "nemo-poll", "claim-peer-1", now),
+            "nemo-poll",
+            "claim-peer-1"
+        ));
+        // ...but it is now visible to the operator, labelled with the endpoint it came
+        // in on, which is derived from the verified signature domain.
+        let claim = integration::pending_claim_for_peer("claim-peer-1")
+            .expect("a proved unbound key must raise a request");
+        assert_eq!(claim.key_id, "claimtest");
+        assert_eq!(claim.via, "settings poll");
+        assert!(!claim.denied);
+        // And the key is still unbound: only the operator writes a binding.
+        assert_eq!(
+            integration::device_key_for_peer("claim-peer-1").map(|k| k.id),
+            None
+        );
+
+        // A client that does NOT hold the key cannot raise a request against it: the
+        // claim is filed only after the signature verifies.
+        assert!(!verify_device_signature(
+            &pub_b64,
+            "bm90LWEtc2lnbmF0dXJl",
+            "nemo-poll",
+            "claim-peer-2"
+        ));
+        assert!(integration::pending_claim_for_peer("claim-peer-2").is_none());
+
+        // With claiming switched off, the original fail-closed rule stands and nothing
+        // is filed at all.
+        integration::set_claim_unbound_device_keys(false);
+        assert!(!verify_device_signature(
+            &pub_b64,
+            &signed_for(&sk, "nemo-poll", "claim-peer-3", now),
+            "nemo-poll",
+            "claim-peer-3"
+        ));
+        assert!(integration::pending_claim_for_peer("claim-peer-3").is_none());
+        integration::set_claim_unbound_device_keys(true);
+
+        // Approval binds it, and then it is an ordinary bound key.
+        integration::approve_device_key_claim("claimtest", "claim-peer-1", now_iso())
+            .expect("approval must bind");
+        assert!(verify_device_signature(
+            &pub_b64,
+            &signed_for(&sk, "nemo-poll", "claim-peer-1", now),
+            "nemo-poll",
+            "claim-peer-1"
+        ));
+        assert!(!verify_device_signature(
+            &pub_b64,
+            &signed_for(&sk, "nemo-poll", "claim-peer-9", now),
+            "nemo-poll",
+            "claim-peer-9"
+        ));
+        integration::unpin_device_key_for_test(&pub_b64);
     }
 
     // S-DUALKEY + M1 + domain separation, against a key pinned in-memory.
