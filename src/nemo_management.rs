@@ -737,6 +737,26 @@ struct PeerPolicyResponse {
     allowed_for_control: bool,
 }
 
+/// Typed by the operator into the dashboard's dialog and required by the API, so neither a
+/// misclick nor a stray authenticated POST can revoke a fleet.
+const ROTATE_CONFIRMATION: &str = "ROTATE";
+
+#[derive(Deserialize)]
+struct RotateServerKeyRequest {
+    #[serde(default)]
+    confirm: String,
+}
+
+#[derive(Serialize)]
+struct RotateServerKeyResponse {
+    previous_public_key: String,
+    new_public_key: String,
+    /// Where the retired secret was kept, so it can be restored if this was a mistake.
+    archived_secret_key: String,
+    /// Always true: hbbs reads its key once at startup.
+    restart_required: bool,
+}
+
 #[derive(Deserialize)]
 struct PeerEndpointRequest {
     /// `host:port[,knockport]`. `None` or empty clears the endpoint.
@@ -753,6 +773,30 @@ struct PeerEndpointResponse {
 
 #[derive(Serialize)]
 struct PolicyResponse {
+    /// This server's own Ed25519 identity key, base64 — the value every client needs as
+    /// `key` (to verify the rendezvous handshake and the signed id/pk) and as
+    /// `nemo-management-public-key` (to verify signed policy).
+    ///
+    /// It was previously impossible to read anywhere: the dashboard's "Server public key"
+    /// field is a policy *input* that pushes a value TO clients, and the only API carrying
+    /// the real one was the client policy response, which needs a registered peer. So the
+    /// one value required to provision a new client could only be obtained by shelling into
+    /// the server and catting the keyfile.
+    ///
+    /// That is worse than inconvenient, because `hbbs` silently generates a keypair in its
+    /// working directory whenever it finds none — so every lab or dev run leaves behind an
+    /// `id_ed25519.pub` that looks authoritative and is not. Four such files were in
+    /// circulation on 2026-10-15 and a build was nearly configured against the wrong one.
+    ///
+    /// Public by construction: it is handed to every client on every policy poll, so showing
+    /// it to an authenticated operator discloses nothing new.
+    server_public_key: String,
+    /// The key ON DISK, i.e. what the next start will use. Normally identical to
+    /// `server_public_key`; differs after a rotation, because hbbs reads its key once at
+    /// startup. The dashboard shows a restart-pending warning on a mismatch — without this
+    /// the operator would rotate, see the old key still listed, and have no way to tell
+    /// whether the rotation took.
+    server_public_key_on_disk: String,
     company_only: bool,
     blocked_status: i64,
     allowed_status: i64,
@@ -961,6 +1005,140 @@ fn peer_hostname(id: &str) -> String {
         .get(id)
         .cloned()
         .unwrap_or_default()
+}
+
+// ---- Server identity key: read it, and (break-glass) rotate it ----
+//
+// `hbbs` keeps its Ed25519 signing key in `id_ed25519` in its working directory and reads
+// it ONCE at startup (see common::gen_sk), so a rotation here does not take effect until
+// the process restarts. Everything below is written so that the on-disk state is always
+// consistent and recoverable, and so the dashboard can tell the operator that the running
+// key no longer matches the file.
+
+fn server_key_file() -> &'static str {
+    // Must match common::gen_sk, which hardcodes this name relative to the cwd.
+    "id_ed25519"
+}
+
+/// The public key currently ON DISK, which is what the next start will use. Read from
+/// `id_ed25519.pub` if present, otherwise derived from the secret (the public half is the
+/// second 32 bytes), so a missing `.pub` does not make this lie.
+fn server_public_key_on_disk() -> String {
+    server_public_key_on_disk_at(server_key_file())
+}
+
+/// Path-explicit so it is testable without mutating the process-wide cwd, which other
+/// tests in this binary run against in parallel.
+fn server_public_key_on_disk_at(sk_file: &str) -> String {
+    if let Ok(pk) = std::fs::read_to_string(format!("{sk_file}.pub")) {
+        let pk = pk.trim().to_owned();
+        if !pk.is_empty() {
+            return pk;
+        }
+    }
+    std::fs::read_to_string(sk_file)
+        .ok()
+        .and_then(|sk| base64::decode(sk.trim()).ok())
+        .filter(|sk| sk.len() == sign::SECRETKEYBYTES)
+        .map(|sk| base64::encode(&sk[sign::SECRETKEYBYTES / 2..]))
+        .unwrap_or_default()
+}
+
+/// A fresh keypair whose base64 public half contains neither `/` nor `:`, because the key
+/// travels inside licence names of the form `host=...,key=...` where both are separators.
+/// Same filter as common::generate_and_publish_sk; keep them in step.
+fn gen_url_safe_keypair() -> (String, sign::SecretKey) {
+    for _ in 0..300 {
+        let (pk, sk) = sign::gen_keypair();
+        let pk_b64 = base64::encode(pk);
+        if !pk_b64.contains('/') && !pk_b64.contains(':') {
+            return (pk_b64, sk);
+        }
+    }
+    let (pk, sk) = sign::gen_keypair();
+    (base64::encode(pk), sk)
+}
+
+fn write_private(path: &str, contents: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    #[cfg(unix)]
+    let mut f = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?
+    };
+    #[cfg(not(unix))]
+    let mut f = std::fs::File::create(path)?;
+    f.write_all(contents)
+}
+
+/// Mint a new server identity key and retire the current one.
+///
+/// This is a deliberate fleet-wide revocation: every client still provisioned with the old
+/// key stops being able to complete the rendezvous handshake and stops accepting signed
+/// policy. There is no way to push the new key out through the normal channel, because that
+/// channel is authenticated BY the key being replaced — so re-provisioning is necessarily
+/// out of band (new installer with `key=` in the licence name, or config push via RMM/GPO).
+///
+/// The old key is **archived, not destroyed** (`id_ed25519.rotated-<epoch>`, 0600). Deleting
+/// it would turn an operator misclick into a permanently unrecoverable fleet; retiring it
+/// from service is what revokes access, and anyone who can read the archive already has root
+/// on the server. Shred the archive separately if the key is believed compromised.
+///
+/// Write order is chosen so no failure can leave the server with NO key, which would be
+/// fatal at next start (gen_sk exits when the file is missing and `--generate-key` is not
+/// set): the replacement is written to a temp file first, the old key is moved aside only
+/// once that succeeded, and the move is rolled back if publishing the new one then fails.
+fn rotate_server_key() -> Result<(String, String), String> {
+    rotate_server_key_at(server_key_file())
+}
+
+/// Path-explicit, for the same reason as `server_public_key_on_disk_at`.
+fn rotate_server_key_at(sk_file: &str) -> Result<(String, String), String> {
+    let previous_pub = server_public_key_on_disk_at(sk_file);
+    let (new_pub, new_sk) = gen_url_safe_keypair();
+
+    let tmp = format!("{sk_file}.rotating-{}", std::process::id());
+    write_private(&tmp, base64::encode(&new_sk).as_bytes())
+        .map_err(|e| format!("could not write the replacement key: {e}"))?;
+
+    let stamp = now_epoch_secs();
+    let archive = format!("{sk_file}.rotated-{stamp}");
+    let had_old = std::path::Path::new(sk_file).exists();
+    if had_old {
+        if let Err(e) = std::fs::rename(sk_file, &archive) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(format!("could not archive the current key to {archive}: {e}"));
+        }
+    }
+    if let Err(e) = std::fs::rename(&tmp, sk_file) {
+        // Put the old key back; better the previous state than none at all.
+        if had_old {
+            let _ = std::fs::rename(&archive, sk_file);
+        }
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("could not publish the replacement key: {e}"));
+    }
+    // The .pub is a convenience copy; a stale one would mislead, so overwrite it. Failure
+    // here is not fatal -- server_public_key_on_disk derives the public half from the
+    // secret when the .pub is missing or unreadable.
+    if let Err(e) = std::fs::write(format!("{sk_file}.pub"), new_pub.as_bytes()) {
+        log::warn!("rotated the server key but could not update {sk_file}.pub: {e}");
+    }
+    if had_old {
+        log::warn!(
+            "SERVER IDENTITY KEY ROTATED. Old key archived at {archive}. Every client still \
+             provisioned with {} is now locked out until it is re-provisioned with {}. \
+             Restart hbbs to put the new key into service.",
+            if previous_pub.is_empty() { "the previous key" } else { &previous_pub },
+            new_pub
+        );
+    }
+    Ok((new_pub, if had_old { archive } else { String::new() }))
 }
 
 // ---- Direct endpoints: where a workstation is reachable without the relay ----
@@ -1240,6 +1418,10 @@ pub(crate) async fn spawn_hbbs_api(
         // TASK-25: device-key-signed audit uploads from clients (conn/file/alarm).
         .route("/nemo/api/client/audit/:kind", post(client_audit))
         .route("/nemo/api/policy", get(get_policy).put(update_policy))
+        // Break-glass: mint a new server identity key and retire the current one. Locks out
+        // every client still carrying the old key, so it needs an explicit confirmation in
+        // the body on top of the dashboard's dialog.
+        .route("/nemo/api/server-key/rotate", post(rotate_server_key_route))
         .route("/nemo/api/stats", get(get_stats))
         .route("/nemo/api/events", get(get_events))
         // Nemo integration: LDAP config + per-user RBAC (admin dashboard).
@@ -3954,7 +4136,7 @@ async fn health(
     headers: HeaderMap,
 ) -> ApiResult<PolicyResponse> {
     require_auth(&headers, &state.token)?;
-    Ok(Json(policy_response()))
+    Ok(Json(policy_response(&state.server_public_key)))
 }
 
 async fn list_peers(
@@ -4407,7 +4589,51 @@ async fn get_policy(
     headers: HeaderMap,
 ) -> ApiResult<PolicyResponse> {
     require_auth(&headers, &state.token)?;
-    Ok(Json(policy_response()))
+    Ok(Json(policy_response(&state.server_public_key)))
+}
+
+/// `{"confirm": "ROTATE"}` is required in the body. The dashboard already asks, but this
+/// endpoint revokes an entire fleet's access, so it must not be reachable by a bare POST
+/// from something that merely holds the admin token (a stale script, a mis-aimed curl).
+async fn rotate_server_key_route(
+    Extension(state): Extension<HbbsApiState>,
+    headers: HeaderMap,
+    Json(request): Json<RotateServerKeyRequest>,
+) -> ApiResult<RotateServerKeyResponse> {
+    require_auth(&headers, &state.token)?;
+    if request.confirm.trim() != ROTATE_CONFIRMATION {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            &format!(
+                "refusing to rotate the server identity key without confirmation: send \
+                 {{\"confirm\":\"{ROTATE_CONFIRMATION}\"}}. This locks out every client still \
+                 provisioned with the current key."
+            ),
+        ));
+    }
+    let previous = state.server_public_key.trim().to_owned();
+    let (new_public_key, archived) =
+        rotate_server_key().map_err(|reason| api_error(StatusCode::INTERNAL_SERVER_ERROR, &reason))?;
+    {
+        let mut store = STATS.write().await;
+        record_event_locked(
+            &mut store,
+            "server-key-rotated",
+            None,
+            None,
+            format!(
+                "new key {new_public_key}; previous {} archived at {}; restart hbbs to activate",
+                if previous.is_empty() { "(unknown)" } else { &previous },
+                if archived.is_empty() { "(none)" } else { &archived }
+            ),
+        );
+    }
+    Ok(Json(RotateServerKeyResponse {
+        previous_public_key: previous,
+        new_public_key,
+        archived_secret_key: archived,
+        restart_required: true,
+    }))
 }
 
 async fn update_policy(
@@ -4488,7 +4714,7 @@ async fn update_policy(
         log::info!("Nemo require-sealed-request set to {}", require);
         integration::set_require_sealed_request(require);
     }
-    Ok(Json(policy_response()))
+    Ok(Json(policy_response(&state.server_public_key)))
 }
 
 async fn get_stats(
@@ -4633,8 +4859,10 @@ pub(crate) fn nemo_build_id() -> &'static str {
     option_env!("NEMO_BUILD_ID").unwrap_or("unknown")
 }
 
-fn policy_response() -> PolicyResponse {
+fn policy_response(server_public_key: &str) -> PolicyResponse {
     PolicyResponse {
+        server_public_key: server_public_key.trim().to_owned(),
+        server_public_key_on_disk: server_public_key_on_disk(),
         company_only: company_only(),
         blocked_status: 0,
         allowed_status: 1,
@@ -5781,6 +6009,56 @@ mod tests {
         // Nothing configured => the key is never pushed, so the whole fleet keeps today's
         // hole-punch / relay behaviour untouched.
         assert_eq!(direct_endpoint_map(&[], None), "");
+    }
+
+    // Rotation is a fleet-wide revocation, so the two things that must hold are that it
+    // actually changes the key and that it stays RECOVERABLE -- a server left with no key
+    // at all is fatal at next start (gen_sk exits), and a destroyed old key turns an
+    // operator misclick into a permanently unreachable fleet.
+    #[test]
+    fn rotating_the_server_key_is_recoverable() {
+        // Path-explicit helpers, so this never touches the process cwd that sibling tests
+        // run against in parallel.
+        let dir = std::env::temp_dir().join(format!("nemo-rotate-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("tmpdir");
+        let sk_file = dir.join("id_ed25519").to_string_lossy().into_owned();
+        let pub_file = format!("{sk_file}.pub");
+
+        // Start from a known key, the way a provisioned server looks.
+        let (first_pub, first_sk) = gen_url_safe_keypair();
+        write_private(&sk_file, base64::encode(&first_sk).as_bytes()).expect("seed key");
+        std::fs::write(&pub_file, first_pub.as_bytes()).expect("seed pub");
+        assert_eq!(server_public_key_on_disk_at(&sk_file), first_pub);
+
+        let (new_pub, archive) = rotate_server_key_at(&sk_file).expect("rotate");
+        assert_ne!(new_pub, first_pub, "rotation must actually change the key");
+        assert_eq!(
+            server_public_key_on_disk_at(&sk_file),
+            new_pub,
+            "the next start must pick up the new key"
+        );
+        // Recoverable: the old secret is archived, not destroyed, and it is the real one.
+        assert!(!archive.is_empty(), "the previous key must be archived");
+        let archived = std::fs::read_to_string(&archive).expect("archive readable");
+        assert_eq!(archived.trim(), base64::encode(&first_sk));
+        // Restoring the archive puts the fleet back exactly where it was.
+        std::fs::rename(&archive, &sk_file).expect("restore");
+        std::fs::write(&pub_file, first_pub.as_bytes()).expect("restore pub");
+        assert_eq!(server_public_key_on_disk_at(&sk_file), first_pub);
+
+        // A .pub that is missing must not make the readout lie -- the public half is
+        // derived from the secret instead.
+        std::fs::remove_file(&pub_file).expect("drop pub");
+        assert_eq!(server_public_key_on_disk_at(&sk_file), first_pub);
+
+        // The key travels inside licence names of the form `host=..,key=..`, so it must
+        // contain neither separator.
+        for _ in 0..32 {
+            let (pk, _) = gen_url_safe_keypair();
+            assert!(!pk.contains('/') && !pk.contains(':'), "{pk}");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn policy_with_knock_keys() -> ManagementPolicy {

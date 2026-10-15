@@ -802,6 +802,28 @@
           <h2 class="panel-title">Settings</h2>
         </div>
         <div class="col-grid" style="padding:12px 16px;">
+          <div class="span-all" style="border:1px solid rgba(0,0,0,0.12);border-radius:6px;padding:10px 12px;background:rgba(0,0,0,0.02);">
+            <div style="font-weight:600;margin-bottom:4px;">Server identity key <span id="serverKeyMsg" style="font-weight:400;font-size:12px;opacity:0.8;margin-left:6px;"></span></div>
+            <div id="serverKey" class="mono" style="word-break:break-all;font-size:13px;" title="Click to copy">—</div>
+            <div id="serverKeyPending" style="display:none;margin-top:8px;padding:8px 10px;border-radius:5px;background:#fff4e5;border:1px solid #ffb366;font-size:12px;line-height:1.5;"></div>
+            <div style="font-size:12px;opacity:0.75;line-height:1.5;margin-top:6px;">
+              Read-only. Every client needs this value as <b>both</b> <code>key</code> and
+              <code>nemo-management-public-key</code> (or baked into the licence name as
+              <code>key=&hellip;</code>). With the wrong one a client <b>never registers and never
+              accepts policy</b>. Click the key to copy it.
+              <br><b>Read it here, never from a file in a repo checkout.</b> <code>hbbs</code> silently
+              generates a keypair in its working directory when it finds none, so a lab or dev run
+              leaves behind an <code>id_ed25519.pub</code> that looks authoritative and is not. On the
+              server the live file is <code>/var/lib/rustdesk-server/id_ed25519.pub</code>.
+            </div>
+            <div style="margin-top:10px;display:flex;gap:10px;align-items:center;">
+              <button id="rotateServerKey" class="danger">Rotate server key…</button>
+              <span style="font-size:12px;opacity:0.75;line-height:1.4;">
+                Break-glass revocation: mints a new key and retires the old one, which
+                <b>locks out every client still carrying the old key</b> — including this fleet.
+              </span>
+            </div>
+          </div>
           <label style="display:flex;gap:10px;align-items:flex-start;cursor:pointer;">
             <input id="companyOnly" type="checkbox" style="margin-top:3px;">
             <span>
@@ -1341,6 +1363,7 @@
     $("ldapUserSearch").addEventListener("click", searchDirectory);
     $("ldapUserQuery").addEventListener("keydown", (e) => { if (e.key === "Enter") searchDirectory(); });
     $("gpSave").addEventListener("click", saveGlobalPolicy);
+    $("rotateServerKey").addEventListener("click", rotateServerKeyFlow);
     $("permsSave").addEventListener("click", savePermissions);
     $("adminPolicySave").addEventListener("click", async () => {
       const ap = collectAdminPolicy();
@@ -1769,6 +1792,7 @@
         state.events = events.events || [];
         setHealth("ok", "Online");
         renderBuildInfo(health.build_id);
+        renderServerKey(health.server_public_key, health.server_public_key_on_disk);
         renderSummary();
         renderPeers();
         renderDeviceKeyPeerList();
@@ -1790,6 +1814,87 @@
     // time (window.__NEMO_GUI_BUILD); the server build comes from the live /health.
     // They match normally (GUI is compiled into the binary); a mismatch means the
     // browser is showing a cached page — prompt a hard refresh.
+    // THE value needed to provision a client: every client must carry it as `key` and as
+    // `nemo-management-public-key`, or it never registers and never accepts policy. Until
+    // this existed the only way to read it was to ssh in and cat the keyfile -- and because
+    // hbbs silently generates a keypair in its working directory when it finds none, every
+    // lab run leaves an id_ed25519.pub that looks authoritative and is not. Showing the
+    // LIVE one here is what stops a client being configured against a decoy.
+    function renderServerKey(running, onDisk) {
+      const el = $("serverKey");
+      if (!el) return;
+      const k = (running || "").trim();
+      el.textContent = k || "—";
+      if (k) {
+        el.title = "This server's Ed25519 identity key, as the RUNNING process holds it. Click to copy.";
+        el.style.cursor = "pointer";
+        el.onclick = async () => {
+          try { await navigator.clipboard.writeText(k); setMsg("serverKeyMsg", "copied", true); }
+          catch (e) { setMsg("serverKeyMsg", "select and copy manually", false); }
+          setTimeout(() => setMsg("serverKeyMsg", ""), 2500);
+        };
+      }
+      // hbbs reads its key once at startup, so after a rotation the file and the running
+      // process disagree. Saying so is the difference between "did the rotation take?" and
+      // knowing the fleet is still on the old key until a restart.
+      const disk = (onDisk || "").trim();
+      const pending = $("serverKeyPending");
+      if (!pending) return;
+      if (disk && k && disk !== k) {
+        pending.style.display = "";
+        pending.innerHTML = `<b>Restart pending.</b> The key on disk is
+          <span class="mono" style="word-break:break-all;">${escapeHtml(disk)}</span>,
+          but this process is still running the one above. Restart hbbs
+          (<code>systemctl restart rustdesk-hbbs-nemo</code>) to put the new key into service.
+          Until then clients keep working with the old key.`;
+      } else {
+        pending.style.display = "none";
+        pending.innerHTML = "";
+      }
+    }
+
+    // Break-glass fleet revocation. Two gates: a typed confirmation here, and the same word
+    // required by the API, so neither a misclick nor a stray authenticated POST can do it.
+    async function rotateServerKeyFlow() {
+      const warn =
+        "Rotate the server identity key?\n\n" +
+        "This mints a new key and retires the current one. EVERY client still provisioned " +
+        "with the old key will stop being able to register and will stop accepting policy — " +
+        "including this entire fleet.\n\n" +
+        "There is no automatic way to push the new key out: the policy channel is itself " +
+        "authenticated by the key being replaced, so every client must be re-provisioned out " +
+        "of band (new installer with key=... in the licence name, or a config push).\n\n" +
+        "The old secret is archived on the server (id_ed25519.rotated-<timestamp>) so this " +
+        "can be undone.\n\n" +
+        "Type ROTATE to confirm:";
+      const answer = window.prompt(warn, "");
+      if (answer === null) return;
+      if (answer.trim() !== "ROTATE") {
+        setMsg("serverKeyMsg", "not confirmed — nothing changed", false);
+        setTimeout(() => setMsg("serverKeyMsg", ""), 4000);
+        return;
+      }
+      try {
+        const res = await api("/nemo/api/server-key/rotate", {
+          method: "POST",
+          body: JSON.stringify({ confirm: "ROTATE" })
+        });
+        setMsg("serverKeyMsg", "rotated — restart hbbs to activate", true);
+        const pending = $("serverKeyPending");
+        if (pending) {
+          pending.style.display = "";
+          pending.innerHTML = `<b>Key rotated. Restart hbbs to activate.</b>
+            <br>New key: <span class="mono" style="word-break:break-all;">${escapeHtml(res.new_public_key || "")}</span>
+            <br>Previous key: <span class="mono" style="word-break:break-all;">${escapeHtml(res.previous_public_key || "(unknown)")}</span>
+            <br>Old secret archived at <code>${escapeHtml(res.archived_secret_key || "(none)")}</code> — restore it there to undo.
+            <br>Re-provision every client with the new key, then
+            <code>systemctl restart rustdesk-hbbs-nemo</code>.`;
+        }
+      } catch (err) {
+        setMsg("serverKeyMsg", err.message, false);
+      }
+    }
+
     function renderBuildInfo(serverBuild) {
       const el = $("buildInfo");
       if (!el) return;
