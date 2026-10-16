@@ -710,6 +710,8 @@
                 <option value="allowed">Allowed</option>
                 <option value="blocked">Blocked</option>
                 <option value="unapproved">Unapproved</option>
+                <option value="direct">Direct-reachable</option>
+                <option value="nodirect">Relay / punch only</option>
               </select>
               <button id="clear">Clear</button>
             </div>
@@ -777,7 +779,7 @@
                 <th title="The target's NAT type as the server sees it.">NAT</th>
                 <th title="How long ago the last negotiation for this pair happened.">Last seen</th>
                 <th title="How many times this pair re-negotiated a connection in the window.">Count</th>
-                <th title="Cut = block the target so it stops accepting NEW connections. Active direct sessions end when closed.">Actions</th>
+                <th title="Cut = end the sessions this machine currently has. It does NOT block the peer; admission is the separate Block action in the Peers panel.">Actions</th>
               </tr>
             </thead>
             <tbody id="connections"></tbody>
@@ -790,6 +792,11 @@
           <h2 class="panel-title">Relayed bytes <small class="mini-stats"><b id="mRelayLive">0</b> live</small></h2>
         </div>
         <div style="padding:6px 16px 0;font-size:12px;opacity:0.7;line-height:1.4;">What the <b>relay actually carried</b>, measured by the relay itself (hbbr) and joined to the session this server brokered. The Connections panel shows which <i>path</i> was negotiated; this shows the bytes, which is the only way to prove a session stayed direct. A row with <b>no bytes</b> is the good case: the relay was offered, the two machines went direct, and the grant expired unused. <b>Live</b> rows are sessions the relay still has open.</div>
+        <!-- TODO 24: the measurement's own state. Until this says the relay is
+             answering, no row may claim a session "went direct" - that verdict is
+             made of the ABSENCE of samples, which is also what a broken admin
+             channel produces. -->
+        <div id="relayHealth" style="display:none;margin:8px 16px 0;padding:8px 10px;border-radius:6px;font-size:12px;line-height:1.45;"></div>
         <div class="table-wrap">
           <table>
             <thead>
@@ -801,7 +808,7 @@
                 <th title="Highest rate the relay saw during this session.">Peak</th>
                 <th title="How long the relay has been carrying this session.">Duration</th>
                 <th title="When the server brokered the session.">Brokered</th>
-                <th title="live = the relay still has it open; ended = the relay closed and forgot it; unused = brokered but never carried a byte, i.e. the machines went direct.">State</th>
+                <th title="live = the relay still has it open; ended = the relay carried it and has now closed it; unused — went direct = the relay is reporting and reported nothing for this session; no data from the relay = this server cannot read the relay's counters, so what the session did is unknown.">State</th>
               </tr>
             </thead>
             <tbody id="relaySessions"></tbody>
@@ -1953,6 +1960,23 @@
         renderDeviceKeyClaims(claims && claims.claims, keys, !!(claims && claims.claim_unbound_device_keys));
       } catch (e) {}
     }
+
+    // A claim arrives while the operator is already looking at this page -- that is the
+    // normal case, because they are watching for it. loadDeviceKeys() only runs when the
+    // view is entered, so the waiting-for-confirmation box used to appear only after a
+    // tab switch or a reload. This re-renders JUST that box on the 5 s tick: it holds
+    // nothing editable, so unlike the device-key form it is safe to replace under the
+    // operator's hands.
+    async function refreshDeviceKeyClaims() {
+      if (!$("deviceKeyClaims")) return;
+      try {
+        const [keys, claims] = await Promise.all([
+          api("/nemo/api/device-keys"),
+          api("/nemo/api/device-key-claims"),
+        ]);
+        renderDeviceKeyClaims(claims && claims.claims, keys, !!(claims && claims.claim_unbound_device_keys));
+      } catch (e) {}
+    }
     $("generateDeviceKey").addEventListener("click", async () => {
       const label = $("deviceKeyLabel").value.trim();
       const peer_id = $("deviceKeyPeerId").value.trim();
@@ -2144,6 +2168,7 @@
         renderDeviceKeyPeerList();
         renderEvents();
         renderDetail();
+        refreshDeviceKeyClaims();
       } catch (err) {
         setHealth("bad", err.message || "Error");
         $("peerEmpty").textContent = err.message || "Failed to load peers";
@@ -2264,7 +2289,18 @@
       $("mPeers").textContent = state.peers.length;
       $("mOnline").textContent = state.peers.filter((p) => p.online).length;
       $("mReject").textContent = totals.policy_rejections || 0;
-      if ($("mRelayBytes")) $("mRelayBytes").textContent = formatBytes(totals.relay_bytes);
+      // TODO 24: "0 B relayed" is a measurement, not a default. Say so when nothing is
+      // measuring, instead of reporting a zero that was never counted.
+      if ($("mRelayBytes")) {
+        const el = $("mRelayBytes");
+        if (relayMeasurementTrusted()) {
+          el.textContent = formatBytes(totals.relay_bytes);
+          el.title = "Bytes the relay itself reported carrying, since this server started.";
+        } else {
+          el.textContent = "not measured";
+          el.title = "The relay's byte counters are not reaching this server, so this is unknown rather than zero. See the Relayed bytes panel.";
+        }
+      }
     }
 
     // Binary units, like every other tool an operator will compare this against.
@@ -2290,10 +2326,45 @@
     // TODO 7: the relay's own byte counters. The server only ever saw negotiations, so a
     // session that fell back to the relay and pushed gigabytes looked exactly like one
     // that was offered the relay and then went direct. These rows tell them apart.
+    // TODO 24: is the relay's own measurement arriving? "unused — went direct" is a
+    // verdict made out of the ABSENCE of samples for a session, so it is only a verdict
+    // at all while hbbr is answering. When the poller has never got through (hbbs and
+    // hbbr in separate containers, the admin channel being loopback-only) every row
+    // looked "unused", i.e. the dashboard reported a fleet staying direct from no data.
+    function relayMeasurementTrusted() {
+      const h = state.stats?.relay_poller;
+      return !!(h && h.enabled && h.last_success_at);
+    }
+
+    function renderRelayHealth() {
+      const el = $("relayHealth");
+      if (!el) return;
+      const h = state.stats?.relay_poller;
+      if (relayMeasurementTrusted()) {
+        el.style.display = "none";
+        return;
+      }
+      el.style.display = "";
+      if (!h || !h.enabled) {
+        el.style.background = "#fff8e1";
+        el.style.border = "1px solid #e0c060";
+        el.style.color = "#6b5200";
+        el.innerHTML = "<b>The relay is not being measured.</b> Byte counters are off on this server (<code>--nemo-relay-metrics \"\"</code>), so the rows below only show which sessions this server <i>brokered</i> &mdash; they say nothing about which of them used the relay, and none of them can be called direct.";
+        return;
+      }
+      const why = h.last_error ? ` Last error: <code>${escapeHtml(h.last_error)}</code>${h.last_error_at ? " at " + escapeHtml(h.last_error_at.replace("T", " ").slice(0, 19)) : ""}.` : "";
+      el.style.background = "#fdecea";
+      el.style.border = "1px solid #e09b94";
+      el.style.color = "#7a1b12";
+      el.innerHTML = `<b>No data from the relay.</b> hbbr at <code>${escapeHtml(h.target || "?")}</code> has not answered this server since it started, so relayed-byte counts are unavailable and <b>no session below can be shown as direct</b>.${why} hbbr's <code>uj</code> admin channel binds loopback only: if the relay runs in another container or on another host, point <code>--nemo-relay-metrics</code> at a reachable address (e.g. over an SSH tunnel) or run both on the same host.`;
+    }
+
     function renderRelaySessions() {
+      renderRelayHealth();
       const body = $("relaySessions");
       if (!body) return;
       const rows = state.stats?.relay_sessions || [];
+      const trusted = relayMeasurementTrusted();
       $("mRelayLive").textContent = rows.filter((r) => r.live).length;
       if (!rows.length) {
         body.innerHTML = "";
@@ -2302,15 +2373,29 @@
       }
       $("relayEmpty").style.display = "none";
       body.innerHTML = rows.map((r) => {
-        const unused = !r.last_sample_at;
-        const stateCell = r.live
-          ? '<span class="badge allowed">live</span>'
-          : (unused ? '<span style="color:#1a7a34;font-weight:600" title="Brokered but never used: the two machines connected directly.">unused &mdash; went direct</span>'
-                    : '<span style="opacity:0.6">ended</span>');
+        const sampled = !!r.last_sample_at;
+        // Three distinct states, where there used to be two:
+        //   live                      - the relay has it open right now
+        //   unused - went direct      - the relay is known-good and reported nothing
+        //   no data from the relay    - we cannot see what this session did
+        let stateCell;
+        if (r.live) {
+          stateCell = '<span class="badge allowed">live</span>';
+        } else if (sampled) {
+          stateCell = '<span style="opacity:0.6">ended</span>';
+        } else if (trusted) {
+          stateCell = '<span style="color:#1a7a34;font-weight:600" title="The relay is reporting, and reported nothing for this session: the two machines connected directly and the grant expired unused.">unused &mdash; went direct</span>';
+        } else {
+          stateCell = '<span style="color:#7a1b12;font-weight:600" title="This server brokered the session but cannot read the relay\'s counters, so whether it was relayed is unknown. See the note above the table.">no data from the relay</span>';
+        }
+        const bytesCell = sampled
+          ? escapeHtml(formatBytes(r.bytes))
+          : (trusted ? '<span style="opacity:0.4" title="Nothing relayed.">&mdash;</span>'
+                     : '<span style="opacity:0.5" title="Not measured.">?</span>');
         return `<tr>
           <td>${r.source_id ? `<code>${escapeHtml(r.source_id)}</code>` : '<span style="opacity:0.5" title="The controller proved no identity on this handshake.">unknown</span>'}${peerHostAlias(r.source_id)}</td>
           <td>${r.target_id ? `<code>${escapeHtml(r.target_id)}</code>` : '<span style="opacity:0.5">unknown</span>'}${peerHostAlias(r.target_id)}</td>
-          <td style="font-weight:600">${unused ? '<span style="opacity:0.4">&mdash;</span>' : escapeHtml(formatBytes(r.bytes))}</td>
+          <td style="font-weight:600">${bytesCell}</td>
           <td>${r.kbps ? escapeHtml(r.kbps + " kb/s") : '<span style="opacity:0.4">&mdash;</span>'}</td>
           <td>${r.peak_kbps ? escapeHtml(r.peak_kbps + " kb/s") : '<span style="opacity:0.4">&mdash;</span>'}</td>
           <td>${formatDuration(r.seconds)}</td>
@@ -2337,6 +2422,10 @@
         if (filter === "allowed") return peer.policy === "allowed" || peer.policy === "open";
         if (filter === "blocked") return peer.policy === "blocked";
         if (filter === "unapproved") return peer.policy === "unapproved";
+        // Which machines a controller can reach without the relay, and which still
+        // cost a third of the link. The point of the fork, in one dropdown.
+        if (filter === "direct") return !!peer.direct_endpoint;
+        if (filter === "nodirect") return !peer.direct_endpoint;
         return true;
       });
     }
@@ -2367,7 +2456,7 @@
           <td>${badge(peer.policy)}</td>
           <td>${peerKeyAuthCell(peer)}</td>
           <td>${((integ.devicePolicies || {})[peer.id]) ? escapeHtml(integ.devicePolicies[peer.id]) : '<span style="opacity:0.4">—</span>'}</td>
-          <td class="mono">${peer.direct_endpoint ? `<span style="color:#1a7a34;font-weight:600">${escapeHtml(peer.direct_endpoint)}</span>` : '<span style="opacity:0.4">—</span>'}</td>
+          <td class="mono">${directAccessCell(peer)}</td>
           <td class="mono">${escapeHtml(peer.registered_ip || "")}</td>
           <td class="mono">${escapeHtml(peer.public_addr || "")}</td>
           <td>${formatSeen(peer.last_seen_ms_ago)}</td>
@@ -2559,7 +2648,7 @@
               ${peer.pending_claim_denied ? "" : '<button class="danger" id="detailClaimDeny">Deny</button>'}
             </div></dd>` : ""}
           <dt>Local Addr</dt><dd>${stats.local_addr_attempts || 0}</dd>
-          <dt title="Bytes the relay actually carried for sessions this machine took part in, at either end. The two counters below only say a relay was offered or asked for.">Relayed bytes</dt><dd>${stats.relay_bytes ? `<span style="color:#8a6d1a;font-weight:600">${escapeHtml(formatBytes(stats.relay_bytes))}</span>` : '<span style="color:#1a7a34;font-weight:600">0 &mdash; nothing relayed</span>'}</dd>
+          <dt title="Bytes the relay actually carried for sessions this machine took part in, at either end. The two counters below only say a relay was offered or asked for.">Relayed bytes</dt><dd>${stats.relay_bytes ? `<span style="color:#8a6d1a;font-weight:600">${escapeHtml(formatBytes(stats.relay_bytes))}</span>` : (relayMeasurementTrusted() ? '<span style="color:#1a7a34;font-weight:600">0 &mdash; nothing relayed</span>' : '<span style="color:#7a1b12;font-weight:600" title="The relay is not reporting to this server, so this is unknown rather than zero.">not measured</span>')}</dd>
           <dt>Relay Requests</dt><dd>${stats.relay_requests || 0}</dd>
           <dt>Relay Responses</dt><dd>${stats.relay_responses || 0}</dd>
           <dt>NAT</dt><dd>${escapeHtml(stats.last_nat_type || "")}</dd>
@@ -2577,6 +2666,9 @@
               <button id="directEndpointSave">Save</button>
               <span id="directEndpointMsg" style="font-size:12px;opacity:0.8;"></span>
             </div>
+          </div>
+          <div style="font-size:12px;margin-top:8px;line-height:1.5;">
+            ${directDeliveryLine(peer)}
           </div>
           <div style="font-size:12px;opacity:0.75;line-height:1.5;margin-top:8px;">
             <code>host:port</code>, optionally <code>,knockport</code>. This is where controllers dial this
@@ -2708,14 +2800,52 @@
       if (peer.auth_mode === 'default') {
         return '<span style="color:#8a6d1a">server key only</span>';
       }
+      // TODO 23: a machine that is online and relaying has proved its device key on the
+      // rendezvous handshake — more strongly than a poll does, in fact. Saying
+      // "provisioned, not polled" about it reads as a server fault when the actual
+      // condition is "this client has no api-server, so it never polls", which is the
+      // client's configuration and is what the operator has to go and fix.
+      const proved = (peer.device_key_proved_at || "").replace("T", " ").slice(0, 19);
+      if (proved) {
+        return `<span style="color:#1a7a34;font-weight:600" title="Proved its device key on the rendezvous handshake at ${escapeAttr(proved)}${peer.device_key_label ? ' (key: ' + escapeAttr(peer.device_key_label) + ')' : ''}, so the key is good. It has NOT polled the management API, so no policy, address book or audit reaches it — check this client's api-server / nemo-management-server setting.">device key &mdash; handshake only</span>`;
+      }
       return peer.provisioned
-        ? '<span style="opacity:0.6" title="A device key is bound to this machine, but it has not polled this server since it started.">provisioned, not polled</span>'
+        ? '<span style="opacity:0.6" title="A device key is bound to this machine in the registry, but it has neither polled the management API nor completed a device-key handshake since this server started. If it is online, check this client&apos;s api-server setting; if it is offline, this is simply its last known state.">no management poll yet</span>'
         : '<span style="opacity:0.5">unknown</span>';
+    }
+
+    // Whether this workstation can be reached WITHOUT the relay, made obvious at a
+    // glance: the relay costs about a third of the link, so "is this machine direct-
+    // reachable" is the single most consequential row in the table and used to be a
+    // bare host:port that read like any other address column.
+    function directAccessCell(peer) {
+      if (!peer.direct_endpoint) {
+        return '<span style="opacity:0.55" title="No port forward configured: controllers will hole-punch and fall back to the relay. Set an endpoint in this peer&apos;s detail panel to make it directly reachable.">relay / punch</span>';
+      }
+      const parts = peer.direct_endpoint.split(",");
+      const knock = parts.length > 1 ? ` <span style="opacity:0.7" title="SPA (fwknop) knock port ${escapeAttr(parts[1])}: the forward stays closed until the controller knocks.">knock ${escapeHtml(parts[1])}</span>` : "";
+      return `<span class="badge allowed" style="margin-right:4px" title="Direct access possible: controllers that are allowed to reach this machine are told to dial ${escapeAttr(parts[0])} and skip the relay.">⇄ direct</span><span style="color:#1a7a34;font-weight:600">${escapeHtml(parts[0])}</span>${knock}`;
+    }
+
+    // Did the port forward actually REACH a client? Configuring an endpoint and a
+    // controller being able to use it are two different facts: the map is filtered per
+    // controller by the outbound-targets ACL and withheld entirely for a blocked
+    // target, so an endpoint typed here used to look identical whether or not anything
+    // ever received it. This reads back what this machine's last poll handed over.
+    function directDeliveryLine(peer) {
+      const at = (peer.endpoints_delivered_at || "").replace("T", " ").slice(0, 19);
+      if (!at) {
+        return '<span style="color:#7a1b12">This machine has not polled the management API since the server started, so it has <b>not been told</b> about any direct endpoint. Direct access needs a working <code>api-server</code> on the client.</span>';
+      }
+      if (!peer.endpoints_delivered) {
+        return `<span style="color:#6b5200">Polled at ${escapeHtml(at)} and was given <b>no direct endpoint</b> &mdash; as a controller it will hole-punch / relay to every target. (Endpoints are only sent for targets it is allowed to reach.)</span>`;
+      }
+      return `<span style="color:#1a7a34">Handed <b>${peer.endpoints_delivered} direct endpoint${peer.endpoints_delivered === 1 ? "" : "s"}</b> on its last poll at ${escapeHtml(at)}, so this machine can dial those targets without the relay.</span>`;
     }
 
     function badge(value) {
       const label = value || "unknown";
-      return `<span class="badge ${escapeAttr(label)}">${escapeHtml(label)}</span>`;
+      return `<span class="badge ${cssToken(label)}">${escapeHtml(label)}</span>`;
     }
 
     // Default hover text for the standard tri-state (bool) options, so every
@@ -2768,7 +2898,22 @@
       }[ch]));
     }
 
+    // escapeHtml already escapes both quote characters, so it IS attribute-safe. This
+    // wrapper exists for readability at attribute call sites -- and must do nothing
+    // else: it used to also lower-case and slug its input, which silently corrupted
+    // every CASE-SENSITIVE value passed through it. The one that mattered was
+    // data-claim-approve="<device key id>": the dashboard then asked the server to
+    // approve "evudkktkksqoqp0f" instead of "eVudkkTkKsqoQp0F" and got back "no such
+    // pending device-key claim", i.e. a device-key claim could not be approved from
+    // the dashboard at all. It went unnoticed because peer ids are digits, where
+    // lower-casing is a no-op. Tooltip text built with it came out slugged too.
     function escapeAttr(value) {
+      return escapeHtml(value);
+    }
+
+    // The slug form, for the ONE place that wants it: a CSS class derived from a label
+    // ("Allowed" -> .allowed). Never use this for a value the server will read back.
+    function cssToken(value) {
       return escapeHtml(value).replace(/\s+/g, "-").toLowerCase();
     }
 
@@ -3117,6 +3262,14 @@
       ["enable-privacy-mode", "Privacy mode", "bool", null, "Allow blanking the remote monitor so bystanders can't watch (needs supported graphics hardware)."],
       ["image_quality", "Image quality", "select", [["","Local","Use the client default."],["best","Best","Sharpest image, higher bandwidth/latency."],["balanced","Balanced","Middle ground between sharpness and speed."],["low","Reaction time","Lowest latency for fast interaction (recommended for control)."]], "Trade-off between picture sharpness and responsiveness of the stream."],
       ["nemo-permanent-password", "Incoming access password", "password", null, "Sets a fixed password the client requires for incoming connections. Leave blank to keep the client's own password."],
+      // The LISTENING side of a direct connection. Setting a peer's "Reachable at"
+      // already switches its direct-access server on, but that server listens on 21118
+      // unless this says otherwise — and the endpoint's port is the ROUTER's external
+      // port, which a forward may translate (31118 -> 21118). The peer panel told
+      // operators to "set direct-access-port in the device policy", and until now the
+      // dashboard had nowhere to set it: the whole direct path was unreachable from the
+      // GUI whenever the machine could not use 21118 (e.g. something else holds it).
+      ["direct-access-port", "Direct access port (listening side)", "text", null, "The port this machine's direct-access server listens on. Blank = 21118. This is the port INSIDE the network; the port in 'Reachable at' is the router's external one, which a port forward may translate."],
     ];
 
     // A policy control WITHOUT a global id (multiple named-policy blocks render at
@@ -3433,14 +3586,14 @@
             <td>${escapeHtml(c.nat_type || "")}</td>
             <td>${formatSeen(c.age_ms)}</td>
             <td>${c.negotiations}</td>
-            <td><button class="conn-cut danger" data-target="${escapeHtml(c.target_id)}" data-source="${escapeHtml(c.source_id)}" title="Block the target so it stops accepting new connections">Cut</button></td>
+            <td><button class="conn-cut danger" data-target="${escapeHtml(c.target_id)}" data-source="${escapeHtml(c.source_id)}" title="End the sessions this machine currently has. Does not block it.">Cut</button></td>
           </tr>
         `).join("");
         body.querySelectorAll(".conn-cut").forEach((btn) => {
           btn.addEventListener("click", async (e) => {
             const target = e.target.dataset.target;
             const source = e.target.dataset.source || "";
-            if (!confirm(`Cut connections to ${target}?\n\nThis blocks the target peer so it stops accepting new connections, AND revokes the sessions it already has: the machine closes them itself on its next managed-policy poll, so expect them to drop within ~30 seconds rather than instantly. You can allow it again from the Peers tab.`)) return;
+            if (!confirm(`Cut the sessions of ${target}?\n\nThis revokes the sessions the machine currently has: it closes them itself on its next managed-policy poll, so expect them to drop within ~30 seconds rather than instantly.\n\nIt does NOT block the peer \u2014 it stays allowed and can be connected to again straight away. To lock it out, use Block in the Peers panel.`)) return;
             try {
               await api("/nemo/api/connections/cut", { method: "POST", body: JSON.stringify({ target_id: target, source_id: source }) });
               loadConnections();

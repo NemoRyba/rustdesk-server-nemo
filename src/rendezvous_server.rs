@@ -2145,6 +2145,14 @@ impl RendezvousServer {
                                             &who.device_pub_b64
                                                 [..who.device_pub_b64.len().min(12)]
                                         );
+                                        // TODO 23: the dashboard's key column was fed
+                                        // only by the management poll, so a machine that
+                                        // had just proved its key here still read
+                                        // "provisioned, not polled". Record the proof
+                                        // where it happens.
+                                        crate::nemo_management::record_peer_device_key_rendezvous(
+                                            &who.peer_id,
+                                        );
                                         authed = Some(who);
                                     }
                                     Err(err) => {

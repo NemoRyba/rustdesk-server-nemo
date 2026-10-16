@@ -474,6 +474,77 @@ fn peer_auth_mode(id: &str) -> String {
         .unwrap_or_else(|| "unknown".to_owned())
 }
 
+// TODO 23: when each peer last proved its device key on the RENDEZVOUS handshake.
+//
+// `auth_mode` above is written only by the management poll, so a machine that is online,
+// allowed and relaying -- having proved its pinned key seconds earlier -- showed up as
+// "provisioned, not polled", which reads as a server fault and is not one. The two
+// proofs are kept apart rather than merged: the handshake proves the KEY (more strongly,
+// in fact -- it signs a fresh server nonce instead of a timestamp), while the poll is
+// what delivers policy. An operator needs to see both, because "key fine, never polls"
+// is a real and separate condition with its own cause (no api-server on the client).
+static PEER_DEVICE_KEY_RENDEZVOUS: Lazy<std::sync::RwLock<HashMap<String, String>>> =
+    Lazy::new(|| std::sync::RwLock::new(HashMap::new()));
+
+/// Called from the rendezvous handshake once a device signature has verified against the
+/// peer id in its own signed payload (`nemo_client_auth_open`), i.e. never on an
+/// unproven id.
+pub(crate) fn record_peer_device_key_rendezvous(id: &str) {
+    if id.is_empty() {
+        return;
+    }
+    let at = now_iso();
+    let mut map = PEER_DEVICE_KEY_RENDEZVOUS.write().unwrap();
+    evict_one_if_full(&mut map, id);
+    map.insert(id.to_owned(), at);
+}
+
+fn peer_device_key_proved_at(id: &str) -> String {
+    PEER_DEVICE_KEY_RENDEZVOUS
+        .read()
+        .unwrap()
+        .get(id)
+        .cloned()
+        .unwrap_or_default()
+}
+
+// What each CONTROLLER was last handed in `nemo-direct-endpoints`: "<count> <iso>".
+// Configuring a port forward and a controller being able to use it are two separate
+// facts -- the map is filtered per controller by the outbound-targets ACL and dropped
+// for a blocked target -- and only the first one used to be visible anywhere.
+static PEER_ENDPOINTS_DELIVERED: Lazy<std::sync::RwLock<HashMap<String, String>>> =
+    Lazy::new(|| std::sync::RwLock::new(HashMap::new()));
+
+fn record_peer_endpoints_delivered(id: &str, endpoints: &str) {
+    if id.is_empty() {
+        return;
+    }
+    let count = if endpoints.trim().is_empty() {
+        0
+    } else {
+        endpoints.split(';').filter(|e| !e.trim().is_empty()).count()
+    };
+    let mut map = PEER_ENDPOINTS_DELIVERED.write().unwrap();
+    evict_one_if_full(&mut map, id);
+    map.insert(id.to_owned(), format!("{} {}", count, now_iso()));
+}
+
+/// `(entries, when)` from the last poll, or `(0, "")` if this id has not polled since
+/// the server started. Zero entries with a timestamp is itself an answer: the client
+/// polled and was given no endpoint at all.
+fn peer_endpoints_delivered(id: &str) -> (usize, String) {
+    let raw = PEER_ENDPOINTS_DELIVERED
+        .read()
+        .unwrap()
+        .get(id)
+        .cloned()
+        .unwrap_or_default();
+    match raw.split_once(' ') {
+        Some((count, at)) => (count.parse().unwrap_or(0), at.to_owned()),
+        None => (0, String::new()),
+    }
+}
+
 #[derive(Clone)]
 struct HbbsApiState {
     pm: PeerMap,
@@ -502,6 +573,12 @@ struct NemoStatsStore {
     connections: Vec<ConnectionRecord>,
     // TODO 7: relayed sessions, live and recently ended, as hbbr measures them.
     relay_sessions: Vec<RelaySessionRecord>,
+    // TODO 24: the relay-metrics poller's OWN state. A session row with no samples
+    // means "hbbr told us nothing about it", which is evidence that the two machines
+    // went direct only if hbbr is actually answering. Without this the panel labelled
+    // every row "unused — went direct" whenever the poller could not reach the relay
+    // at all, i.e. invented good news out of missing data.
+    relay_poller: RelayPollerHealth,
 }
 
 // Connection history is retained by COUNT (the most-recent N negotiations), not
@@ -736,6 +813,12 @@ struct PeerResponse {
     stats: NemoPeerStats,
     // S-DUALKEY: which key this peer used on its last poll — "device-key" / "default".
     auth_mode: String,
+    // TODO 23: when it last proved that key on the rendezvous handshake (ISO, empty =
+    // never since this server started). Kept separate from auth_mode on purpose: this
+    // says the KEY is good, auth_mode says a POLL arrived, and a machine can have the
+    // first without the second (no api-server configured) — which is precisely the
+    // state the dashboard used to describe as "provisioned, not polled".
+    device_key_proved_at: String,
     // M1-CLAIM: provisioning state read from the PINNED REGISTRY rather than from the
     // last poll, so unlike auth_mode above it survives a server restart: a machine that
     // has a key bound to it is provisioned even if it has not polled since boot.
@@ -754,6 +837,12 @@ struct PeerResponse {
     // Where controllers may reach this workstation without the relay, as the operator
     // configured it ("host:port[,knockport]"). Empty => hole punch / relay only.
     direct_endpoint: String,
+    // How many direct endpoints THIS machine was handed on its last management poll,
+    // and when. The other half of the direct-access question: `direct_endpoint` says
+    // where this machine can be reached, these say whether it (as a controller) was
+    // actually told where to reach anything.
+    endpoints_delivered: usize,
+    endpoints_delivered_at: String,
 }
 
 #[derive(Serialize)]
@@ -873,6 +962,9 @@ struct StatsPeerResponse {
 struct StatsResponse {
     // TODO 7: live and recent relayed sessions with their byte counts.
     relay_sessions: Vec<RelaySessionRecord>,
+    // TODO 24: whether those counts can be believed. Without it the dashboard cannot
+    // tell "the relay carried nothing" from "the relay never told us anything".
+    relay_poller: RelayPollerHealth,
     company_only: bool,
     totals: NemoTotals,
     peers: Vec<StatsPeerResponse>,
@@ -4398,31 +4490,58 @@ async fn cut_connection(
     Json(req): Json<CutConnectionRequest>,
 ) -> ApiResult<PeerPolicyResponse> {
     require_auth(&headers, &state.token)?;
-    // Two levers, both needed:
-    //   1. block the target so it stops accepting NEW connections, and
-    //   2. issue a session revocation it will honour on its next management poll.
-    // (2) is what actually ends a session already in progress. A direct session has
-    // no server-side data path to interrupt, so the teardown has to be performed by
-    // the controlled machine itself -- which is the right place anyway, since that is
-    // the asset the operator owns and the controller cannot veto it.
-    let resp = set_peer_policy(&state.pm, &req.target_id, Some(0)).await?;
+    // TODO 25: cut ENDS the live sessions, and changes nothing else.
+    //
+    // It used to also write status=0, i.e. BLOCK the target. So an operator who cut one
+    // screen-share found the machine locked out of the fleet afterwards and had to go
+    // and allow it again -- a permanent admission change for what reads as "hang up
+    // this call". Admission stays the separate, explicit Block action the Peers panel
+    // already has; an operator who wants both presses both.
+    //
+    // The lever that actually ends a session in progress is the revocation below: a
+    // direct session has no server-side data path to interrupt, so the teardown is
+    // performed by the controlled machine on its next management poll -- which is the
+    // right place anyway, since that is the asset the operator owns and the controller
+    // cannot veto it.
+    //
+    // The peer is looked up first so an unknown id still answers 404 (the contract the
+    // dashboard and the API reference describe) instead of silently writing a
+    // revocation for an id that was never registered.
+    if state
+        .pm
+        .get_registered(&req.target_id)
+        .await
+        .map_err(server_error)?
+        .is_none()
+    {
+        return Err(api_error(StatusCode::NOT_FOUND, "peer not found"));
+    }
     let terminate_ts = set_peer_terminate(&req.target_id);
     {
         let mut store = STATS.write().await;
         store.connections.retain(|c| c.target_id != req.target_id);
         let detail = match &req.source_id {
             Some(s) => format!(
-                "blocked target {} (source {}) from dashboard; sessions revoked as of {}",
+                "cut sessions of target {} (source {}) from dashboard; revoked as of {} \
+                 (admission unchanged)",
                 req.target_id, s, terminate_ts
             ),
             None => format!(
-                "blocked target {} from dashboard; sessions revoked as of {}",
+                "cut sessions of target {} from dashboard; revoked as of {} \
+                 (admission unchanged)",
                 req.target_id, terminate_ts
             ),
         };
         record_event_locked(&mut store, "connection-cut", Some(&req.target_id), None, detail);
     }
-    Ok(resp)
+    // The peer's policy, UNCHANGED -- so the dashboard's peer row does not flip to
+    // "blocked" after a cut.
+    let status = state
+        .pm
+        .peer_status(&req.target_id)
+        .await
+        .map_err(server_error)?;
+    Ok(Json(peer_policy_response(req.target_id.clone(), status)))
 }
 
 pub(crate) fn company_only() -> bool {
@@ -4950,6 +5069,34 @@ pub(crate) struct RelaySessionRecord {
     live: bool,
 }
 
+/// TODO 24: whether the relay's own counters are reaching us, so the dashboard can tell
+/// "the relay carried nothing for this session" apart from "we have no idea what the
+/// relay did". They are not the same statement, and only the first one means the two
+/// machines went direct.
+#[derive(Clone, Default, Serialize)]
+pub(crate) struct RelayPollerHealth {
+    /// False when `--nemo-relay-metrics ""` turned measurement off. The panel must then
+    /// make no claim about paths at all.
+    enabled: bool,
+    /// Where it polls (`host:port` of hbbr's admin channel), so the operator can see
+    /// which relay the verdict is about.
+    target: String,
+    /// Last time hbbr answered. `None` while `enabled` = it has never answered since
+    /// this server started -- exactly the case that produced the false "went direct".
+    last_success_at: Option<String>,
+    /// Why the most recent attempt failed, and when. Kept after a later success too, as
+    /// the record of a flapping relay channel.
+    last_error: Option<String>,
+    last_error_at: Option<String>,
+}
+
+/// True only when hbbr's counters are known to be arriving: measurement is on AND the
+/// relay has answered at least once. Everything the dashboard says about a session
+/// having gone direct is conditional on this.
+fn relay_measurement_trusted(health: &RelayPollerHealth) -> bool {
+    health.enabled && health.last_success_at.is_some()
+}
+
 /// What hbbr's `uj` command reports per session.
 #[derive(Deserialize)]
 struct RelayUsageSample {
@@ -5083,6 +5230,16 @@ pub(crate) fn spawn_relay_usage_poller() {
     let addr = addr.trim().to_owned();
     if addr.is_empty() || is_truthy_off(&addr) {
         log::info!("Nemo relay byte metrics disabled (--nemo-relay-metrics)");
+        // TODO 24: record that it is OFF rather than leaving the default, so the panel
+        // says "not measured" instead of letting every row read as "went direct".
+        tokio::spawn(async move {
+            let mut store = STATS.write().await;
+            store.relay_poller = RelayPollerHealth {
+                enabled: false,
+                target: String::new(),
+                ..Default::default()
+            };
+        });
         return;
     }
     let interval = get_arg("nemo-relay-metrics-interval")
@@ -5095,6 +5252,13 @@ pub(crate) fn spawn_relay_usage_poller() {
         interval
     );
     tokio::spawn(async move {
+        {
+            // TODO 24: publish the target before the first attempt, so a dashboard
+            // opened in the first few seconds already names the relay it is waiting on.
+            let mut store = STATS.write().await;
+            store.relay_poller.enabled = true;
+            store.relay_poller.target = addr.clone();
+        }
         // One warning per outage, not one every interval: hbbr not being there (a
         // relay on another host, or simply not started yet) must not fill the log.
         let mut complained = false;
@@ -5108,8 +5272,14 @@ pub(crate) fn spawn_relay_usage_poller() {
                     let at = now_iso();
                     let mut store = STATS.write().await;
                     apply_relay_usage(&mut store, samples, &at);
+                    store.relay_poller.last_success_at = Some(at);
                 }
                 Err(err) => {
+                    {
+                        let mut store = STATS.write().await;
+                        store.relay_poller.last_error = Some(err.to_string());
+                        store.relay_poller.last_error_at = Some(now_iso());
+                    }
                     if !complained {
                         log::warn!(
                             "Nemo relay byte metrics: cannot read hbbr usage from {} ({}). \
@@ -5690,6 +5860,20 @@ async fn client_policy(
             .options
             .insert(OPTION_NEMO_DIRECT_ENDPOINTS.to_owned(), endpoints);
     }
+    // Record what this poll actually HANDED OVER. Configuring a port forward in the
+    // dashboard and the controller being able to use it are two different facts, and
+    // until now only the first was visible: an endpoint typed into the peer's row looked
+    // identical whether or not any controller ever received it (it is filtered per
+    // controller by the outbound-targets ACL, and dropped entirely for a blocked
+    // target). The peers panel reads this back as "endpoints delivered to this client".
+    record_peer_endpoints_delivered(
+        &peer.id,
+        policy
+            .options
+            .get(OPTION_NEMO_DIRECT_ENDPOINTS)
+            .map(|s| s.as_str())
+            .unwrap_or(""),
+    );
     // The other half of a direct endpoint is a listener on the far side. Configuring an
     // endpoint for a machine IS the instruction to make it reachable, so turn its direct
     // access server on rather than leaving the operator to discover, after every attempt
@@ -5705,6 +5889,25 @@ async fn client_policy(
             .options
             .entry("direct-server".to_owned())
             .or_insert_with(|| "Y".to_owned());
+        // ...and the port that listener binds, when the machine's own device policy
+        // names one. `direct-access-port` is a property of the MACHINE (where its
+        // listener sits behind the forward), not of whoever is signed in on it, but a
+        // logged-in user's policy REPLACES the device policy wholesale — so a machine
+        // reachable at :21218 silently fell back to listening on 21118 the moment
+        // someone signed in, and every direct connection to it then failed. Injected
+        // here for the same reason `direct-server` above is: the endpoint is the
+        // operator's instruction to make this machine reachable, and it has to survive
+        // the policy that happens to be in force.
+        if let Some(dp) = integration::device_policy(&peer.id) {
+            if let Some(port) = dp.options.get("direct-access-port") {
+                if !port.trim().is_empty() {
+                    policy
+                        .options
+                        .entry("direct-access-port".to_owned())
+                        .or_insert_with(|| port.trim().to_owned());
+                }
+            }
+        }
     }
     if matches!(peer.status, Some(0)) {
         policy.allow_user_override = false;
@@ -6043,6 +6246,7 @@ async fn get_stats(
         company_only: company_only(),
         totals: store.totals.clone(),
         relay_sessions,
+        relay_poller: store.relay_poller.clone(),
         peers,
     }))
 }
@@ -6130,6 +6334,7 @@ async fn peer_response(pm: &PeerMap, peer: RegisteredPeer) -> PeerResponse {
     // M1-CLAIM: both come from the pinned registry, not from runtime state.
     let device_key = integration::device_key_for_peer(&peer.id);
     let pending = integration::pending_claim_for_peer(&peer.id);
+    let delivered = peer_endpoints_delivered(&peer.id);
     PeerResponse {
         id: peer.id.clone(),
         hostname: peer_hostname(&peer.id),
@@ -6150,6 +6355,7 @@ async fn peer_response(pm: &PeerMap, peer: RegisteredPeer) -> PeerResponse {
         online: runtime.as_ref().map(|snapshot| snapshot.online).unwrap_or(false),
         last_seen_ms_ago: runtime.and_then(|snapshot| snapshot.last_seen_ms_ago),
         auth_mode: peer_auth_mode(&peer.id),
+        device_key_proved_at: peer_device_key_proved_at(&peer.id),
         provisioned: device_key.is_some(),
         device_key_id: device_key.as_ref().map(|k| k.id.clone()).unwrap_or_default(),
         device_key_label: device_key.as_ref().map(|k| k.label.clone()).unwrap_or_default(),
@@ -6171,6 +6377,8 @@ async fn peer_response(pm: &PeerMap, peer: RegisteredPeer) -> PeerResponse {
         pending_claim_via: pending.as_ref().map(|c| c.via.clone()).unwrap_or_default(),
         pending_claim_denied: pending.as_ref().map(|c| c.denied).unwrap_or(false),
         direct_endpoint: peer_endpoint(&peer.id),
+        endpoints_delivered: delivered.0,
+        endpoints_delivered_at: delivered.1,
         stats: peer_stats(&peer.id).await,
     }
 }
@@ -8153,6 +8361,236 @@ mod tests {
             stamped > 0,
             "a zero stamp is the 'nothing revoked' sentinel the client ignores"
         );
+    }
+
+    /// TODO 25: "cut" ends the sessions a machine currently has. It must NOT change
+    /// admission -- it used to write status=0 as well, so an operator who cut one
+    /// screen-share found the machine BLOCKED afterwards and had to go and allow it
+    /// again. Admission is the separate Block action; this test is what keeps the two
+    /// levers apart.
+    #[test]
+    fn cutting_a_connection_revokes_sessions_and_leaves_admission_alone() {
+        run_cutting_a_connection_revokes_sessions_and_leaves_admission_alone();
+    }
+    #[tokio::main(flavor = "current_thread")]
+    async fn run_cutting_a_connection_revokes_sessions_and_leaves_admission_alone() {
+        let db = format!("target/nemo_cut_test_{}.sqlite3", std::process::id());
+        let _ = std::fs::create_dir_all("target");
+        for suffix in ["", "-wal", "-shm", "-journal"] {
+            let _ = std::fs::remove_file(format!("{}{}", db, suffix));
+        }
+        let mut pm = PeerMap::new_for_test(&db).await.expect("test db");
+        let id = "cut-test-peer";
+        let peer = pm.get_or(id).await;
+        pm.update_pk(
+            id.to_owned(),
+            peer,
+            "203.0.113.9:21116".parse().expect("addr"),
+            hbb_common::bytes::Bytes::from_static(b"cut-uuid"),
+            hbb_common::bytes::Bytes::from_static(b"cut-pk"),
+            "203.0.113.9".to_owned(),
+        )
+        .await;
+        pm.set_peer_status(id, Some(1), None).await.expect("allow");
+
+        let (login_enc_pk, login_enc_sk) = box_::gen_keypair();
+        let state = HbbsApiState {
+            pm: pm.clone(),
+            token: Some("cut-test-token".to_owned()),
+            server_public_key: String::new(),
+            server_secret_key: None,
+            login_enc_pk,
+            login_enc_sk,
+        };
+        // The route is admin-authenticated; a tokenless call is a 401 before anything
+        // else, which is the behaviour the rest of the panel relies on.
+        let mut auth = HeaderMap::new();
+        auth.insert(
+            AUTHORIZATION,
+            "Bearer cut-test-token".parse().expect("header"),
+        );
+        {
+            let now = std::time::Instant::now();
+            let mut store = STATS.write().await;
+            store.connections.push(ConnectionRecord {
+                source_id: "cut-test-controller".to_owned(),
+                target_id: id.to_owned(),
+                source_addr: "203.0.113.1:50000".to_owned(),
+                target_addr: "203.0.113.9:21116".to_owned(),
+                path: "relay".to_owned(),
+                relay_server: "192.0.2.1".to_owned(),
+                nat_type: "SYMMETRIC".to_owned(),
+                first_seen: now,
+                last_seen: now,
+                negotiations: 1,
+            });
+        }
+
+        let before = peer_terminate_before(id);
+        let resp = match cut_connection(
+            Extension(state.clone()),
+            auth.clone(),
+            Json(CutConnectionRequest {
+                target_id: id.to_owned(),
+                source_id: Some("cut-test-controller".to_owned()),
+            }),
+        )
+        .await
+        {
+            Ok(resp) => resp,
+            Err((code, Json(err))) => panic!("cut failed: {} {}", code, err.error),
+        };
+
+        // The sessions in progress are revoked -- this stamp is what the controlled
+        // machine reads in its next poll and acts on.
+        assert!(
+            peer_terminate_before(id) >= before && peer_terminate_before(id) > 0,
+            "cut must stamp a session revocation, or nothing actually ends"
+        );
+        // ...and the peer is still allowed, in the database AND in what the dashboard
+        // is told, so its row does not flip to "blocked" after a cut.
+        assert_eq!(
+            pm.peer_status(id).await.expect("status"),
+            Some(1),
+            "cut must not change admission"
+        );
+        assert_eq!(resp.0.policy, "allowed");
+        assert!(resp.0.allowed_for_control);
+        // The live connection row is dropped so the panel does not keep showing it.
+        assert!(
+            !STATS
+                .read()
+                .await
+                .connections
+                .iter()
+                .any(|c| c.target_id == id),
+            "the cut connection must leave the Connections panel"
+        );
+        // The audit line must not promise a block any more, or the log disagrees with
+        // what the server did.
+        {
+            let store = STATS.read().await;
+            let cut_event = store
+                .events
+                .iter()
+                .rev()
+                .find(|e| e.kind == "connection-cut" && e.peer_id.as_deref() == Some(id))
+                .expect("a cut is audited");
+            assert!(
+                !cut_event.detail.contains("blocked"),
+                "audit said {:?}",
+                cut_event.detail
+            );
+            assert!(cut_event.detail.contains("admission unchanged"));
+        }
+
+        // An id that was never registered is still a 404 rather than a silent
+        // revocation written against an unknown name.
+        let cut_unknown = cut_connection(
+            Extension(state),
+            auth,
+            Json(CutConnectionRequest {
+                target_id: "cut-test-no-such-peer".to_owned(),
+                source_id: None,
+            }),
+        )
+        .await;
+        let Err((code, _)) = cut_unknown else {
+            panic!("an unregistered id must not be cuttable");
+        };
+        assert_eq!(code, StatusCode::NOT_FOUND);
+
+        for suffix in ["", "-wal", "-shm", "-journal"] {
+            let _ = std::fs::remove_file(format!("{}{}", db, suffix));
+        }
+    }
+
+    /// TODO 24: "unused — went direct" is a verdict made out of the ABSENCE of relay
+    /// samples, so it is only a verdict while the relay is actually reporting. With
+    /// hbbs and hbbr in separate containers the poller never got through and EVERY row
+    /// read "went direct" with a `0 B relayed` header -- a dashboard inventing good
+    /// news from missing data. The trust rule lives here; the dashboard asks for it
+    /// before it labels anything.
+    #[test]
+    fn a_session_cannot_be_called_direct_unless_the_relay_is_reporting() {
+        // Measurement off: no claim either way.
+        let off = RelayPollerHealth::default();
+        assert!(!relay_measurement_trusted(&off));
+        // On, but hbbr has never answered: exactly the container case.
+        let blind = RelayPollerHealth {
+            enabled: true,
+            target: "127.0.0.1:21117".to_owned(),
+            last_error: Some("connection refused".to_owned()),
+            last_error_at: Some("2026-10-16T12:00:00Z".to_owned()),
+            last_success_at: None,
+        };
+        assert!(!relay_measurement_trusted(&blind));
+        // Answered at least once: now an empty session row really does mean direct.
+        let good = RelayPollerHealth {
+            last_success_at: Some("2026-10-16T12:00:01Z".to_owned()),
+            ..blind
+        };
+        assert!(relay_measurement_trusted(&good));
+
+        // And the dashboard must consult it rather than reading last_sample_at alone.
+        let html = include_str!("nemo_admin.html");
+        assert!(html.contains("function relayMeasurementTrusted()"));
+        assert!(html.contains("no data from the relay"));
+        assert!(
+            html.contains("} else if (trusted) {"),
+            "the 'went direct' branch must be gated on the poller being known-good"
+        );
+    }
+
+    /// The dashboard's attribute escaper must not CHANGE the value it escapes.
+    ///
+    /// It used to lower-case and slug its input, which corrupted every case-sensitive
+    /// value that went through it. The one that mattered: a device key's id travels to
+    /// the Approve button as `data-claim-approve`, so the dashboard asked the server to
+    /// approve `evudkktkksqoqp0f` when the key was `eVudkkTkKsqoQp0F` and got back "no
+    /// such pending device-key claim" — a claim could not be approved from the
+    /// dashboard at all, which is the one step the whole provisioning flow waits on.
+    /// It hid for so long because peer ids are digits, where lower-casing is a no-op.
+    #[test]
+    fn the_dashboard_escaper_does_not_rewrite_the_values_it_escapes() {
+        let html = include_str!("nemo_admin.html");
+        let body = html
+            .split_once("function escapeAttr(value) {")
+            .expect("escapeAttr exists")
+            .1
+            .split_once('}')
+            .expect("escapeAttr body")
+            .0;
+        assert!(
+            !body.contains("toLowerCase") && !body.contains("replace("),
+            "escapeAttr must only escape; it rewrote the value: {:?}",
+            body
+        );
+        // The slug form still exists for the one thing that wants it: a CSS class.
+        assert!(html.contains("function cssToken(value)"));
+        assert!(html.contains("class=\"badge ${cssToken(label)}\""));
+        // And the id the server reads back is escaped, not slugged.
+        assert!(html.contains("data-claim-approve=\"${escapeAttr(c.key_id)}\""));
+    }
+
+    /// The other half of the direct-access question. An endpoint typed into a peer's
+    /// row used to look identical whether or not any controller ever received it: the
+    /// map is filtered per controller by the outbound-targets ACL and dropped entirely
+    /// for a blocked target. This records what each poll actually handed over.
+    #[test]
+    fn the_peers_panel_can_show_which_endpoints_a_client_was_handed() {
+        let id = "endpoint-delivery-test-peer";
+        assert_eq!(peer_endpoints_delivered(id), (0, String::new()));
+        record_peer_endpoints_delivered(id, "200,10.0.0.5:21118;300,10.0.0.6:21118,62201");
+        let (count, at) = peer_endpoints_delivered(id);
+        assert_eq!(count, 2);
+        assert!(!at.is_empty(), "a delivery has to carry when it happened");
+        // A client that polled and was given nothing is NOT the same as one that never
+        // polled: zero with a timestamp is itself the answer "told about no endpoint".
+        record_peer_endpoints_delivered(id, "");
+        let (count, at) = peer_endpoints_delivered(id);
+        assert_eq!(count, 0);
+        assert!(!at.is_empty());
     }
 
     #[test]
