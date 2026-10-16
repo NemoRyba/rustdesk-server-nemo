@@ -948,11 +948,11 @@
           </div>
           <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
             <input id="deviceKeyLabel" type="text" placeholder="label (e.g. Reception-PC)" style="min-width:220px;">
-            <input id="deviceKeyPeerId" list="deviceKeyPeerList" type="text" placeholder="bind to TBFDesk ID — pick or type (empty = any client)" style="min-width:300px;">
+            <input id="deviceKeyPeerId" list="deviceKeyPeerList" type="text" placeholder="bind to TBFDesk ID — pick or type (can be filled in later)" style="min-width:300px;">
             <datalist id="deviceKeyPeerList"></datalist>
             <button id="generateDeviceKey">Generate device key</button>
           </div>
-          <div style="font-size:12px;opacity:0.7;line-height:1.4;max-width:900px;">Binding a key to one TBFDesk ID means it can only authenticate <b>that</b> client &mdash; a leaked key no longer works fleet-wide. Leave empty only for a legacy any-client key.</div>
+          <div style="font-size:12px;opacity:0.7;line-height:1.4;max-width:900px;">Binding a key to one TBFDesk ID means it can only authenticate <b>that</b> client &mdash; a leaked key no longer works fleet-wide. An <b>unbound</b> key authenticates <b>nothing</b>, so it is safe to generate one before you know the id and fill the id in afterwards: the <b>Bound to ID</b> field in the table below is editable. The id may be typed the way the client shows it (<span class="mono">456 456 456</span>); the spaces are stripped. <b>Where to find the id of a machine that has no key yet:</b> it is in the <b>Peers</b> panel as soon as the client comes up &mdash; registering there needs no device key &mdash; flagged <i>unverified &mdash; no device key</i>, with a button that mints a key already bound to it.</div>
           <div id="deviceKeyGenerated" style="display:none;"></div>
           <div class="table-wrap">
             <table>
@@ -1644,12 +1644,50 @@
         const body = $("deviceKeysBody");
         body.innerHTML = (keys || []).map((k) => `<tr>
           <td>${escapeHtml(k.label || "")}</td>
-          <td>${k.peer_id ? escapeHtml(k.peer_id) : '<span style="opacity:0.55;">any (unbound)</span>'}</td>
+          <td>
+            <div style="display:flex;gap:6px;align-items:center;">
+              <input type="text" class="mono" list="deviceKeyPeerList" data-devkey-id="${escapeHtml(k.id)}"
+                     value="${escapeHtml(k.peer_id || "")}" placeholder="— not bound —"
+                     style="min-width:150px;font-size:12px;">
+              <button data-devkey-bind="${escapeHtml(k.id)}">Save</button>
+            </div>
+            <div style="font-size:11px;margin-top:3px;opacity:0.7;" data-devkey-msg="${escapeHtml(k.id)}">${
+              k.peer_id
+                ? (k.claimed_at ? "claimed by this client on first use" : "bound by an operator")
+                : '<span style="color:#a33;">authenticates nothing until it is bound</span>'
+            }</div>
+          </td>
           <td class="mono" style="word-break:break-all;font-size:11px;">${escapeHtml(k.public_key || "")}</td>
           <td>${escapeHtml((k.created_at || "").replace("T", " ").slice(0, 19))}</td>
           <td><button class="danger" data-devkey-del="${escapeHtml(k.id)}">Delete</button></td>
         </tr>`).join("");
         $("deviceKeysEmpty").style.display = (keys && keys.length) ? "none" : "block";
+        // The id is typed, read off a client screen that groups it in threes, so the
+        // server strips the spaces — and the row shows back what it stored, which is
+        // how the operator sees that "456 456 456" landed as 456456456.
+        const bind = async (keyId) => {
+          const input = body.querySelector(`[data-devkey-id="${keyId}"]`);
+          const msg = body.querySelector(`[data-devkey-msg="${keyId}"]`);
+          try {
+            const r = await api("/nemo/api/device-keys/" + encodeURIComponent(keyId) + "/peer-id", {
+              method: "POST",
+              body: JSON.stringify({ peer_id: input.value })
+            });
+            input.value = r.peer_id || "";
+            if (msg) {
+              msg.innerHTML = r.peer_id
+                ? "Bound to " + escapeHtml(r.peer_id) + " — that client is now provisioned"
+                : '<span style="color:#a33;">Cleared — this key authenticates nothing</span>';
+            }
+            renderPeers();
+          } catch (err) {
+            if (msg) msg.innerHTML = '<span style="color:#a33;">' + escapeHtml(err.message) + "</span>";
+          }
+        };
+        body.querySelectorAll("[data-devkey-bind]").forEach((btn) => btn.addEventListener("click", () => bind(btn.dataset.devkeyBind)));
+        body.querySelectorAll("[data-devkey-id]").forEach((input) => input.addEventListener("keydown", (event) => {
+          if (event.key === "Enter") { event.preventDefault(); bind(input.dataset.devkeyId); }
+        }));
         body.querySelectorAll("[data-devkey-del]").forEach((btn) => btn.addEventListener("click", async () => {
           if (!confirm("Delete this device key? A client using it will be refused if 'require device key' is on.")) return;
           await api("/nemo/api/device-keys/" + encodeURIComponent(btn.dataset.devkeyDel) + "/delete", { method: "POST" });
@@ -1965,7 +2003,7 @@
           <td>${escapeHtml(peerAlias(peer))}</td>
           <td>${badge(peer.online ? "online" : "offline")}</td>
           <td>${badge(peer.policy)}</td>
-          <td>${peer.auth_mode === 'device-key' ? '<span style="color:#1a7a34;font-weight:600">device key</span>' : (peer.auth_mode === 'default' ? '<span style="color:#8a6d1a">server key only</span>' : '<span style="opacity:0.5">unknown</span>')}</td>
+          <td>${peer.provisioned ? (peer.auth_mode === 'device-key' ? '<span style="color:#1a7a34;font-weight:600">device key</span>' : (peer.auth_mode === 'default' ? '<span style="color:#8a6d1a">server key only</span>' : '<span style="opacity:0.6">key pinned, not polled yet</span>')) : '<span style="color:#a33;font-weight:600" title="No device key is pinned for this id. The machine is registered here but not provisioned: with \'require a provisioned device key\' on it cannot poll, log in or fetch an address book. Open it and use &quot;Create device key for this peer&quot;.">unverified &mdash; no device key</span>'}</td>
           <td>${((integ.devicePolicies || {})[peer.id]) ? escapeHtml(integ.devicePolicies[peer.id]) : '<span style="opacity:0.4">—</span>'}</td>
           <td class="mono">${peer.direct_endpoint ? `<span style="color:#1a7a34;font-weight:600">${escapeHtml(peer.direct_endpoint)}</span>` : '<span style="opacity:0.4">—</span>'}</td>
           <td class="mono">${escapeHtml(peer.registered_ip || "")}</td>
@@ -2101,6 +2139,9 @@
       detail.innerHTML = `
         <dl class="kv">
           <dt title="Which key this client used to authenticate its last policy poll: its own provisioned device key, or only the shared server key.">Key auth</dt><dd>${peer.auth_mode === 'device-key' ? '<span style="color:#1a7a34;font-weight:600">own device key</span>' : (peer.auth_mode === 'default' ? '<span style="color:#8a6d1a">server key only</span>' : '<span style="opacity:0.5">unknown</span>')}</dd>
+          <dt title="Whether a device key is pinned FOR this id. Known from the key registry, so it is true before the client ever polls and survives a restart — unlike 'Key auth', which reflects the last poll only.">Provisioned</dt><dd>${peer.provisioned
+            ? `<span style="color:#1a7a34;font-weight:600">yes</span> &middot; key <span class="mono">${escapeHtml(peer.device_key_id || "")}</span>${peer.device_key_label ? " (" + escapeHtml(peer.device_key_label) + ")" : ""}`
+            : `<span style="color:#a33;font-weight:600">no &mdash; unverified</span> <button id="createKeyForPeer" style="margin-left:8px;">Create device key for this peer</button>`}</dd>
           <dt>Local Addr</dt><dd>${stats.local_addr_attempts || 0}</dd>
           <dt>Relay Requests</dt><dd>${stats.relay_requests || 0}</dd>
           <dt>Relay Responses</dt><dd>${stats.relay_responses || 0}</dd>
@@ -2172,6 +2213,19 @@
         }
       };
       if (depSave) depSave.addEventListener("click", saveEndpoint);
+      // The provisioning loop, from the end the operator can actually start at: the
+      // machine is listed here as soon as it registers (that needs no device key), so
+      // its id can be read off this panel and a key minted for it in one step.
+      const ckp = $("createKeyForPeer");
+      if (ckp) ckp.addEventListener("click", () => {
+        const pid = $("deviceKeyPeerId");
+        if (pid) pid.value = peer.id;
+        const lbl = $("deviceKeyLabel");
+        if (lbl && !lbl.value) lbl.value = peer.hostname || "";
+        const panel = document.querySelector('.panel[data-panel-id="device-keys"]');
+        if (panel) panel.scrollIntoView({ behavior: "smooth", block: "start" });
+        if (lbl) lbl.focus();
+      });
       if (dep) dep.addEventListener("keydown", (event) => {
         if (event.key === "Enter") { event.preventDefault(); saveEndpoint(); }
       });

@@ -724,6 +724,15 @@ struct PeerResponse {
     stats: NemoPeerStats,
     // S-DUALKEY: which key this peer used on its last poll — "device-key" / "default".
     auth_mode: String,
+    /// Whether a device key is pinned FOR this peer, read from the registry rather than
+    /// from poll history: unlike `auth_mode` this is known before the peer ever polls
+    /// and survives a restart. False = the machine is registered at the rendezvous
+    /// server but not provisioned — the "unverified" state the dashboard flags, and the
+    /// moment at which its id can be read off the list and bound to a key.
+    provisioned: bool,
+    /// The id/label of that key, so the dashboard can link straight to its row.
+    device_key_id: String,
+    device_key_label: String,
     // Where controllers may reach this workstation without the relay, as the operator
     // configured it ("host:port[,knockport]"). Empty => hole punch / relay only.
     direct_endpoint: String,
@@ -1442,6 +1451,10 @@ pub(crate) async fn spawn_hbbs_api(
             get(list_device_keys).post(generate_device_key),
         )
         .route("/nemo/api/device-keys/:id/delete", post(delete_device_key))
+        .route(
+            "/nemo/api/device-keys/:id/peer-id",
+            post(set_device_key_peer_id_route),
+        )
         .route(
             "/nemo/api/policies",
             get(get_policies).put(put_policies),
@@ -2747,6 +2760,81 @@ async fn list_device_keys(
 ) -> ApiResult<Vec<integration::DeviceKey>> {
     require_auth(&headers, &state.token)?;
     Ok(Json(integration::list_device_keys()))
+}
+
+#[derive(Deserialize)]
+struct DeviceKeyPeerIdRequest {
+    /// The TBFDesk id to bind this key to. Empty clears the binding.
+    #[serde(default)]
+    peer_id: String,
+}
+
+/// Bind an existing device key to a peer id, or clear the binding.
+///
+/// This is the other half of the provisioning deadlock: a client shows no id until it
+/// is past the provisioning gate, so the operator cannot know the id when they
+/// generate the key. They read the id off the peers list (a client registers at the
+/// rendezvous server without needing a device key, so it is listed as soon as it comes
+/// up) and bind the key here afterwards.
+async fn set_device_key_peer_id_route(
+    Path(id): Path<String>,
+    Extension(state): Extension<HbbsApiState>,
+    headers: HeaderMap,
+    Json(req): Json<DeviceKeyPeerIdRequest>,
+) -> ApiResult<integration::DeviceKey> {
+    require_auth(&headers, &state.token)?;
+    let previous = integration::list_device_keys()
+        .into_iter()
+        .find(|k| k.id == id)
+        .map(|k| k.peer_id)
+        .unwrap_or_default();
+    let updated = integration::set_device_key_peer_id(&id, &req.peer_id)
+        .map_err(|reason| api_error(StatusCode::BAD_REQUEST, &reason))?;
+    // Moving a key off a peer revokes that peer's proof, so end what it is doing now
+    // rather than only its next login — the same rule as deleting the key (M69).
+    let mut ended = Vec::new();
+    if !previous.is_empty() && previous != updated.peer_id {
+        ended = terminate_sessions_from_controllers(&[previous.clone()], "device key rebound").await;
+    }
+    {
+        let mut store = STATS.write().await;
+        record_event_locked(
+            &mut store,
+            "device-key-binding",
+            if updated.peer_id.is_empty() {
+                None
+            } else {
+                Some(updated.peer_id.as_str())
+            },
+            None,
+            if updated.peer_id.is_empty() {
+                format!(
+                    "device key {} unbound (was {}); it now authenticates nothing until it is \
+                     bound again",
+                    updated.id,
+                    if previous.is_empty() { "unbound" } else { &previous }
+                )
+            } else if previous.is_empty() {
+                format!(
+                    "device key {} bound to peer {}",
+                    updated.id, updated.peer_id
+                )
+            } else {
+                format!(
+                    "device key {} rebound from peer {} to {}{}",
+                    updated.id,
+                    previous,
+                    updated.peer_id,
+                    if ended.is_empty() {
+                        String::new()
+                    } else {
+                        format!("; ended sessions on {}", ended.join(", "))
+                    }
+                )
+            },
+        );
+    }
+    Ok(Json(updated))
 }
 async fn delete_device_key(
     Path(id): Path<String>,
@@ -4894,6 +4982,7 @@ async fn set_peer_policy(
 
 async fn peer_response(pm: &PeerMap, peer: RegisteredPeer) -> PeerResponse {
     let runtime = pm.runtime_snapshot(&peer.id).await;
+    let provisioned_key = integration::device_key_for_peer(&peer.id);
     let info = serde_json::from_str::<PeerInfo>(&peer.info).unwrap_or_default();
     let status = runtime
         .as_ref()
@@ -4929,6 +5018,15 @@ async fn peer_response(pm: &PeerMap, peer: RegisteredPeer) -> PeerResponse {
         online: runtime.as_ref().map(|snapshot| snapshot.online).unwrap_or(false),
         last_seen_ms_ago: runtime.and_then(|snapshot| snapshot.last_seen_ms_ago),
         auth_mode: peer_auth_mode(&peer.id),
+        provisioned: provisioned_key.is_some(),
+        device_key_id: provisioned_key
+            .as_ref()
+            .map(|k| k.id.clone())
+            .unwrap_or_default(),
+        device_key_label: provisioned_key
+            .as_ref()
+            .map(|k| k.label.clone())
+            .unwrap_or_default(),
         direct_endpoint: peer_endpoint(&peer.id),
         stats: peer_stats(&peer.id).await,
     }

@@ -240,10 +240,14 @@ pub struct IntegrationConfig {
     /// The pending claim closes that loop — the client reports the id, the operator
     /// approves it — without ever letting the client decide its own trust.
     ///
-    /// ON by default. With it off, the old fail-closed rule stands (an unbound key
-    /// authenticates nothing, and no claim is even filed) and every key has to be
-    /// bound by hand.
-    #[serde(default = "default_true")]
+    /// **OFF until the confirm/deny flow is finished** (`DEVICE-KEY-CLAIM.md`). The
+    /// pending-claim half does not exist yet, so with this on, first use would *take*
+    /// the binding with nobody confirming it — the opposite of the requirement. Off
+    /// keeps the old fail-closed rule exactly: an unbound key authenticates nothing,
+    /// no claim is filed, and every key is bound by hand (the dashboard's editable
+    /// "Bound to ID" field). Flip the default back to `default_true` in the same change
+    /// that lands the pending claims, not before.
+    #[serde(default)]
     pub claim_unbound_device_keys: bool,
     /// M1-CLAIM: binding requests awaiting the operator's confirmation. Persisted, so
     /// a request filed overnight is still on the dashboard in the morning and a
@@ -347,7 +351,8 @@ impl Default for IntegrationConfig {
             strip_unsealed_secrets: true,
             require_sealed_login: true,
             require_sealed_request: false,
-            claim_unbound_device_keys: true,
+            // Off: see the field docs — the operator-confirmation half is unwritten.
+            claim_unbound_device_keys: false,
             pending_device_key_claims: Vec::new(),
         }
     }
@@ -993,7 +998,9 @@ pub fn add_device_key(
         label,
         public_key: public_key.clone(),
         created_at,
-        peer_id: peer_id.trim().to_owned(),
+        // Same operator-typed field as the editable one below, so the same rule:
+        // the grouped form the client displays is accepted.
+        peer_id: normalize_peer_id(&peer_id),
         claimed_at: String::new(),
     };
     // Re-adding the SAME public key replaces its entry (label/binding update);
@@ -1075,32 +1082,6 @@ pub fn device_key_binding(public_key: &str) -> Option<String> {
         .iter()
         .find(|k| k.public_key == pk)
         .map(|k| k.peer_id.clone())
-}
-/// TASK #14: the ONE binding rule both enforcement points apply (nemo_client_auth_open,
-/// verify_device_signature). A bound key authenticates exactly its peer; an UNBOUND key
-/// authenticates NOTHING unless --allow-unbound-device-keys is on, because the admin
-/// peer-id box is optional free text and "blank = any id" was a fleet-wide skeleton key.
-pub(crate) fn device_key_binding_check(
-    bound: &str,
-    claimed: &str,
-    allow_unbound: bool,
-) -> Result<(), String> {
-    if bound.is_empty() && allow_unbound {
-        return Ok(());
-    }
-    if bound.is_empty() {
-        return Err(format!(
-            "device key has no peer-id binding (client claims {}); bind it or pass --allow-unbound-device-keys Y",
-            claimed
-        ));
-    }
-    if bound != claimed {
-        return Err(format!(
-            "device key is bound to peer {} but the client claims {}",
-            bound, claimed
-        ));
-    }
-    Ok(())
 }
 /// TASK #14 escape hatch, read like insecure_ldap_allowed (CLI/.env only).
 pub(crate) fn allow_unbound_device_keys() -> bool {
@@ -1221,11 +1202,25 @@ pub fn claim_device_key(
     Ok(claimed)
 }
 
+/// Operator-typed peer ids: strip ALL whitespace, not just the ends.
+///
+/// The client shows its id grouped in threes ("456 456 456"), so that is what an
+/// operator reading it off a screen types or pastes — and `456 456 456` must mean the
+/// same thing as `456456456` rather than being refused as malformed. `is_whitespace`
+/// (not `== ' '`) so a non-breaking space pasted out of a GUI is handled too, which is
+/// the failure that would otherwise look like "the id I can see is rejected".
+///
+/// Only for ids a human enters. A client reports its own id programmatically and must
+/// keep matching byte-for-byte, so nothing on the request path normalizes.
+pub fn normalize_peer_id(raw: &str) -> String {
+    raw.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
 /// Peer ids are the client's own machine-derived id, and they end up in log lines,
 /// JSON and the dashboard, so keep them to the shape hbbs already accepts
-/// (`register_pk_core` refuses anything under 6 characters).
+/// (`register_pk_core` refuses anything under 6 characters). Expects an id that has
+/// already been through `normalize_peer_id`.
 pub fn valid_peer_id(id: &str) -> bool {
-    let id = id.trim();
     id.len() >= 6
         && id.len() <= 64
         && id
@@ -1240,7 +1235,9 @@ fn set_device_key_peer_id_in(
     id: &str,
     peer_id: &str,
 ) -> Result<DeviceKey, String> {
-    let peer_id = peer_id.trim();
+    // "456 456 456" is how the client displays the id, so accept it as 456456456.
+    let peer_id = normalize_peer_id(peer_id);
+    let peer_id = peer_id.as_str();
     if !peer_id.is_empty() && !valid_peer_id(peer_id) {
         return Err(
             "not a TBFDesk id: use 6-64 characters, letters, digits, '-' or '_' (empty clears \
@@ -2762,19 +2759,97 @@ mod tests {
     }
 
     // TASK #14: a bound key opens for exactly its peer; an UNBOUND key for nobody
-    // unless the escape hatch is on. The rule both enforcement points share.
+    // unless the escape hatch is on. The rule both enforcement points share, kept
+    // assertion-for-assertion from the `device_key_binding_check` this replaced, with
+    // claiming OFF — that is the shipped default while the confirm/deny half is
+    // unwritten (DEVICE-KEY-CLAIM.md), so "claim off" must stay byte-identical to the
+    // old rule.
     #[test]
-    fn device_key_binding_check_fails_closed_on_an_unbound_key() {
-        assert!(device_key_binding_check("peer-a", "peer-a", false).is_ok());
-        assert!(device_key_binding_check("peer-a", "peer-b", false).is_err());
-        assert!(device_key_binding_check("peer-a", "peer-b", true).is_err());
-        assert!(device_key_binding_check("", "peer-a", false).is_err());
-        assert!(device_key_binding_check("", "", false).is_err());
-        assert!(device_key_binding_check("", "peer-a", true).is_ok());
-        let err = device_key_binding_check("peer-a", "peer-b", false).unwrap_err();
+    fn device_key_binding_fails_closed_on_an_unbound_key() {
+        let decide = |bound, claimed, allow_unbound| {
+            device_key_binding_decision(bound, claimed, allow_unbound, false)
+        };
+        use BindingDecision::*;
+        assert_eq!(decide("peer-a", "peer-a", false), Proven);
+        assert!(matches!(decide("peer-a", "peer-b", false), Refused(_)));
+        assert!(matches!(decide("peer-a", "peer-b", true), Refused(_)));
+        assert!(matches!(decide("", "peer-a", false), Refused(_)));
+        assert!(matches!(decide("", "", false), Refused(_)));
+        assert_eq!(decide("", "peer-a", true), Proven);
+        let Refused(err) = decide("peer-a", "peer-b", false) else {
+            panic!("a key bound elsewhere must be refused");
+        };
         assert!(err.contains("bound to peer peer-a"), "{}", err);
-        let err = device_key_binding_check("", "peer-a", false).unwrap_err();
+        let Refused(err) = decide("", "peer-a", false) else {
+            panic!("an unbound key must be refused with claiming off");
+        };
         assert!(err.contains("allow-unbound-device-keys"), "{}", err);
+
+        // Claiming ON changes exactly one arm — the unbound one — and never turns a
+        // refusal for a DIFFERENT peer into an opening.
+        assert_eq!(
+            device_key_binding_decision("", "peer-a", false, true),
+            ClaimOnProof
+        );
+        assert!(matches!(
+            device_key_binding_decision("peer-a", "peer-b", false, true),
+            Refused(_)
+        ));
+        // The escape hatch keeps precedence, so an operator who asked for the loose
+        // rule does not silently get first-use binding instead.
+        assert_eq!(
+            device_key_binding_decision("", "peer-a", true, true),
+            Proven
+        );
+        // A client that claims no id at all cannot claim a key.
+        assert!(matches!(
+            device_key_binding_decision("", "", false, true),
+            Refused(_)
+        ));
+    }
+
+    // The operator types the id the client SHOWS, which is grouped in threes.
+    #[test]
+    fn a_grouped_peer_id_is_the_same_id() {
+        assert_eq!(normalize_peer_id("456 456 456"), "456456456");
+        assert_eq!(normalize_peer_id("  456456456  "), "456456456");
+        assert_eq!(normalize_peer_id("456\t456\n456"), "456456456");
+        // Non-breaking space, as pasted out of a GUI.
+        assert_eq!(normalize_peer_id("456\u{a0}456\u{a0}456"), "456456456");
+        assert!(valid_peer_id(&normalize_peer_id("456 456 456")));
+        // Normalising must not invent a valid id out of junk.
+        assert!(!valid_peer_id(&normalize_peer_id("12 34")));
+        assert!(!valid_peer_id(&normalize_peer_id("456 456 45!")));
+        assert!(!valid_peer_id(&normalize_peer_id("   ")));
+    }
+
+    // The editable "Bound to ID" field: it binds, it rebinds, it clears, it validates,
+    // and clearing re-arms the key rather than leaving a stale claim stamp.
+    #[test]
+    fn binding_a_key_by_hand_validates_and_normalises() {
+        let mut keys = vec![DeviceKey {
+            id: "k1".to_owned(),
+            label: "Reception".to_owned(),
+            public_key: "pk1".to_owned(),
+            created_at: String::new(),
+            peer_id: String::new(),
+            claimed_at: "2026-10-16T00:00:00Z".to_owned(),
+        }];
+        // Grouped input binds to the compact id.
+        let updated = set_device_key_peer_id_in(&mut keys, "k1", "456 456 456").unwrap();
+        assert_eq!(updated.peer_id, "456456456");
+        // An operator typing the id is not a first-use claim, so the stamp is cleared.
+        assert_eq!(updated.claimed_at, "");
+        // Junk is refused and leaves the stored binding alone.
+        let err = set_device_key_peer_id_in(&mut keys, "k1", "12 34").unwrap_err();
+        assert!(err.contains("not a TBFDesk id"), "{}", err);
+        assert_eq!(keys[0].peer_id, "456456456");
+        // Empty clears it.
+        assert_eq!(
+            set_device_key_peer_id_in(&mut keys, "k1", "  ").unwrap().peer_id,
+            ""
+        );
+        assert!(set_device_key_peer_id_in(&mut keys, "nope", "456456456").is_err());
     }
 
     // S-C: tls_verify=false is refused unless the loud override flag is set.
