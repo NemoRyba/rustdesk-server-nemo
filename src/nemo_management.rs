@@ -3460,9 +3460,15 @@ async fn set_device_key_peer_id(
     Json(req): Json<DeviceKeyPeerIdRequest>,
 ) -> ApiResult<integration::DeviceKey> {
     require_auth(&headers, &state.token)?;
-    let peer_id = req.peer_id.trim().to_owned();
-    let key = integration::set_device_key_peer_id(&id, &peer_id)
+    let key = integration::set_device_key_peer_id(&id, &req.peer_id)
         .map_err(|e| api_error(StatusCode::BAD_REQUEST, &e))?;
+    // Audit the id that was STORED, not the one that was typed: the operator may have
+    // entered it the way the client displays it ("456 456 456"), and
+    // `normalize_peer_id` strips that. Reporting the raw string would put a spaced id
+    // in the event line nobody can then grep for, and -- because the peer id argument
+    // creates the per-peer stats entry -- would also key that entry on an id no peer
+    // can ever have.
+    let peer_id = key.peer_id.clone();
     let mut store = STATS.write().await;
     record_event_locked(
         &mut store,
