@@ -2509,14 +2509,38 @@
         : "";
     }
 
-    function renderDetail() {
+    // The 5 s poll calls renderDetail(), which rebuilds this panel's innerHTML. That
+    // destroys any field being typed into - "Reachable at" is the one that hurts,
+    // because an endpoint takes longer to type than the refresh interval, so it could
+    // not be entered at all. Skip the rebuild while the panel is being edited; an
+    // explicit action (selecting another peer, saving) renders regardless.
+    //
+    // Tracked as well as focus-checked on purpose: typing and then clicking away moves
+    // focus out but the text is still unsaved, and wiping it there would be the same
+    // bug one step later.
+    let detailDirty = false;
+    // `input` covers typing; `change` also catches the selects and checkboxes in this
+    // panel, which some browsers do not fire `input` for.
+    $("detail").addEventListener("input", () => { detailDirty = true; });
+    $("detail").addEventListener("change", () => { detailDirty = true; });
+    function detailIsBeingEdited(detail, peer) {
+      if (detail.dataset.peerId !== peer.id) return false; // different machine: always rebuild
+      return detailDirty || detail.contains(document.activeElement);
+    }
+
+    function renderDetail(force) {
       const peer = state.peers.find((item) => item.id === state.selectedId);
       const detail = $("detail");
       if (!peer) {
         detail.className = "detail empty";
         detail.textContent = "Select a peer";
+        detail.dataset.peerId = "";
+        detailDirty = false;
         return;
       }
+      if (!force && detailIsBeingEdited(detail, peer)) return;
+      detailDirty = false;
+      detail.dataset.peerId = peer.id;
       const stats = peer.stats || {};
       const managementPolicy = peer.management_policy || {};
       const policyOptions = managementPolicy.options || {};
@@ -2619,6 +2643,10 @@
           });
           peer.direct_endpoint = res.endpoint || "";
           dep.value = peer.direct_endpoint;
+          // Saved, so there is nothing left to protect from the refresh. Without this
+          // the panel would stay frozen: a dirty panel blocks the rebuild that is the
+          // only thing which clears the flag.
+          detailDirty = false;
           setMsg("directEndpointMsg", peer.direct_endpoint ? "Saved — clients pick it up on their next poll" : "Cleared — back to hole punch / relay", true);
           renderPeers();
         } catch (err) {
