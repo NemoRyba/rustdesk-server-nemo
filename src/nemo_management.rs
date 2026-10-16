@@ -2822,6 +2822,11 @@ struct ClientSetupBundle {
     /// and this is the only clue to that after the fact.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     issued_from: String,
+    /// "internal" or "external": which address set this bundle carries. The client logs
+    /// it, which is the only way to tell afterwards that a machine was handed the wrong
+    /// one of the two.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    scope: String,
     server: ClientSetupServer,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     device_key: String,
@@ -2836,6 +2841,53 @@ fn encode_client_setup(bundle: &ClientSetupBundle) -> Result<String, String> {
     ))
 }
 
+/// Which side of the network the bundle is for. A deployment like this one has two
+/// addresses for the same server -- a LAN address and a public one -- and a client
+/// carries ONE set of them, so which one a machine is given is not a detail: give a
+/// workstation the public address and every session hairpins out through the router and
+/// back; give a roaming laptop the LAN address and it simply cannot reach the server.
+///
+/// So both are exported, side by side, and the operator hands over the one that matches
+/// where the machine connects FROM. (The real fix for a machine that does both is one
+/// split-horizon DNS name resolving to each address from each side, which both profiles
+/// then carry identically -- see TOPOLOGY-DEPLOYMENT.md.)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ClientSetupScope {
+    /// Inside the network: the server's LAN address.
+    Internal,
+    /// From the internet: its public address.
+    External,
+}
+
+impl ClientSetupScope {
+    fn parse(value: Option<&str>) -> Self {
+        match value.unwrap_or_default().trim().to_ascii_lowercase().as_str() {
+            "external" | "public" | "wan" | "internet" => Self::External,
+            _ => Self::Internal,
+        }
+    }
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Internal => "internal",
+            Self::External => "external",
+        }
+    }
+    /// The flag suffix, so one arg name pair covers both: `--nemo-client-api` and
+    /// `--nemo-client-api-external`.
+    fn arg_suffix(self) -> &'static str {
+        match self {
+            Self::Internal => "",
+            Self::External => "-external",
+        }
+    }
+    fn file_tag(self) -> &'static str {
+        match self {
+            Self::Internal => "lan",
+            Self::External => "wan",
+        }
+    }
+}
+
 /// Everything the operator may override, and what the server fills in when they do not.
 ///
 /// The defaults come from the **Host header of the dashboard request**, which is a
@@ -2848,7 +2900,18 @@ fn client_setup_server(
     overrides: &ClientSetupRequest,
     host_header: &str,
     server_public_key: &str,
+    scope: ClientSetupScope,
 ) -> ClientSetupServer {
+    let sfx = scope.arg_suffix();
+    // The LAN profile is derived from the dashboard address (the operator usually
+    // administers from inside) and from --local-ip; the public one from `-r`, which in a
+    // deployment like this one is exactly the public address hbbs hands out to clients.
+    // Either way an explicit --nemo-client-* flag wins, and the operator's edit in the
+    // dashboard wins over that.
+    let scoped_relay_default = match scope {
+        ClientSetupScope::Internal => get_arg("local-ip"),
+        ClientSetupScope::External => String::new(),
+    };
     let host_header = host_header.trim();
     // host:port -> (host, port). An IPv6 literal in a Host header is bracketed, so the
     // last colon is only a port separator when it comes after the closing bracket.
@@ -2859,45 +2922,68 @@ fn client_setup_server(
         _ => (host_header, ""),
     };
     let host = host.trim_matches(|c| c == '[' || c == ']');
-    let api_default = if host_header.is_empty() {
+    // The API port is the one thing both profiles share, so it is taken from the
+    // dashboard address even for the public profile - only the HOST differs.
+    let api_port = if port.is_empty() {
         String::new()
-    } else if port.is_empty() {
-        format!("https://{}", host_header)
     } else {
-        format!("https://{}:{}", host, port)
+        format!(":{}", port)
+    };
+    let public_host = relay_host(&get_arg("relay-servers"));
+    let api_default = match scope {
+        ClientSetupScope::Internal => {
+            let h = first_non_empty(&[host, &get_arg("local-ip")]);
+            if h.is_empty() {
+                String::new()
+            } else {
+                format!("https://{}{}", h, api_port)
+            }
+        }
+        // Deliberately NOT the dashboard host: an operator reading this over the LAN
+        // would otherwise get the LAN address baked into the "from the internet" bundle,
+        // which is the one mistake this whole split exists to prevent. Better to hand
+        // back an empty field the dashboard asks them to fill in.
+        ClientSetupScope::External => {
+            if public_host.is_empty() {
+                String::new()
+            } else {
+                format!("https://{}{}", public_host, api_port)
+            }
+        }
     };
     let api_server = first_non_empty(&[
         overrides.api_server.as_deref().unwrap_or_default(),
-        &get_arg("nemo-client-api"),
+        &get_arg(&format!("nemo-client-api{}", sfx)),
         &api_default,
     ]);
     // The rendezvous port is NOT the API port, so it is never taken from the Host
     // header; the client's own default (21116) covers the normal case and is left
     // implicit, exactly as a hand-typed address would be.
     let rendezvous_port = get_arg_or("port", hbb_common::config::RENDEZVOUS_PORT.to_string());
-    let id_default = if host.is_empty() {
+    let id_host = match scope {
+        ClientSetupScope::Internal => first_non_empty(&[host, &get_arg("local-ip")]),
+        ClientSetupScope::External => public_host.clone(),
+    };
+    let id_default = if id_host.is_empty() {
         String::new()
     } else if rendezvous_port == hbb_common::config::RENDEZVOUS_PORT.to_string() {
-        host.to_owned()
+        id_host.clone()
     } else {
-        format!("{}:{}", host, rendezvous_port)
+        format!("{}:{}", id_host, rendezvous_port)
     };
     let id_server = first_non_empty(&[
         overrides.id_server.as_deref().unwrap_or_default(),
-        &get_arg("nemo-client-id-server"),
+        &get_arg(&format!("nemo-client-id-server{}", sfx)),
         &id_default,
     ]);
-    // `-r` can carry several, comma separated; a client takes one address.
-    let relay_default = get_arg("relay-servers")
-        .split(',')
-        .map(str::trim)
-        .find(|s| !s.is_empty())
-        .unwrap_or_default()
-        .to_owned();
+    // For a client on the internet, empty is the right default: hbbs hands out its own
+    // `-r` (the public relay) at runtime. For one on the LAN it is not - that would send
+    // an internal session out through the router and back - so --local-ip is used when
+    // the operator set one.
     let relay_server = first_non_empty(&[
         overrides.relay_server.as_deref().unwrap_or_default(),
-        &get_arg("nemo-client-relay"),
-        &relay_default,
+        &get_arg(&format!("nemo-client-relay{}", sfx)),
+        &scoped_relay_default,
     ]);
     // Only a self-signed certificate needs pinning; with a CA-signed one the client
     // validates the normal way, and pinning it would strand the client at renewal.
@@ -2924,6 +3010,23 @@ fn client_setup_server(
     }
 }
 
+/// The host out of `-r`/`--relay-servers`: it can carry several, comma separated, and
+/// each may have a port the client does not need here (it dials the relay on 21117).
+fn relay_host(relay_servers: &str) -> String {
+    let first = relay_servers
+        .split(',')
+        .map(str::trim)
+        .find(|s| !s.is_empty())
+        .unwrap_or_default();
+    match first.rfind(':') {
+        // Not a port separator inside an IPv6 literal.
+        Some(idx) if idx > first.rfind(']').unwrap_or(0) => first[..idx].to_owned(),
+        _ => first.to_owned(),
+    }
+    .trim_matches(|c| c == '[' || c == ']')
+    .to_owned()
+}
+
 fn first_non_empty(candidates: &[&str]) -> String {
     candidates
         .iter()
@@ -2934,22 +3037,28 @@ fn first_non_empty(candidates: &[&str]) -> String {
 }
 
 /// A filename an operator can keep apart from the next machine's.
-fn client_setup_filename(label: &str, with_key: bool) -> String {
+fn client_setup_filename(label: &str, with_key: bool, scope: ClientSetupScope) -> String {
     let slug: String = label
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
         .collect();
     let slug = slug.trim_matches('-').to_owned();
     let stem = if slug.is_empty() { "tbfdesk".to_owned() } else { format!("tbfdesk-{}", slug) };
+    // The tag is not decoration: two files for the same machine differ only in which
+    // side of the network they are for, and handing over the wrong one is the failure
+    // this split exists to prevent.
     if with_key {
-        format!("{}-setup-with-key.tbfsetup", stem)
+        format!("{}-setup-{}-with-key.tbfsetup", stem, scope.file_tag())
     } else {
-        format!("{}-setup.tbfsetup", stem)
+        format!("{}-setup-{}.tbfsetup", stem, scope.file_tag())
     }
 }
 
-#[derive(Default, Deserialize)]
+#[derive(Clone, Default, Deserialize)]
 struct ClientSetupRequest {
+    /// "internal" (default) or "external".
+    #[serde(default)]
+    scope: Option<String>,
     /// `None` = use the server's default; `Some("")` = deliberately blank.
     #[serde(default)]
     id_server: Option<String>,
@@ -2963,13 +3072,27 @@ struct ClientSetupRequest {
     label: Option<String>,
 }
 
-#[derive(Serialize)]
-struct ClientSetupResponse {
+#[derive(Default, Serialize)]
+struct ClientSetupProfile {
+    scope: String,
     server: ClientSetupServer,
     /// The importable string. Carries no device key: this is the one an operator can
     /// hand out freely to machines whose keys already exist.
     setup_string: String,
     filename: String,
+    /// Why this profile could not be built, when it could not. The public profile is
+    /// routinely in this state on a server started without `-r`: there is no public
+    /// address to guess, and guessing the LAN one would be worse than an empty field.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    error: String,
+}
+
+#[derive(Serialize)]
+struct ClientSetupResponse {
+    /// Both sides, side by side. A client carries ONE address set, so the operator picks
+    /// the profile that matches where the machine connects from.
+    internal: ClientSetupProfile,
+    external: ClientSetupProfile,
     /// What the defaults were derived from, so the dashboard can say so.
     issued_from: String,
 }
@@ -2987,16 +3110,25 @@ fn build_client_setup(
     headers: &HeaderMap,
     server_public_key: &str,
     device_key: &str,
+    scope: ClientSetupScope,
 ) -> Result<(ClientSetupServer, String, String), String> {
     let host = host_header(headers);
-    let server = client_setup_server(overrides, &host, server_public_key);
+    let server = client_setup_server(overrides, &host, server_public_key, scope);
     if server.id_server.is_empty() || server.api_server.is_empty() {
-        return Err(
-            "cannot work out this server's client-facing address; fill the ID server and \
-             api-server fields in, or start hbbs with --nemo-client-id-server / \
-             --nemo-client-api"
+        return Err(match scope {
+            ClientSetupScope::Internal => "cannot work out this server's address on the \
+                 local network; fill the ID server and api-server fields in, or start \
+                 hbbs with --local-ip (or --nemo-client-id-server / --nemo-client-api)"
                 .to_owned(),
-        );
+            // Not derivable and deliberately not guessed: the dashboard address is the
+            // wrong answer here, and a public bundle carrying a LAN address is the one
+            // failure this split exists to prevent.
+            ClientSetupScope::External => "this server does not know its own public \
+                 address: fill the ID server and api-server fields in, or start hbbs \
+                 with -r <public-host:21117> (or --nemo-client-id-server-external / \
+                 --nemo-client-api-external)"
+                .to_owned(),
+        });
     }
     let label = overrides.label.clone().unwrap_or_default();
     let bundle = ClientSetupBundle {
@@ -3004,6 +3136,7 @@ fn build_client_setup(
         label: label.clone(),
         issued_at: now_iso(),
         issued_from: host.clone(),
+        scope: scope.as_str().to_owned(),
         server: server.clone(),
         device_key: device_key.to_owned(),
     };
@@ -3011,46 +3144,83 @@ fn build_client_setup(
     Ok((
         server,
         string,
-        client_setup_filename(&label, !device_key.is_empty()),
+        client_setup_filename(&label, !device_key.is_empty(), scope),
     ))
 }
 
-/// GET: the defaults plus a ready-to-copy string with no device key in it.
+/// One profile, with its failure carried inside it rather than failing the request: the
+/// public profile being underivable must not stop the LAN one from being handed out.
+fn client_setup_profile(
+    overrides: &ClientSetupRequest,
+    headers: &HeaderMap,
+    server_public_key: &str,
+    device_key: &str,
+    scope: ClientSetupScope,
+) -> ClientSetupProfile {
+    match build_client_setup(overrides, headers, server_public_key, device_key, scope) {
+        Ok((server, setup_string, filename)) => ClientSetupProfile {
+            scope: scope.as_str().to_owned(),
+            server,
+            setup_string,
+            filename,
+            error: String::new(),
+        },
+        Err(error) => ClientSetupProfile {
+            scope: scope.as_str().to_owned(),
+            server: client_setup_server(overrides, &host_header(headers), server_public_key, scope),
+            error,
+            ..Default::default()
+        },
+    }
+}
+
+/// GET: both profiles' defaults, each with a ready-to-copy string that carries no device
+/// key. Nothing here can fail as a whole - a profile that cannot be derived says so in
+/// its own `error` and the other one is still usable.
 async fn get_client_setup(
     Extension(state): Extension<HbbsApiState>,
     headers: HeaderMap,
 ) -> ApiResult<ClientSetupResponse> {
     require_auth(&headers, &state.token)?;
-    let (server, setup_string, filename) = build_client_setup(
-        &ClientSetupRequest::default(),
-        &headers,
-        &state.server_public_key,
-        "",
-    )
-    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, &e))?;
+    let blank = ClientSetupRequest::default();
     Ok(Json(ClientSetupResponse {
-        server,
-        setup_string,
-        filename,
+        internal: client_setup_profile(
+            &blank,
+            &headers,
+            &state.server_public_key,
+            "",
+            ClientSetupScope::Internal,
+        ),
+        external: client_setup_profile(
+            &blank,
+            &headers,
+            &state.server_public_key,
+            "",
+            ClientSetupScope::External,
+        ),
         issued_from: host_header(&headers),
     }))
 }
 
-/// POST: the same, with the operator's edits applied.
+/// POST: ONE profile, with the operator's edits applied - the dashboard's two blocks
+/// each send their own, so editing the LAN fields cannot disturb the public ones.
+/// `scope` picks which; omitting it means the LAN profile.
 async fn post_client_setup(
     Extension(state): Extension<HbbsApiState>,
     headers: HeaderMap,
     Json(req): Json<ClientSetupRequest>,
-) -> ApiResult<ClientSetupResponse> {
+) -> ApiResult<ClientSetupProfile> {
     require_auth(&headers, &state.token)?;
+    let scope = ClientSetupScope::parse(req.scope.as_deref());
     let (server, setup_string, filename) =
-        build_client_setup(&req, &headers, &state.server_public_key, "")
+        build_client_setup(&req, &headers, &state.server_public_key, "", scope)
             .map_err(|e| api_error(StatusCode::BAD_REQUEST, &e))?;
-    Ok(Json(ClientSetupResponse {
+    Ok(Json(ClientSetupProfile {
+        scope: scope.as_str().to_owned(),
         server,
         setup_string,
         filename,
-        issued_from: host_header(&headers),
+        error: String::new(),
     }))
 }
 
@@ -3062,11 +3232,20 @@ struct GenerateDeviceKeyRequest {
     /// M1: the peer id this key is generated FOR. Empty = unbound legacy key.
     #[serde(default)]
     peer_id: String,
-    /// The client-setup values to bake into this key's setup string. Omitted fields fall
-    /// back to the server's defaults, so a caller that sends nothing still gets a
-    /// complete, usable string.
-    #[serde(default, flatten)]
-    setup: ClientSetupRequest,
+    /// The client-setup values to bake into this key's setup strings, per side of the
+    /// network. Omitted fields fall back to the server's defaults, so a caller that
+    /// sends nothing still gets whatever this server can work out on its own.
+    #[serde(default)]
+    setup: ClientSetupPair,
+}
+
+/// The operator's edits for both profiles, as the dashboard holds them.
+#[derive(Clone, Default, Deserialize)]
+struct ClientSetupPair {
+    #[serde(default)]
+    internal: ClientSetupRequest,
+    #[serde(default)]
+    external: ClientSetupRequest,
 }
 #[derive(Serialize)]
 struct GenerateDeviceKeyResponse {
@@ -3076,19 +3255,16 @@ struct GenerateDeviceKeyResponse {
     private_key: String,
     created_at: String,
     peer_id: String,
-    /// The whole first run in one string: this key's private half plus the six server
-    /// values a fresh client would otherwise have to be told by hand. Shown once, with
-    /// the private key, and never stored.
-    setup_string: String,
-    /// Suggested download name, so two machines' files do not collide in Downloads.
-    setup_filename: String,
-    /// What went into it, so the dashboard can show the operator what they are handing
-    /// over rather than an opaque blob.
-    setup_server: ClientSetupServer,
-    /// Non-empty when the setup string could NOT be built (the server cannot work out
-    /// its own client-facing address). The key itself is still generated and pinned -
-    /// losing the convenience must not lose the key.
-    setup_error: String,
+    /// The whole first run in one string: this key's private half plus the server values
+    /// a fresh client would otherwise have to be told by hand. Shown once, with the
+    /// private key, and never stored.
+    ///
+    /// Two of them, because this server has two addresses: hand over the one that
+    /// matches where the machine will connect from. Each carries its own `error` when it
+    /// could not be built - the key is pinned either way, so losing the convenience must
+    /// never lose the key.
+    setup_internal: ClientSetupProfile,
+    setup_external: ClientSetupProfile,
 }
 async fn generate_device_key(
     Extension(state): Extension<HbbsApiState>,
@@ -3106,25 +3282,32 @@ async fn generate_device_key(
         created_at.clone(),
         req.peer_id,
     );
-    // The key is pinned at this point. The setup string is a convenience on top, so a
-    // failure to build it is reported in the response rather than losing the key.
-    let mut setup = ClientSetupRequest {
-        label: req.setup.label.clone().or_else(|| Some(dk.label.clone())),
-        ..req.setup
+    // The key is pinned at this point. The setup strings are a convenience on top, so a
+    // failure to build one is reported inside that profile rather than losing the key.
+    let labelled = |mut overrides: ClientSetupRequest| {
+        if overrides.label.as_deref().unwrap_or_default().is_empty() {
+            overrides.label = Some(if dk.label.is_empty() {
+                dk.peer_id.clone()
+            } else {
+                dk.label.clone()
+            });
+        }
+        overrides
     };
-    if setup.label.as_deref().unwrap_or_default().is_empty() {
-        setup.label = Some(dk.peer_id.clone());
-    }
-    let (setup_server, setup_string, setup_filename, setup_error) =
-        match build_client_setup(&setup, &headers, &state.server_public_key, &private_key) {
-            Ok((server, string, filename)) => (server, string, filename, String::new()),
-            Err(err) => (
-                ClientSetupServer::default(),
-                String::new(),
-                String::new(),
-                err,
-            ),
-        };
+    let setup_internal = client_setup_profile(
+        &labelled(req.setup.internal.clone()),
+        &headers,
+        &state.server_public_key,
+        &private_key,
+        ClientSetupScope::Internal,
+    );
+    let setup_external = client_setup_profile(
+        &labelled(req.setup.external.clone()),
+        &headers,
+        &state.server_public_key,
+        &private_key,
+        ClientSetupScope::External,
+    );
     Ok(Json(GenerateDeviceKeyResponse {
         id: dk.id,
         label: dk.label,
@@ -3132,10 +3315,8 @@ async fn generate_device_key(
         private_key,
         created_at,
         peer_id: dk.peer_id,
-        setup_string,
-        setup_filename,
-        setup_server,
-        setup_error,
+        setup_internal,
+        setup_external,
     }))
 }
 async fn list_device_keys(
@@ -7275,30 +7456,31 @@ mod tests {
     #[test]
     fn client_setup_defaults_come_from_the_dashboard_address() {
         let none = ClientSetupRequest::default();
+        let lan = ClientSetupScope::Internal;
 
         // host:port -> api keeps the port, the ID server does NOT (21116 is the
         // client's own default and a hand-typed address would leave it implicit too).
-        let s = client_setup_server(&none, "10.0.0.5:21120", " KEYB64 ");
+        let s = client_setup_server(&none, "10.0.0.5:21120", " KEYB64 ", lan);
         assert_eq!(s.api_server, "https://10.0.0.5:21120");
         assert_eq!(s.id_server, "10.0.0.5");
         assert_eq!(s.key, "KEYB64", "the key is trimmed, not passed through raw");
 
         // A Host header with no port at all (a reverse proxy on 443).
-        let s = client_setup_server(&none, "tbfdesk.example.com", "k");
+        let s = client_setup_server(&none, "tbfdesk.example.com", "k", lan);
         assert_eq!(s.api_server, "https://tbfdesk.example.com");
         assert_eq!(s.id_server, "tbfdesk.example.com");
 
         // IPv6 literals are bracketed in a Host header, and the colons inside the
         // address are not port separators.
-        let s = client_setup_server(&none, "[fd00::1]:21120", "k");
+        let s = client_setup_server(&none, "[fd00::1]:21120", "k", lan);
         assert_eq!(s.api_server, "https://fd00::1:21120");
         assert_eq!(s.id_server, "fd00::1");
 
         // No Host header: nothing is invented, and build_client_setup refuses rather
         // than handing out a bundle that points nowhere.
-        let s = client_setup_server(&none, "", "k");
+        let s = client_setup_server(&none, "", "k", lan);
         assert!(s.api_server.is_empty() && s.id_server.is_empty());
-        assert!(build_client_setup(&none, &HeaderMap::new(), "k", "").is_err());
+        assert!(build_client_setup(&none, &HeaderMap::new(), "k", "", lan).is_err());
 
         // The operator's edits win - the point of showing the fields at all, since a
         // LAN dashboard session cannot know a roaming client's public address.
@@ -7308,14 +7490,71 @@ mod tests {
             api_server: Some("https://tbfdesk.example.com:21120".to_owned()),
             api_cert_fingerprint: Some("  ".to_owned()),
             label: Some("Reception".to_owned()),
+            scope: None,
         };
-        let s = client_setup_server(&edited, "10.0.0.5:21120", "k");
+        let s = client_setup_server(&edited, "10.0.0.5:21120", "k", lan);
         assert_eq!(s.id_server, "85.126.226.2");
         assert_eq!(s.relay_server, "85.126.226.2");
         assert_eq!(s.api_server, "https://tbfdesk.example.com:21120");
         // An explicitly blank pin means "do not pin" (a proxy with its own cert), which
         // must not be silently refilled from this server's self-signed fingerprint.
         assert_eq!(s.api_cert_fingerprint, "");
+    }
+
+    // The split itself: one server, two addresses, and a client that carries only one
+    // set of them. Handing a workstation the public address hairpins every session out
+    // through the router and back; handing a roaming laptop the LAN address locks it
+    // out. So the public profile must NOT fall back to the dashboard address, and the
+    // LAN profile must not quietly relay via the public one.
+    #[test]
+    fn the_public_profile_never_falls_back_to_the_dashboard_address() {
+        let none = ClientSetupRequest::default();
+        let wan = ClientSetupScope::External;
+        // Reading the dashboard over the LAN, with no -r and no --nemo-client-*-external
+        // configured: the public profile is EMPTY and says why, rather than shipping
+        // 10.0.0.5 as "from the internet".
+        let s = client_setup_server(&none, "10.0.0.5:21120", "k", wan);
+        assert!(s.id_server.is_empty(), "{:?}", s.id_server);
+        assert!(s.api_server.is_empty(), "{:?}", s.api_server);
+        let err = build_client_setup(&none, &HeaderMap::new(), "k", "", wan).unwrap_err();
+        assert!(err.contains("public address"), "{}", err);
+        // ...and the failure stays inside that one profile: the LAN one is still built.
+        let profile = client_setup_profile(&none, &HeaderMap::new(), "k", "", wan);
+        assert_eq!(profile.scope, "external");
+        assert!(profile.setup_string.is_empty() && !profile.error.is_empty());
+
+        // The operator fills it in and it is used as given, ports and all.
+        let edited = ClientSetupRequest {
+            scope: Some("external".to_owned()),
+            id_server: Some("tbfdesk.example.com".to_owned()),
+            api_server: Some("https://tbfdesk.example.com:21120".to_owned()),
+            ..Default::default()
+        };
+        let s = client_setup_server(&edited, "10.0.0.5:21120", "k", wan);
+        assert_eq!(s.id_server, "tbfdesk.example.com");
+        assert_eq!(s.api_server, "https://tbfdesk.example.com:21120");
+
+        // `scope` is read leniently, because it arrives from a dashboard field and a
+        // typo must not silently produce the WRONG profile - only these spellings mean
+        // "external", and anything else means the LAN one.
+        for v in ["external", "External", " public ", "wan", "internet"] {
+            assert_eq!(ClientSetupScope::parse(Some(v)), ClientSetupScope::External, "{v}");
+        }
+        for v in ["internal", "lan", "", "exterior", "x"] {
+            assert_eq!(ClientSetupScope::parse(Some(v)), ClientSetupScope::Internal, "{v}");
+        }
+        assert_eq!(ClientSetupScope::parse(None), ClientSetupScope::Internal);
+    }
+
+    // `-r` is where the public address comes from when nothing else says it, and it may
+    // carry a port the client does not need (it dials the relay on its own port).
+    #[test]
+    fn the_public_host_is_taken_from_the_relay_flag() {
+        assert_eq!(relay_host("85.126.226.2:21117"), "85.126.226.2");
+        assert_eq!(relay_host("tbfdesk.example.com"), "tbfdesk.example.com");
+        assert_eq!(relay_host(" a.example.com:21117 , b.example.com "), "a.example.com");
+        assert_eq!(relay_host("[2001:db8::1]:21117"), "2001:db8::1");
+        assert_eq!(relay_host(""), "");
     }
 
     #[test]
@@ -7325,6 +7564,7 @@ mod tests {
             label: "Reception PC".to_owned(),
             issued_at: "t0".to_owned(),
             issued_from: "10.0.0.5:21120".to_owned(),
+            scope: "internal".to_owned(),
             server: ClientSetupServer {
                 id_server: "10.0.0.5".to_owned(),
                 relay_server: String::new(),
@@ -7360,13 +7600,16 @@ mod tests {
         // Filenames: a label becomes a slug, and the with-key variant says so, because
         // one of the two files is a secret and the other is not.
         assert_eq!(
-            client_setup_filename("Reception PC", true),
-            "tbfdesk-Reception-PC-setup-with-key.tbfsetup"
+            client_setup_filename("Reception PC", true, ClientSetupScope::Internal),
+            "tbfdesk-Reception-PC-setup-lan-with-key.tbfsetup"
         );
-        assert_eq!(client_setup_filename("", false), "tbfdesk-setup.tbfsetup");
         assert_eq!(
-            client_setup_filename("../etc/passwd", false),
-            "tbfdesk-etc-passwd-setup.tbfsetup"
+            client_setup_filename("", false, ClientSetupScope::External),
+            "tbfdesk-setup-wan.tbfsetup"
+        );
+        assert_eq!(
+            client_setup_filename("../etc/passwd", false, ClientSetupScope::Internal),
+            "tbfdesk-etc-passwd-setup-lan.tbfsetup"
         );
     }
 

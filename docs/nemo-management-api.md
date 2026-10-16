@@ -103,10 +103,12 @@ git revert <nemo-management-api-commit>
 - `POST /nemo/api/device-keys` with JSON body `{"label":"Reception-PC","peer_id":"123456789"}`
   — generates a keypair, pins the public half, and returns the private half **once**.
   `peer_id` may be empty: the key is then a one-shot provisioning token (see
-  *Device-key claims* below). The response also carries `setup_string` (see
-  *Client setup* below), `setup_filename` and `setup_server`; `setup_error` is non-empty
-  when the string could not be built, in which case the key itself is still pinned.
-  The body may also carry any of the client-setup fields to override the derivation.
+  *Device-key claims* below). The response also carries `setup_internal` and
+  `setup_external` (see *Client setup* below): the same bundle with this key inside it,
+  once per side of the network. A profile that could not be built carries its own
+  `error`; the key is pinned either way, so losing the convenience never loses the key.
+  The body may carry `{"setup":{"internal":{…},"external":{…}}}` to override the
+  derivation per profile.
 - `POST /nemo/api/device-keys/{id}/delete` — also ends the sessions that key's peer holds.
 - `POST /nemo/api/device-keys/{id}/peer-id` with `{"peer_id":"123456789"}` — bind by hand,
   or send `""` to clear the binding and re-arm the key as a claimable token.
@@ -136,17 +138,41 @@ URL (used as both `api-server` and `nemo-management-server`), the server's ident
 (used as both `key` and `nemo-management-public-key`) and, for a self-signed API, its
 certificate fingerprint.
 
-- `GET /nemo/api/client-setup` → `{"server":{…},"setup_string":"…","filename":"…","issued_from":"…"}`
-  — the derived defaults and a string with **no** device key in it.
-- `POST /nemo/api/client-setup` with any of
-  `{"id_server":"…","relay_server":"…","api_server":"…","api_cert_fingerprint":"…","label":"…"}`
-  — the same, with the operator's edits. An omitted field uses the server's default; an
-  explicitly empty `api_cert_fingerprint` means "do not pin" and is not refilled.
+**Two profiles, because this server has two addresses.** A client carries ONE address
+set, so `internal` (the LAN address) and `external` (the public one) are exported side by
+side and the operator hands over the one matching where that machine connects from. Give a
+workstation the public address and every session hairpins out through the router and back;
+give a roaming laptop the LAN address and it cannot reach the server at all. The lasting
+fix is one split-horizon DNS name, which makes both profiles identical — see
+`TOPOLOGY-DEPLOYMENT.md` in the superproject.
 
-The defaults come from the **Host header of the request**, because that is the one address
-the caller has proven a client can reach this API on. The ID server deliberately does not
-inherit the API port, and the relay defaults to this server's own `-r`. Override the
-derivation with `--nemo-client-id-server`, `--nemo-client-relay` and `--nemo-client-api`.
+- `GET /nemo/api/client-setup` →
+  `{"internal":Profile,"external":Profile,"issued_from":"…"}`, where `Profile` is
+  `{"scope":"internal","server":{…},"setup_string":"…","filename":"…","error":"…"}`
+  — the derived defaults and, for each side, a string with **no** device key in it.
+  Nothing here fails as a whole: a profile that cannot be derived carries its reason in
+  its own `error` and the other one is still usable.
+- `POST /nemo/api/client-setup` with any of
+  `{"scope":"external","id_server":"…","relay_server":"…","api_server":"…","api_cert_fingerprint":"…","label":"…"}`
+  — **one** profile, with the operator's edits (the dashboard's two blocks each send
+  their own, so editing one side cannot disturb the other). `scope` omitted means
+  `internal`. An omitted field uses the server's default; an explicitly empty
+  `api_cert_fingerprint` means "do not pin" and is not refilled.
+
+Where the defaults come from, per profile:
+
+| | `internal` | `external` |
+|---|---|---|
+| ID server / api-server host | the request's **Host header**, else `--local-ip` | the host out of **`-r`/`--relay-servers`** |
+| relay | `--local-ip` (an internal session must not hairpin via the public relay) | empty — hbbs hands out its own `-r` at runtime |
+| flag override | `--nemo-client-id-server`, `--nemo-client-relay`, `--nemo-client-api` | the same three with an `-external` suffix |
+
+The API port is taken from the Host header for both (only the host differs); the
+rendezvous port is not, so the client's own default stays implicit unless `--port` says
+otherwise. The `external` profile **never** falls back to the Host header: an operator
+administering over the LAN would otherwise get a LAN address baked into the
+"from the internet" bundle, which is the one mistake this split exists to prevent. It
+returns an empty profile with an `error` asking for the address instead.
 
 The bundle carries the client's trust anchor and is deliberately unsigned — what a
 signature would be verified against is the identity key inside it — so it has to be moved

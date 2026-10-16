@@ -975,31 +975,11 @@
             <span id="reqDeviceKeyMsg" style="font-size:12px;opacity:0.8;"></span>
           </div>
           <div id="deviceKeyClaims" style="display:none;"></div>
-          <div style="border:1px solid #d7e3ea;background:#f6fbfd;border-radius:6px;padding:10px 12px;display:flex;flex-direction:column;gap:8px;">
+          <div style="border:1px solid #d7e3ea;background:#f6fbfd;border-radius:6px;padding:10px 12px;display:flex;flex-direction:column;gap:10px;">
             <div style="font-weight:600;">Client setup string &mdash; the whole first run in one paste</div>
-            <div style="font-size:12px;opacity:0.8;line-height:1.45;max-width:900px;">A fresh client needs <b>six</b> exact values before it can reach this server at all: the ID server, the relay, the api-server URL, the management URL, this server's identity key and (with a self-signed certificate) its fingerprint. One typo in any of them looks exactly like a network fault. This hands them over as a single string the client imports in its <b>Import device key</b> dialog &mdash; it accepts either. Generating a device key below produces the same string <b>with that key included</b>, which is the whole provisioning run: generate here, paste there.</div>
-            <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end;">
-              <label style="font-size:12px;display:flex;flex-direction:column;gap:3px;">ID / rendezvous server
-                <input id="setupIdServer" type="text" class="mono" style="min-width:210px;" placeholder="tbfdesk.example.com">
-              </label>
-              <label style="font-size:12px;display:flex;flex-direction:column;gap:3px;">Relay server <span style="opacity:0.6">(empty = use the server's own)</span>
-                <input id="setupRelayServer" type="text" class="mono" style="min-width:190px;" placeholder="— none —">
-              </label>
-              <label style="font-size:12px;display:flex;flex-direction:column;gap:3px;">api-server URL
-                <input id="setupApiServer" type="text" class="mono" style="min-width:260px;" placeholder="https://tbfdesk.example.com:21120">
-              </label>
-              <button id="setupRefresh">Update string</button>
-            </div>
-            <div style="font-size:12px;opacity:0.75;line-height:1.4;max-width:900px;">Prefilled from <b>the address you are reading this dashboard on</b> &mdash; the one address a client is proven to reach. <b>Check it before handing it out:</b> a value that works on the LAN is wrong for a machine that will connect from outside, and the client gets no second chance to guess.</div>
-            <label style="font-size:12px;display:flex;flex-direction:column;gap:3px;">Certificate pin <span style="opacity:0.6">(fingerprint of this API's self-signed certificate; clear it if something else terminates TLS)</span>
-              <input id="setupCertPin" type="text" class="mono" style="font-size:11px;" placeholder="— not pinned —">
-            </label>
-            <textarea id="setupString" readonly style="width:100%;height:58px;font-family:monospace;font-size:11px;"></textarea>
-            <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
-              <button id="setupCopy">Copy string</button>
-              <button id="setupDownload">Download file</button>
-              <span id="setupMsg" style="font-size:12px;opacity:0.8;"></span>
-            </div>
+            <div style="font-size:12px;opacity:0.8;line-height:1.45;max-width:900px;">A fresh client needs <b>six</b> exact values before it can reach this server at all: the ID server, the relay, the api-server URL, the management URL, this server's identity key and (with a self-signed certificate) its fingerprint. One typo in any of them looks exactly like a network fault. This hands them over as a single string the client imports in its <b>Import device key</b> dialog &mdash; it accepts either. Generating a device key below produces the same strings <b>with that key included</b>, which is the whole provisioning run: generate here, paste there.</div>
+            <div style="font-size:12px;line-height:1.45;max-width:900px;padding:7px 9px;border:1px solid #f0d98c;background:#fff8e6;border-radius:5px;"><b>This server has two addresses, so there are two strings.</b> A client carries only one set, so hand over the one that matches <b>where that machine connects from</b>: give a workstation the public address and every session hairpins out through the router and back; give a roaming laptop the LAN address and it cannot reach the server at all. The lasting fix is one <b>split-horizon DNS name</b> that resolves to each address from each side &mdash; then both strings are identical and the question goes away.</div>
+            <div id="setupProfiles" style="display:flex;flex-direction:column;gap:10px;"></div>
           </div>
           <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
             <input id="deviceKeyLabel" type="text" placeholder="label (e.g. Reception-PC)" style="min-width:220px;">
@@ -1766,53 +1746,134 @@
     }
     // The first-run settings bundle. Kept next to the device keys because the two are
     // handed over together: the string a generated key produces IS this plus the key.
-    const setupState = { filename: "tbfdesk-setup.tbfsetup", string: "" };
+    //
+    // Two profiles, because this server has two addresses and a client carries one set.
+    // They are rendered rather than written out twice in the markup, so the two blocks
+    // cannot drift apart - and each POSTs on its own, so editing the LAN fields can
+    // never disturb the public ones.
+    const SETUP_PROFILES = [
+      {
+        scope: "internal",
+        title: "Inside the network (LAN)",
+        hint: "For workstations and technicians on the same network as this server. Prefilled from the address you are reading this dashboard on, and from <code>--local-ip</code>.",
+      },
+      {
+        scope: "external",
+        title: "From the internet (public)",
+        hint: "For machines that connect from outside &mdash; roaming laptops, home offices. Prefilled from this server's <code>-r</code> relay address, and <b>never</b> from the dashboard address: a LAN address in this string is the one mistake that matters here.",
+      },
+    ];
+    const setupState = {};
 
-    function setupFields() {
+    function setupFieldsFor(scope) {
+      const v = (suffix) => (($(`setup-${scope}-${suffix}`) || {}).value || "").trim();
       return {
-        id_server: ($("setupIdServer").value || "").trim(),
-        relay_server: ($("setupRelayServer").value || "").trim(),
-        api_server: ($("setupApiServer").value || "").trim(),
-        api_cert_fingerprint: ($("setupCertPin").value || "").trim(),
+        scope,
+        id_server: v("id"),
+        relay_server: v("relay"),
+        api_server: v("api"),
+        api_cert_fingerprint: v("pin"),
       };
     }
 
-    function applySetupResponse(r, msg) {
-      setupState.string = r.setup_string || "";
-      setupState.filename = r.filename || setupState.filename;
-      $("setupString").value = setupState.string;
-      const srv = r.server || {};
-      // Never overwrite a field the operator is editing - this also runs on the 5s
-      // refresh path via loadDeviceKeys.
-      const put = (id, value) => {
-        const el = $(id);
+    // Both profiles' edits, for the generate-key call.
+    function setupFields() {
+      return {
+        internal: setupFieldsFor("internal"),
+        external: setupFieldsFor("external"),
+      };
+    }
+
+    function renderSetupProfiles() {
+      const box = $("setupProfiles");
+      if (!box || box.dataset.rendered === "1") return;
+      box.innerHTML = SETUP_PROFILES.map((p) => `
+        <div style="border:1px solid #dde6ea;border-radius:5px;padding:8px 10px;background:#fff;">
+          <div style="font-weight:600;font-size:13px;">${escapeHtml(p.title)}</div>
+          <div style="font-size:12px;opacity:0.75;line-height:1.4;margin:3px 0 7px;max-width:880px;">${p.hint}</div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end;">
+            <label style="font-size:12px;display:flex;flex-direction:column;gap:3px;">ID / rendezvous server
+              <input id="setup-${p.scope}-id" type="text" class="mono" style="min-width:200px;" placeholder="tbfdesk.example.com">
+            </label>
+            <label style="font-size:12px;display:flex;flex-direction:column;gap:3px;">Relay <span style="opacity:0.6">(empty = the server's own)</span>
+              <input id="setup-${p.scope}-relay" type="text" class="mono" style="min-width:170px;" placeholder="— none —">
+            </label>
+            <label style="font-size:12px;display:flex;flex-direction:column;gap:3px;">api-server URL
+              <input id="setup-${p.scope}-api" type="text" class="mono" style="min-width:250px;" placeholder="https://tbfdesk.example.com:21120">
+            </label>
+            <button data-setup-refresh="${p.scope}">Update string</button>
+          </div>
+          <label style="font-size:12px;display:flex;flex-direction:column;gap:3px;margin-top:6px;">Certificate pin <span style="opacity:0.6">(fingerprint of this API's self-signed certificate; clear it if something else terminates TLS)</span>
+            <input id="setup-${p.scope}-pin" type="text" class="mono" style="font-size:11px;" placeholder="— not pinned —">
+          </label>
+          <textarea id="setup-${p.scope}-string" readonly style="width:100%;height:52px;font-family:monospace;font-size:11px;margin-top:6px;"></textarea>
+          <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:4px;">
+            <button data-setup-copy="${p.scope}">Copy string</button>
+            <button data-setup-download="${p.scope}">Download file</button>
+            <span id="setup-${p.scope}-msg" style="font-size:12px;opacity:0.8;"></span>
+          </div>
+        </div>`).join("");
+      box.querySelectorAll("[data-setup-refresh]").forEach((b) => b.addEventListener("click", () => refreshSetupString(b.dataset.setupRefresh, false)));
+      box.querySelectorAll("[data-setup-copy]").forEach((b) => b.addEventListener("click", async () => {
+        const scope = b.dataset.setupCopy;
+        if (await refreshSetupString(scope, true)) copyText(scope);
+      }));
+      box.querySelectorAll("[data-setup-download]").forEach((b) => b.addEventListener("click", async () => {
+        const scope = b.dataset.setupDownload;
+        if (await refreshSetupString(scope, true)) {
+          const st = setupState[scope] || {};
+          downloadText(st.filename || ("tbfdesk-setup-" + scope + ".tbfsetup"), st.string || "");
+          setMsg(`setup-${scope}-msg`, "Downloaded " + (st.filename || ""), true);
+        }
+      }));
+      box.dataset.rendered = "1";
+    }
+
+    function applySetupProfile(p, msg) {
+      if (!p || !p.scope) return;
+      const scope = p.scope;
+      setupState[scope] = { string: p.setup_string || "", filename: p.filename || "" };
+      const area = $(`setup-${scope}-string`);
+      if (area) area.value = p.setup_string || "";
+      const srv = p.server || {};
+      // Never overwrite a field the operator is editing - this also runs on the panel's
+      // reload path.
+      const put = (suffix, value) => {
+        const el = $(`setup-${scope}-${suffix}`);
         if (el && document.activeElement !== el) el.value = value || "";
       };
-      put("setupIdServer", srv.id_server);
-      put("setupRelayServer", srv.relay_server);
-      put("setupApiServer", srv.api_server);
-      put("setupCertPin", srv.api_cert_fingerprint);
-      if (msg) setMsg("setupMsg", msg, true);
+      put("id", srv.id_server);
+      put("relay", srv.relay_server);
+      put("api", srv.api_server);
+      put("pin", srv.api_cert_fingerprint);
+      // A profile this server cannot derive says so where its string would be, rather
+      // than showing an empty box: the public one is routinely in that state until
+      // someone fills it in or starts hbbs with -r.
+      if (p.error) setMsg(`setup-${scope}-msg`, p.error, false);
+      else if (msg) setMsg(`setup-${scope}-msg`, msg, true);
     }
 
     async function loadClientSetup() {
+      renderSetupProfiles();
       try {
-        applySetupResponse(await api("/nemo/api/client-setup"));
+        const r = await api("/nemo/api/client-setup");
+        applySetupProfile(r.internal);
+        applySetupProfile(r.external);
       } catch (e) {
-        setMsg("setupMsg", e.message, false);
+        setMsg("setup-internal-msg", e.message, false);
       }
     }
 
-    async function refreshSetupString(quiet) {
+    async function refreshSetupString(scope, quiet) {
       try {
         const r = await api("/nemo/api/client-setup", {
           method: "POST",
-          body: JSON.stringify(setupFields()),
+          body: JSON.stringify(setupFieldsFor(scope)),
         });
-        applySetupResponse(r, quiet ? "" : "Updated");
+        applySetupProfile(r, quiet ? "" : "Updated");
         return r;
       } catch (e) {
-        setMsg("setupMsg", e.message, false);
+        setMsg(`setup-${scope}-msg`, e.message, false);
         return null;
       }
     }
@@ -1832,31 +1893,19 @@
       setTimeout(() => URL.revokeObjectURL(url), 10000);
     }
 
-    async function copyText(text, msgId) {
+    async function copyText(scope) {
+      const st = setupState[scope] || {};
       try {
-        await navigator.clipboard.writeText(text);
-        setMsg(msgId, "Copied", true);
+        await navigator.clipboard.writeText(st.string || "");
+        setMsg(`setup-${scope}-msg`, "Copied", true);
       } catch (e) {
         // No clipboard permission (or a plain-http dashboard, which is not a secure
         // context): select it instead so Ctrl+C still works.
-        const el = $("setupString");
+        const el = $(`setup-${scope}-string`);
         if (el) { el.focus(); el.select(); }
-        setMsg(msgId, "Press Ctrl+C to copy the selected text", false);
+        setMsg(`setup-${scope}-msg`, "Press Ctrl+C to copy the selected text", false);
       }
     }
-
-    $("setupRefresh").addEventListener("click", () => refreshSetupString(false));
-    $("setupCopy").addEventListener("click", async () => {
-      const r = await refreshSetupString(true);
-      if (r) copyText(setupState.string, "setupMsg");
-    });
-    $("setupDownload").addEventListener("click", async () => {
-      const r = await refreshSetupString(true);
-      if (r) {
-        downloadText(setupState.filename, setupState.string);
-        setMsg("setupMsg", "Downloaded " + setupState.filename, true);
-      }
-    });
 
     async function loadDeviceKeys() {
       try {
@@ -1908,46 +1957,59 @@
       const label = $("deviceKeyLabel").value.trim();
       const peer_id = $("deviceKeyPeerId").value.trim();
       try {
-        // The setup fields ride along, so the string this key comes with matches what
-        // the panel above is showing rather than the server's own guess.
-        const r = await api("/nemo/api/device-keys", { method: "POST", body: JSON.stringify(Object.assign({ label, peer_id }, setupFields())) });
+        // Both profiles' edited fields ride along, so the strings this key comes with
+        // match what the panel above is showing rather than the server's own guess.
+        const r = await api("/nemo/api/device-keys", { method: "POST", body: JSON.stringify({ label, peer_id, setup: setupFields() }) });
         const box = $("deviceKeyGenerated");
-        const srv = r.setup_server || {};
+        const profile = (p, title, note) => {
+          if (!p) return "";
+          const srv = p.server || {};
+          if (!p.setup_string) {
+            return `<div style="margin-top:8px;padding:8px 10px;border:1px solid #e3d2d2;background:#fdf5f5;border-radius:5px;">
+              <b>${escapeHtml(title)}:</b> no setup string &mdash; ${escapeHtml(p.error || "unknown reason")}
+              <div style="margin-top:3px;opacity:0.75;">The key below is still pinned and usable; that client just has to be told these settings another way.</div>
+            </div>`;
+          }
+          return `<div style="margin-top:8px;padding:8px 10px;border:1px solid #cde3c8;background:#f3fbf1;border-radius:5px;">
+            <b>${escapeHtml(title)}</b> &mdash; ${escapeHtml(note)}
+            <div style="margin-top:3px;opacity:0.8;">ID server <span class="mono">${escapeHtml(srv.id_server || "")}</span> &middot; relay <span class="mono">${escapeHtml(srv.relay_server || "(server's own)")}</span> &middot; api <span class="mono">${escapeHtml(srv.api_server || "")}</span>${srv.api_cert_fingerprint ? ' &middot; certificate pinned' : ''}</div>
+            <textarea id="genSetup-${p.scope}" readonly style="width:100%;height:52px;font-family:monospace;font-size:11px;margin-top:4px;">${escapeHtml(p.setup_string)}</textarea>
+            <div style="display:flex;gap:8px;align-items:center;margin-top:4px;">
+              <button data-gen-copy="${p.scope}">Copy</button>
+              <button data-gen-download="${p.scope}" data-filename="${escapeAttr(p.filename || "")}">Download file</button>
+              <span id="genSetupMsg-${p.scope}" style="font-size:12px;opacity:0.8;"></span>
+            </div>
+          </div>`;
+        };
         box.style.display = "block";
         box.innerHTML = `<div style="padding:10px 12px;border:1px solid #f0d98c;background:#fff8e6;border-radius:6px;font-size:12px;line-height:1.5;">
           <b>Copy this out now &mdash; it will not be shown again.</b><br>
           Label: ${escapeHtml(r.label || "(none)")} &middot; Bound to: ${escapeHtml(r.peer_id || "any client (unbound)")}
-          ${r.setup_string ? `
-          <div style="margin-top:8px;padding:8px 10px;border:1px solid #cde3c8;background:#f3fbf1;border-radius:5px;">
-            <b>Setup string &mdash; paste this one into the new client.</b> It carries this key <i>and</i> the server settings, so nothing else has to be typed on that machine.
-            <div style="margin-top:4px;opacity:0.8;">ID server <span class="mono">${escapeHtml(srv.id_server || "")}</span> &middot; relay <span class="mono">${escapeHtml(srv.relay_server || "(server's own)")}</span> &middot; api <span class="mono">${escapeHtml(srv.api_server || "")}</span>${srv.api_cert_fingerprint ? ' &middot; certificate pinned' : ''}</div>
-            <textarea id="genSetupString" readonly style="width:100%;height:58px;font-family:monospace;font-size:11px;margin-top:4px;">${escapeHtml(r.setup_string)}</textarea>
-            <div style="display:flex;gap:8px;align-items:center;margin-top:4px;">
-              <button id="genSetupCopy">Copy setup string</button>
-              <button id="genSetupDownload">Download setup file</button>
-              <span id="genSetupMsg" style="font-size:12px;opacity:0.8;"></span>
-            </div>
-            <div style="margin-top:4px;opacity:0.75;">Treat it like the private key it contains: hand it over the way you would a password, not over a channel you would not send one on.</div>
-          </div>` : `<div style="margin-top:8px;color:#a11;">No setup string: ${escapeHtml(r.setup_error || "unknown reason")}. The key below is still pinned and usable &mdash; the client just has to be told the server settings by hand.</div>`}
+          <div style="margin-top:6px;">Each string below carries this key <i>and</i> the server settings, so nothing else has to be typed on that machine. <b>Hand over the one that matches where this machine connects from.</b></div>
+          ${profile(r.setup_internal, "Inside the network (LAN)", "for a machine on this server's own network")}
+          ${profile(r.setup_external, "From the internet (public)", "for a machine that connects from outside")}
           <div style="margin-top:6px;"><b>Private key only</b> (for a client that is already configured):<br><textarea readonly style="width:100%;height:52px;font-family:monospace;font-size:11px;">${escapeHtml(r.private_key)}</textarea></div>
           <div style="margin-top:4px;opacity:0.7;">Public key (pinned): <span class="mono" style="word-break:break-all;">${escapeHtml(r.public_key)}</span></div>
+          <div style="margin-top:4px;opacity:0.75;">Treat these like the private key they contain: hand them over the way you would a password, not over a channel you would not send one on.</div>
         </div>`;
-        const copyBtn = $("genSetupCopy");
-        if (copyBtn) copyBtn.addEventListener("click", async () => {
+        const strings = {};
+        [r.setup_internal, r.setup_external].forEach((p) => { if (p && p.setup_string) strings[p.scope] = p; });
+        box.querySelectorAll("[data-gen-copy]").forEach((btn) => btn.addEventListener("click", async () => {
+          const scope = btn.dataset.genCopy;
           try {
-            await navigator.clipboard.writeText(r.setup_string);
-            setMsg("genSetupMsg", "Copied", true);
+            await navigator.clipboard.writeText(strings[scope].setup_string);
+            setMsg("genSetupMsg-" + scope, "Copied", true);
           } catch (e) {
-            const el = $("genSetupString");
+            const el = $("genSetup-" + scope);
             if (el) { el.focus(); el.select(); }
-            setMsg("genSetupMsg", "Press Ctrl+C to copy the selected text", false);
+            setMsg("genSetupMsg-" + scope, "Press Ctrl+C to copy the selected text", false);
           }
-        });
-        const dlBtn = $("genSetupDownload");
-        if (dlBtn) dlBtn.addEventListener("click", () => {
-          downloadText(r.setup_filename || "tbfdesk-setup-with-key.tbfsetup", r.setup_string);
-          setMsg("genSetupMsg", "Downloaded", true);
-        });
+        }));
+        box.querySelectorAll("[data-gen-download]").forEach((btn) => btn.addEventListener("click", () => {
+          const scope = btn.dataset.genDownload;
+          downloadText(btn.dataset.filename || ("tbfdesk-setup-" + scope + "-with-key.tbfsetup"), strings[scope].setup_string);
+          setMsg("genSetupMsg-" + scope, "Downloaded", true);
+        }));
         $("deviceKeyLabel").value = "";
         $("deviceKeyPeerId").value = "";
         loadDeviceKeys();
