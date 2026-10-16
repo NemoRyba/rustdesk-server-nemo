@@ -983,11 +983,11 @@
           </div>
           <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
             <input id="deviceKeyLabel" type="text" placeholder="label (e.g. Reception-PC)" style="min-width:220px;">
-            <input id="deviceKeyPeerId" list="deviceKeyPeerList" type="text" placeholder="bind to TBFDesk ID — pick or type (empty = any client)" style="min-width:300px;">
+            <input id="deviceKeyPeerId" list="deviceKeyPeerList" type="text" placeholder="bind to TBFDesk ID — pick or type (can be left empty and filled in later)" style="min-width:300px;">
             <datalist id="deviceKeyPeerList"></datalist>
             <button id="generateDeviceKey">Generate device key</button>
           </div>
-          <div style="font-size:12px;opacity:0.7;line-height:1.4;max-width:900px;">Binding a key to one TBFDesk ID means it can only authenticate <b>that</b> client &mdash; a leaked key no longer works fleet-wide. Leave empty only for a legacy any-client key.</div>
+          <div style="font-size:12px;opacity:0.7;line-height:1.4;max-width:900px;">Binding a key to one TBFDesk ID means it can only authenticate <b>that</b> client &mdash; a leaked key no longer works fleet-wide. <b>Empty is not &ldquo;any client&rdquo;:</b> an unbound key authenticates nothing until either you bind it here or you approve the first client that proves it. So it is safe to generate a key before you know the ID and fill the ID in afterwards &mdash; the <b>Bound to ID</b> column below is editable. The ID may be typed the way the client shows it (<span class="mono">456 456 456</span>); the spaces are stripped.</div>
           <div id="deviceKeyGenerated" style="display:none;"></div>
           <div class="table-wrap">
             <table>

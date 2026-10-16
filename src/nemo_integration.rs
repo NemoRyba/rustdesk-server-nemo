@@ -1010,7 +1010,10 @@ pub fn add_device_key(
         label,
         public_key: public_key.clone(),
         created_at,
-        peer_id: peer_id.trim().to_owned(),
+        // Operator-typed, like the editable field: accept the grouped form the client
+        // displays. The approve path deliberately does NOT normalize — the id there is
+        // the one the client reported, and it has to match the pending row byte-exact.
+        peer_id: normalize_peer_id(&peer_id),
         claimed_at: String::new(),
     };
     // Re-adding the SAME public key replaces its entry (label/binding update);
@@ -1200,6 +1203,21 @@ fn claim_device_key_in(
     Ok(true)
 }
 
+/// Operator-typed peer ids: strip ALL whitespace, not just the ends.
+///
+/// The client shows its id grouped in threes ("456 456 456"), so that is what an
+/// operator reading it off a screen types or pastes — and `456 456 456` must mean the
+/// same thing as `456456456` rather than being refused as malformed, which is a
+/// guaranteed support call otherwise. `is_whitespace` (not `== ' '`) so a non-breaking
+/// space pasted out of a GUI is handled too.
+///
+/// Only for ids a human enters. A client reports its own id programmatically and must
+/// keep matching byte-for-byte, so nothing on the request path normalizes — that is why
+/// `valid_peer_id` still refuses an id with spaces in it rather than accepting one.
+pub fn normalize_peer_id(raw: &str) -> String {
+    raw.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
 /// Peer ids are the client's own machine-derived id, and they end up in log lines,
 /// JSON and the dashboard, so keep them to the shape hbbs already accepts
 /// (`register_pk_core` refuses anything under 6 characters).
@@ -1219,7 +1237,9 @@ fn set_device_key_peer_id_in(
     id: &str,
     peer_id: &str,
 ) -> Result<DeviceKey, String> {
-    let peer_id = peer_id.trim();
+    // Typed by a human, so accept the grouped form the client displays.
+    let peer_id = normalize_peer_id(peer_id);
+    let peer_id = peer_id.as_str();
     if !peer_id.is_empty() && !valid_peer_id(peer_id) {
         return Err(
             "not a TBFDesk id: use 6-64 characters, letters, digits, '-' or '_' (empty clears \
@@ -3278,6 +3298,49 @@ mod tests {
         );
     }
 
+    // The operator types the id the client SHOWS, and the client shows it grouped in
+    // threes. Refusing that as malformed would be a support call every time, so the
+    // operator-typed paths normalize first — while the request path keeps comparing
+    // ids byte-for-byte.
+    #[test]
+    fn a_grouped_peer_id_is_the_same_id() {
+        assert_eq!(normalize_peer_id("456 456 456"), "456456456");
+        assert_eq!(normalize_peer_id("  456456456  "), "456456456");
+        assert_eq!(normalize_peer_id("456\t456\n456"), "456456456");
+        // Non-breaking space, as pasted out of a GUI.
+        assert_eq!(normalize_peer_id("456\u{a0}456\u{a0}456"), "456456456");
+        assert!(valid_peer_id(&normalize_peer_id("456 456 456")));
+        // Normalising must not invent a valid id out of junk.
+        assert!(!valid_peer_id(&normalize_peer_id("12 34")));
+        assert!(!valid_peer_id(&normalize_peer_id("456 456 45!")));
+        assert!(!valid_peer_id(&normalize_peer_id("   ")));
+
+        // The editable "Bound to ID" field takes the grouped form and stores it compact.
+        let mut keys = vec![DeviceKey {
+            id: "k1".to_owned(),
+            label: "Reception".to_owned(),
+            public_key: "pk1".to_owned(),
+            created_at: String::new(),
+            peer_id: String::new(),
+            claimed_at: "2026-10-16T00:00:00Z".to_owned(),
+        }];
+        let updated = set_device_key_peer_id_in(&mut keys, "k1", "456 456 456").unwrap();
+        assert_eq!(updated.peer_id, "456456456");
+        // An operator typing the id is not a first-use claim, so the stamp is cleared.
+        assert_eq!(updated.claimed_at, "");
+        // Junk is still refused, and leaves the stored binding alone.
+        let err = set_device_key_peer_id_in(&mut keys, "k1", "12 34").unwrap_err();
+        assert!(err.contains("not a TBFDesk id"), "{}", err);
+        assert_eq!(keys[0].peer_id, "456456456");
+        // Whitespace-only clears the binding rather than becoming a junk id.
+        assert_eq!(
+            set_device_key_peer_id_in(&mut keys, "k1", " \u{a0} ")
+                .unwrap()
+                .peer_id,
+            ""
+        );
+    }
+
     // A junk id must never reach the persisted table (it ends up in the dashboard, the
     // log and an API response), and a key deleted between the decision and the claim
     // fails closed.
@@ -3287,6 +3350,8 @@ mod tests {
         assert!(valid_peer_id("desk-01_a"));
         assert!(!valid_peer_id("short"));
         assert!(!valid_peer_id(""));
+        // Still refused HERE: a client's own reported id must match byte-for-byte, so
+        // only the operator-typed paths normalize (see the test below).
         assert!(!valid_peer_id("has spaces"));
         assert!(!valid_peer_id("semi;colon"));
         assert!(!valid_peer_id(&"x".repeat(65)));
