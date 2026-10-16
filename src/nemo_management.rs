@@ -1427,7 +1427,44 @@ pub(crate) async fn spawn_hbbs_api(
         login_enc_pk,
         login_enc_sk,
     };
+    // SPLIT-PORT: the routes CLIENTS call, as their own router, so they can also be
+    // served on a second bind that carries nothing else.
+    //
+    // Why this exists: the policy poll, the login and the address book share a listener
+    // with the dashboard and every /nemo/api admin route. An operator who restricts the
+    // admin port to their own address — the right instinct, since that port is a
+    // complete map of the management surface — also cuts off every REMOTE client's
+    // poll, login and device-key claim, with no way to allow one without the other.
+    // Two binds let the firewall tell them apart.
+    //
+    // Authentication does not change and does not depend on which bind a request
+    // arrives on: these routes authenticate the CLIENT (device-key signature, or the
+    // login credential), never the admin token, so exposing this set is not exposing
+    // the admin API.
+    let client_routes = || {
+        Router::new()
+            // The client's first call: "is this TLS certificate yours?" (it pins the
+            // fingerprint from the setup bundle). Unauthenticated by necessity — it is
+            // what bootstraps trust — and it reveals only the cert the TLS handshake
+            // already presented.
+            .route(
+                "/api/tls-cert-info",
+                get(api_tls_cert_info).post(api_tls_cert_info),
+            )
+            .route("/api/login-key", get(api_login_key).post(api_login_key))
+            .route("/api/login", post(api_login))
+            .route("/api/logout", post(api_logout))
+            .route("/api/currentUser", post(api_current_user))
+            .route("/api/ab/get", post(api_ab_get))
+            .route("/nemo/api/client/policy", post(client_policy))
+            .route("/nemo/api/client/audit/:kind", post(client_audit))
+            // Clients poll this for the update manifest; publishing one is an admin
+            // route (POST /nemo/api/update) and is deliberately NOT here.
+            .route("/nemo/api/update/latest", get(get_update_latest))
+    };
+
     let app = Router::new()
+        .merge(client_routes())
         // TASK-18: the dashboard HTML is a complete map of the management surface
         // -- every /nemo/api route, every pushed policy key, the LDAP and device-key
         // workflows, the running build id -- and the shipped systemd unit binds
@@ -1458,9 +1495,6 @@ pub(crate) async fn spawn_hbbs_api(
             "/nemo/api/peers/:id/management-policy",
             get(get_peer_management_policy).put(update_peer_management_policy),
         )
-        .route("/nemo/api/client/policy", post(client_policy))
-        // TASK-25: device-key-signed audit uploads from clients (conn/file/alarm).
-        .route("/nemo/api/client/audit/:kind", post(client_audit))
         .route("/nemo/api/policy", get(get_policy).put(update_policy))
         // Break-glass: mint a new server identity key and retire the current one. Locks out
         // every client still carrying the old key, so it needs an explicit confirmation in
@@ -1518,22 +1552,9 @@ pub(crate) async fn spawn_hbbs_api(
         )
         .route("/nemo/api/connections", get(get_connections))
         .route("/nemo/api/connections/cut", post(cut_connection))
-        // Auto-update: the client-facing signed manifest (unauthenticated — every
-        // client polls it) and the admin publish / withdraw endpoints.
-        .route("/nemo/api/update/latest", get(get_update_latest))
         .route("/nemo/api/update", post(put_update_manifest))
         .route("/nemo/api/update/delete", post(delete_update_manifest))
-        // RustDesk-client-facing login + server-driven address book.
-        .route("/api/login-key", get(api_login_key).post(api_login_key))
-        .route(
-            "/api/tls-cert-info",
-            get(api_tls_cert_info).post(api_tls_cert_info),
-        )
-        .route("/api/login", post(api_login))
-        .route("/api/logout", post(api_logout))
-        .route("/api/currentUser", post(api_current_user))
-        .route("/api/ab/get", post(api_ab_get))
-        .layer(Extension(state))
+        .layer(Extension(state.clone()))
         // SEC-9: applied last so it wraps every route above, including the
         // unauthenticated ones, and runs before any extractor reads the body.
         .layer(axum::middleware::from_fn(limit_request_body));
@@ -1600,6 +1621,74 @@ pub(crate) async fn spawn_hbbs_api(
     // TODO 7: the relayed-byte poller runs with the dashboard, because the dashboard is
     // the only consumer of what it collects. Before the TLS branch below, which returns.
     spawn_relay_usage_poller();
+
+    // SPLIT-PORT: an optional second listener carrying ONLY the client routes, so the
+    // admin bind can be firewalled to the operator's own address without cutting off
+    // remote clients. Unset (the default) changes nothing: everything stays on one
+    // bind, exactly as before.
+    //
+    // It shares this listener's TLS decision and certificate on purpose: clients pin
+    // the fingerprint from their setup bundle, so a second cert would mean a second
+    // fingerprint and a bootstrap that fails on the first call it makes
+    // (/api/tls-cert-info).
+    let client_bind = get_arg("nemo-client-api-bind");
+    if !client_bind.is_empty() {
+        let client_addr: SocketAddr = client_bind.parse().map_err(|e| {
+            hbb_common::anyhow::anyhow!("--nemo-client-api-bind {}: {}", client_bind, e)
+        })?;
+        if client_addr == addr {
+            bail!(
+                "--nemo-client-api-bind {} is the same address as --nemo-api-bind; use a \
+                 different port, or drop the flag to serve everything on one bind",
+                client_addr
+            );
+        }
+        let client_app = client_routes()
+            .layer(Extension(state))
+            .layer(axum::middleware::from_fn(limit_request_body));
+        // No admin token crosses this bind and no admin route is mounted on it, so the
+        // plaintext refusal above (which exists to protect that token) does not apply
+        // here. Client traffic still carries sealed secrets, so it follows the same TLS
+        // decision rather than getting its own weaker one.
+        if use_tls {
+            #[cfg(feature = "nemo-tls")]
+            {
+                let config = resolve_rustls(&cert_path, &key_path).await?;
+                log::info!(
+                    "Nemo CLIENT API listening on https://{} (policy poll, login, address \
+                     book, audit, update manifest). The admin API and dashboard are on {} \
+                     only.",
+                    client_addr,
+                    addr
+                );
+                tokio::spawn(async move {
+                    if let Err(err) = axum_server::bind_rustls(client_addr, config)
+                        .serve(client_app.into_make_service_with_connect_info::<SocketAddr>())
+                        .await
+                    {
+                        log::error!("Nemo client API (TLS) failed: {}", err);
+                    }
+                });
+            }
+            #[cfg(not(feature = "nemo-tls"))]
+            {
+                bail!(
+                    "TLS was requested for the Nemo client API but this build lacks the \
+                     nemo-tls feature"
+                );
+            }
+        } else {
+            log::info!("Nemo CLIENT API listening on http://{}", client_addr);
+            tokio::spawn(async move {
+                if let Err(err) = axum::Server::bind(&client_addr)
+                    .serve(client_app.into_make_service_with_connect_info::<SocketAddr>())
+                    .await
+                {
+                    log::error!("Nemo client API failed: {}", err);
+                }
+            });
+        }
+    }
 
     if use_tls {
         #[cfg(feature = "nemo-tls")]
@@ -2922,13 +3011,18 @@ fn client_setup_server(
         _ => (host_header, ""),
     };
     let host = host.trim_matches(|c| c == '[' || c == ']');
-    // The API port is the one thing both profiles share, so it is taken from the
-    // dashboard address even for the public profile - only the HOST differs.
-    let api_port = if port.is_empty() {
-        String::new()
-    } else {
-        format!(":{}", port)
-    };
+    // The API port is the one thing both profiles share, so only the HOST differs.
+    //
+    // Normally it is the port of the address the operator administers from, because
+    // that is an address a client has been PROVEN to reach this API on — including a
+    // reverse proxy on 443, where appending the listener's own port would be wrong.
+    // `host_header` above is really the request authority, so this now also works over
+    // HTTP/2, where there is no Host header at all (it is the `:authority`
+    // pseudo-header) and every exported bundle used to lose its port and point at 443.
+    //
+    // A dedicated client bind overrides it: that listener is the one clients must use,
+    // and the address the admin happens to browse cannot imply its port.
+    let api_port = api_port_suffix(dedicated_client_api_port(), port);
     let public_host = relay_host(&get_arg("relay-servers"));
     let api_default = match scope {
         ClientSetupScope::Internal => {
@@ -3097,6 +3191,47 @@ struct ClientSetupResponse {
     issued_from: String,
 }
 
+/// Which port an exported bundle tells clients to use, as a `":port"` suffix (empty =
+/// none, i.e. the scheme default). Pure, so the precedence is testable without
+/// touching the process-global argument table.
+///
+/// A dedicated client listener wins: that is the socket clients must reach, and the
+/// address the operator browsed says nothing about it. Otherwise the authority's own
+/// port is used — which is empty behind a reverse proxy on 443, and must STAY empty
+/// there rather than having a listener port appended.
+fn api_port_suffix(dedicated: Option<u16>, authority_port: &str) -> String {
+    match dedicated {
+        Some(port) => format!(":{}", port),
+        None if authority_port.is_empty() => String::new(),
+        None => format!(":{}", authority_port),
+    }
+}
+
+/// SPLIT-PORT: the port of the dedicated client listener, when one is configured.
+/// `None` means there is no second bind, so the client API is wherever the admin API
+/// is. Parsed from the same argument the listener itself uses, so the two cannot drift.
+fn dedicated_client_api_port() -> Option<u16> {
+    let bind = get_arg("nemo-client-api-bind");
+    if bind.is_empty() {
+        return None;
+    }
+    bind.parse::<SocketAddr>().ok().map(|a| a.port())
+}
+
+/// The address this request was addressed to: the `:authority` pseudo-header on
+/// HTTP/2, the `Host` header on HTTP/1.
+///
+/// Reading only `Host` was a real bug: axum exposes h2's `:authority` through the URI,
+/// never as a HOST header, so on an h2 dashboard connection every caller of this saw
+/// an empty string — which is why exported setup bundles lost their API port and the
+/// LAN profile reported "cannot work out this server's address".
+fn request_authority(uri: &axum::http::Uri, headers: &HeaderMap) -> String {
+    match uri.authority() {
+        Some(authority) => authority.to_string(),
+        None => host_header(headers),
+    }
+}
+
 fn host_header(headers: &HeaderMap) -> String {
     headers
         .get(axum::http::header::HOST)
@@ -3107,13 +3242,12 @@ fn host_header(headers: &HeaderMap) -> String {
 
 fn build_client_setup(
     overrides: &ClientSetupRequest,
-    headers: &HeaderMap,
+    authority: &str,
     server_public_key: &str,
     device_key: &str,
     scope: ClientSetupScope,
 ) -> Result<(ClientSetupServer, String, String), String> {
-    let host = host_header(headers);
-    let server = client_setup_server(overrides, &host, server_public_key, scope);
+    let server = client_setup_server(overrides, authority, server_public_key, scope);
     if server.id_server.is_empty() || server.api_server.is_empty() {
         return Err(match scope {
             ClientSetupScope::Internal => "cannot work out this server's address on the \
@@ -3135,7 +3269,7 @@ fn build_client_setup(
         v: 1,
         label: label.clone(),
         issued_at: now_iso(),
-        issued_from: host.clone(),
+        issued_from: authority.to_owned(),
         scope: scope.as_str().to_owned(),
         server: server.clone(),
         device_key: device_key.to_owned(),
@@ -3152,12 +3286,12 @@ fn build_client_setup(
 /// public profile being underivable must not stop the LAN one from being handed out.
 fn client_setup_profile(
     overrides: &ClientSetupRequest,
-    headers: &HeaderMap,
+    authority: &str,
     server_public_key: &str,
     device_key: &str,
     scope: ClientSetupScope,
 ) -> ClientSetupProfile {
-    match build_client_setup(overrides, headers, server_public_key, device_key, scope) {
+    match build_client_setup(overrides, authority, server_public_key, device_key, scope) {
         Ok((server, setup_string, filename)) => ClientSetupProfile {
             scope: scope.as_str().to_owned(),
             server,
@@ -3167,7 +3301,7 @@ fn client_setup_profile(
         },
         Err(error) => ClientSetupProfile {
             scope: scope.as_str().to_owned(),
-            server: client_setup_server(overrides, &host_header(headers), server_public_key, scope),
+            server: client_setup_server(overrides, authority, server_public_key, scope),
             error,
             ..Default::default()
         },
@@ -3179,26 +3313,28 @@ fn client_setup_profile(
 /// its own `error` and the other one is still usable.
 async fn get_client_setup(
     Extension(state): Extension<HbbsApiState>,
+    axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
     headers: HeaderMap,
 ) -> ApiResult<ClientSetupResponse> {
     require_auth(&headers, &state.token)?;
+    let authority = request_authority(&uri, &headers);
     let blank = ClientSetupRequest::default();
     Ok(Json(ClientSetupResponse {
         internal: client_setup_profile(
             &blank,
-            &headers,
+            &authority,
             &state.server_public_key,
             "",
             ClientSetupScope::Internal,
         ),
         external: client_setup_profile(
             &blank,
-            &headers,
+            &authority,
             &state.server_public_key,
             "",
             ClientSetupScope::External,
         ),
-        issued_from: host_header(&headers),
+        issued_from: authority.clone(),
     }))
 }
 
@@ -3207,13 +3343,15 @@ async fn get_client_setup(
 /// `scope` picks which; omitting it means the LAN profile.
 async fn post_client_setup(
     Extension(state): Extension<HbbsApiState>,
+    axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
     headers: HeaderMap,
     Json(req): Json<ClientSetupRequest>,
 ) -> ApiResult<ClientSetupProfile> {
     require_auth(&headers, &state.token)?;
+    let authority = request_authority(&uri, &headers);
     let scope = ClientSetupScope::parse(req.scope.as_deref());
     let (server, setup_string, filename) =
-        build_client_setup(&req, &headers, &state.server_public_key, "", scope)
+        build_client_setup(&req, &authority, &state.server_public_key, "", scope)
             .map_err(|e| api_error(StatusCode::BAD_REQUEST, &e))?;
     Ok(Json(ClientSetupProfile {
         scope: scope.as_str().to_owned(),
@@ -3268,6 +3406,7 @@ struct GenerateDeviceKeyResponse {
 }
 async fn generate_device_key(
     Extension(state): Extension<HbbsApiState>,
+    axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
     headers: HeaderMap,
     Json(req): Json<GenerateDeviceKeyRequest>,
 ) -> ApiResult<GenerateDeviceKeyResponse> {
@@ -3296,14 +3435,14 @@ async fn generate_device_key(
     };
     let setup_internal = client_setup_profile(
         &labelled(req.setup.internal.clone()),
-        &headers,
+        &request_authority(&uri, &headers),
         &state.server_public_key,
         &private_key,
         ClientSetupScope::Internal,
     );
     let setup_external = client_setup_profile(
         &labelled(req.setup.external.clone()),
-        &headers,
+        &request_authority(&uri, &headers),
         &state.server_public_key,
         &private_key,
         ClientSetupScope::External,
@@ -7460,6 +7599,46 @@ mod tests {
     // port), an IPv6 literal is bracketed, and the operator has to be able to override
     // every field for a roaming client. Those are the four things that can go wrong.
     #[test]
+    /// SPLIT-PORT + the HTTP/2 bug. Which port a bundle advertises, and where the
+    /// address it is derived from comes from.
+    #[test]
+    fn the_bundle_advertises_the_port_clients_must_actually_use() {
+        // No dedicated client bind: the authority's port is used as-is...
+        assert_eq!(api_port_suffix(None, "21120"), ":21120");
+        // ...and a reverse proxy on 443 keeps NO port. Appending the listener's own
+        // port here would send every client to a socket the proxy does not expose.
+        assert_eq!(api_port_suffix(None, ""), "");
+        // A dedicated client listener wins over both: it is the socket clients must
+        // reach, and the address the operator browsed cannot imply its port.
+        assert_eq!(api_port_suffix(Some(21121), "21120"), ":21121");
+        assert_eq!(api_port_suffix(Some(21121), ""), ":21121");
+
+        // The address itself: HTTP/1 carries it in Host, HTTP/2 only as `:authority`,
+        // which axum exposes through the URI. Reading Host alone made every bundle
+        // exported over an h2 dashboard connection lose its port (and the LAN profile
+        // claim the server could not work out its own address).
+        let mut h1 = HeaderMap::new();
+        h1.insert(
+            axum::http::header::HOST,
+            "85.126.226.2:21120".parse().unwrap(),
+        );
+        let origin_form: axum::http::Uri = "/nemo/api/client-setup".parse().unwrap();
+        assert_eq!(request_authority(&origin_form, &h1), "85.126.226.2:21120");
+
+        let absolute: axum::http::Uri = "https://85.126.226.2:21120/nemo/api/client-setup"
+            .parse()
+            .unwrap();
+        assert_eq!(
+            request_authority(&absolute, &HeaderMap::new()),
+            "85.126.226.2:21120",
+            "h2 sends no Host header; the authority has to come from the URI"
+        );
+        // Neither available: invent nothing, so build_client_setup refuses rather than
+        // handing out a bundle that points nowhere.
+        assert_eq!(request_authority(&origin_form, &HeaderMap::new()), "");
+    }
+
+    #[test]
     fn client_setup_defaults_come_from_the_dashboard_address() {
         let none = ClientSetupRequest::default();
         let lan = ClientSetupScope::Internal;
@@ -7486,7 +7665,7 @@ mod tests {
         // than handing out a bundle that points nowhere.
         let s = client_setup_server(&none, "", "k", lan);
         assert!(s.api_server.is_empty() && s.id_server.is_empty());
-        assert!(build_client_setup(&none, &HeaderMap::new(), "k", "", lan).is_err());
+        assert!(build_client_setup(&none, "", "k", "", lan).is_err());
 
         // The operator's edits win - the point of showing the fields at all, since a
         // LAN dashboard session cannot know a roaming client's public address.
@@ -7522,10 +7701,10 @@ mod tests {
         let s = client_setup_server(&none, "10.0.0.5:21120", "k", wan);
         assert!(s.id_server.is_empty(), "{:?}", s.id_server);
         assert!(s.api_server.is_empty(), "{:?}", s.api_server);
-        let err = build_client_setup(&none, &HeaderMap::new(), "k", "", wan).unwrap_err();
+        let err = build_client_setup(&none, "", "k", "", wan).unwrap_err();
         assert!(err.contains("public address"), "{}", err);
         // ...and the failure stays inside that one profile: the LAN one is still built.
-        let profile = client_setup_profile(&none, &HeaderMap::new(), "k", "", wan);
+        let profile = client_setup_profile(&none, "", "k", "", wan);
         assert_eq!(profile.scope, "external");
         assert!(profile.setup_string.is_empty() && !profile.error.is_empty());
 

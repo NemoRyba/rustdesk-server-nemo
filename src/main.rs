@@ -28,6 +28,7 @@ fn main() -> ResultType<()> {
         , --nemo-api=[BOOL(default=N)] 'Enable Nemo management API'
         , --nemo-api-bind=[ADDR(default=127.0.0.1:21120)] 'Sets Nemo management API bind address'
         , --nemo-api-token=[TOKEN] 'Requires Bearer or X-Nemo-Token auth for Nemo management API'
+        , --nemo-client-api-bind=[ADDR] 'Optional SECOND bind serving only the client-facing routes (policy poll, login, address book, audit, update manifest, tls-cert-info) and no admin route or dashboard. Lets the admin bind be firewalled to the operator while remote clients still reach what they need. Shares the admin bind TLS setting and certificate, because clients pin its fingerprint. Unset = everything on --nemo-api-bind, as before.'
         , --nemo-api-tls=[MODE] 'Nemo API TLS: auto (self-signed) | off. Default ON for any routable bind -- `off` needs --nemo-api-allow-insecure Y and puts the admin token in the clear.'
         , --nemo-api-tls-cert=[FILE] 'PEM certificate for the Nemo API (with --nemo-api-tls-key)'
         , --nemo-api-tls-key=[FILE] 'PEM private key for the Nemo API (with --nemo-api-tls-cert)'
