@@ -91,8 +91,67 @@ git revert <nemo-management-api-commit>
 - `POST /nemo/api/client/policy` with JSON body `{"id":"123456789","uuid":"base64"}`
 - `GET /nemo/api/policy`
 - `PUT /nemo/api/policy` with JSON body `{"company_only":true}`
-- `GET /nemo/api/stats`
+- `GET /nemo/api/stats` — totals, per-peer counters, and (TODO 7) `relay_sessions`:
+  what the relay actually carried per session, joined to the two peers hbbs brokered it
+  for. `totals.relay_bytes` counts each session once; the per-peer `relay_bytes` charges
+  both ends, so the per-peer numbers do not add up to the fleet total.
 - `GET /nemo/api/events?limit=100`
+
+### Device keys
+
+- `GET /nemo/api/device-keys`
+- `POST /nemo/api/device-keys` with JSON body `{"label":"Reception-PC","peer_id":"123456789"}`
+  — generates a keypair, pins the public half, and returns the private half **once**.
+  `peer_id` may be empty: the key is then a one-shot provisioning token (see
+  *Device-key claims* below). The response also carries `setup_string` (see
+  *Client setup* below), `setup_filename` and `setup_server`; `setup_error` is non-empty
+  when the string could not be built, in which case the key itself is still pinned.
+  The body may also carry any of the client-setup fields to override the derivation.
+- `POST /nemo/api/device-keys/{id}/delete` — also ends the sessions that key's peer holds.
+- `POST /nemo/api/device-keys/{id}/peer-id` with `{"peer_id":"123456789"}` — bind by hand,
+  or send `""` to clear the binding and re-arm the key as a claimable token.
+
+### Device-key claims
+
+An unbound pinned key is a provisioning token: the first client that **proves** it is
+still refused and files a claim for the operator to confirm. Full rationale in
+`DEVICE-KEY-CLAIM.md` in the superproject.
+
+- `GET /nemo/api/device-key-claims` → `{"claims":[…],"claim_unbound_device_keys":true}`
+- `POST /nemo/api/device-keys/{id}/claim/approve` with `{"peer_id":"…"}` — the only path
+  that writes a binding the operator did not type. Drops the key's other pending rows.
+- `POST /nemo/api/device-keys/{id}/claim/deny` with `{"peer_id":"…"}` — the row stays,
+  marked, so the client's next poll does not re-raise it.
+- `POST /nemo/api/device-keys/{id}/claim/forget` with `{"peer_id":"…"}` — lets a denied
+  client ask again.
+
+`claim_unbound_device_keys` is also a `PUT /nemo/api/policy` field, and the health/policy
+response reports it along with `pending_device_key_claims` (the waiting count).
+
+### Client setup
+
+Everything a fresh client needs to reach this server, as one importable string
+(`tbfdesk-setup-v1:<base64 json>`): the ID/rendezvous server, the relay, the api-server
+URL (used as both `api-server` and `nemo-management-server`), the server's identity key
+(used as both `key` and `nemo-management-public-key`) and, for a self-signed API, its
+certificate fingerprint.
+
+- `GET /nemo/api/client-setup` → `{"server":{…},"setup_string":"…","filename":"…","issued_from":"…"}`
+  — the derived defaults and a string with **no** device key in it.
+- `POST /nemo/api/client-setup` with any of
+  `{"id_server":"…","relay_server":"…","api_server":"…","api_cert_fingerprint":"…","label":"…"}`
+  — the same, with the operator's edits. An omitted field uses the server's default; an
+  explicitly empty `api_cert_fingerprint` means "do not pin" and is not refilled.
+
+The defaults come from the **Host header of the request**, because that is the one address
+the caller has proven a client can reach this API on. The ID server deliberately does not
+inherit the API port, and the relay defaults to this server's own `-r`. Override the
+derivation with `--nemo-client-id-server`, `--nemo-client-relay` and `--nemo-client-api`.
+
+The bundle carries the client's trust anchor and is deliberately unsigned — what a
+signature would be verified against is the identity key inside it — so it has to be moved
+like a password. The client half is documented in the client repo's
+`docs/nemo-provisioning.md`.
 
 ## Policy
 
@@ -151,11 +210,18 @@ when an updated Nemo client identifies itself in the request:
 - `nemo-outbound-targets` limits outgoing control attempts to exact target IDs
   separated by comma, semicolon, or whitespace. `*` allows every target.
 
-The source identity is encoded inside existing RustDesk rendezvous fields, so
-this does not require a fork of the `hbb_common` protobuf submodule. Older
-clients that do not send a Nemo source identity can still be blocked as targets
-and can receive management policy, but hbbs cannot authenticate them as
-controllers during rendezvous.
+The source identity travels in `NemoSource {id, uuid, token}` on `PunchHoleRequest` and
+`RequestRelay` (TODO 8, forked `hbb_common`). It used to be encoded inside existing
+rendezvous fields — `PunchHoleRequest.version` and `RequestRelay.licence_key` — to avoid
+forking the protobuf schema, and the server still reads that marker, so an un-updated
+client on either side keeps working. A client that sends both and disagrees with itself
+is logged and the field wins.
+
+Either way this identity is **asserted, not proved**. What proves a controller is the
+device-key handshake (`NemoClientAuth`), which binds the whole connection to one peer id;
+the server prefers that proof wherever both exist and fails closed when a connection can
+name no controller at all. Older clients that send no source identity can still be
+blocked as targets and can receive management policy.
 
 ## Data Covered
 
@@ -169,6 +235,15 @@ The API exposes:
   request/response counters, and policy rejections
 - block/allow/reset controls for registered peers
 
-Actual relay byte counters still live inside `hbbr`; this API records relay
-negotiation from `hbbs`, which is the part needed to debug why a connection was
-sent toward relay instead of direct punching.
+Relay **byte** counters live inside `hbbr`, and since TODO 7 this API reports them too:
+hbbs remembers which session a relay grant belongs to, polls hbbr over its loopback admin
+channel (`uj`, the machine-readable twin of `usage`) and serves the result in
+`GET /nemo/api/stats` as `relay_sessions` plus the `relay_bytes` totals. The join key is a
+**hash** of the grant, so nothing that could be used to join a session crosses that
+channel and hbbr still learns no peer id.
+
+Two consequences worth knowing: hbbr's admin channel only answers on loopback, so a relay
+on another host reports nothing unless its port is tunnelled to the hbbs host
+(`--nemo-relay-metrics <host:port>`, `--nemo-relay-metrics-interval`, `""` or `N` to turn
+it off); and a session row with no bytes is the **good** outcome — the relay was offered,
+the two machines went direct, and the grant expired unused.
