@@ -1486,6 +1486,12 @@ pub(crate) async fn spawn_hbbs_api(
             get(list_device_keys).post(generate_device_key),
         )
         .route("/nemo/api/device-keys/:id/delete", post(delete_device_key))
+        // The first-run settings bundle: GET for the defaults + a key-less string, POST
+        // to apply the operator's edits.
+        .route(
+            "/nemo/api/client-setup",
+            get(get_client_setup).post(post_client_setup),
+        )
         // M1-CLAIM: the pending-claim queue and the editable "Bound to ID" field.
         .route("/nemo/api/device-key-claims", get(list_device_key_claims))
         .route(
@@ -2761,6 +2767,293 @@ async fn put_permissions(
     }
 }
 
+// --- Client setup bundle: everything a fresh client needs, in one string -----
+//
+// A first install needs SIX values typed in by hand before it can reach this server at
+// all: the ID/rendezvous server, the relay, the api-server URL, the management server
+// URL, the server's identity key, and (for a self-signed API) the certificate pin --
+// and then the device key on top. Every one of them is exact, most are long, and a
+// single typo fails as "cannot reach the server", which is indistinguishable from a
+// network problem. That is the whole first-run experience of this fork, repeated per
+// machine.
+//
+// So the server, which knows all of them, hands them over as one string the client can
+// import the same way it imports a device key. Generating a device key produces the
+// string WITH the key in it, so a provisioning run is: generate here, paste there.
+//
+// It is NOT signed, and signing it would be theatre: the thing a client would verify a
+// signature against is the identity key that is *inside* the bundle. The bundle is the
+// trust anchor, so it has to be moved like one -- the same rule the device key already
+// has, and the same rule the host=..,key=.. exe name has had all along.
+const CLIENT_SETUP_PREFIX: &str = "tbfdesk-setup-v1:";
+
+/// The server-side half: what every client on this server needs, regardless of which
+/// machine it is. Serialized into the bundle and also returned on its own, so the
+/// dashboard can show the operator exactly what it is about to hand out.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub(crate) struct ClientSetupServer {
+    /// `custom-rendezvous-server` -- host, or host:port when the port is not the default.
+    id_server: String,
+    /// `relay-server`. Empty is valid and common: hbbs hands out its own `-r` at
+    /// runtime, so a client with no relay configured still relays.
+    relay_server: String,
+    /// `api-server` AND `nemo-management-server` (login, address book, signed policy).
+    api_server: String,
+    /// The server's Ed25519 identity key, base64: the client's `key` (verifies the
+    /// rendezvous handshake and the signed id/pk) and `nemo-management-public-key`
+    /// (verifies signed policy). One value, two option names.
+    key: String,
+    /// `nemo-api-cert-fingerprint` -- only for a self-signed API, where it is what lets
+    /// the client stop accepting any certificate. Empty when the API serves a CA-signed
+    /// certificate (the client validates normally) or no TLS at all.
+    api_cert_fingerprint: String,
+}
+
+/// The whole bundle. `device_key` is present only in the string generated together with
+/// a key -- it is that key's PRIVATE half, shown once and never stored here.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct ClientSetupBundle {
+    v: u32,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    label: String,
+    issued_at: String,
+    /// The address the operator generated this from, for the log line on the client
+    /// side: a bundle made from a LAN dashboard session is wrong for a roaming client,
+    /// and this is the only clue to that after the fact.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    issued_from: String,
+    server: ClientSetupServer,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    device_key: String,
+}
+
+fn encode_client_setup(bundle: &ClientSetupBundle) -> Result<String, String> {
+    let json = serde_json::to_string(bundle).map_err(|e| e.to_string())?;
+    Ok(format!(
+        "{}{}",
+        CLIENT_SETUP_PREFIX,
+        base64::encode(json.as_bytes())
+    ))
+}
+
+/// Everything the operator may override, and what the server fills in when they do not.
+///
+/// The defaults come from the **Host header of the dashboard request**, which is a
+/// better guess than anything configured: the operator is reaching the API over exactly
+/// the address and port a client would have to use, so that is the address to hand out.
+/// It is still only a guess -- a LAN dashboard session cannot know a roaming client's
+/// public address -- which is why the dashboard shows the three fields and lets them be
+/// edited before anything is generated.
+fn client_setup_server(
+    overrides: &ClientSetupRequest,
+    host_header: &str,
+    server_public_key: &str,
+) -> ClientSetupServer {
+    let host_header = host_header.trim();
+    // host:port -> (host, port). An IPv6 literal in a Host header is bracketed, so the
+    // last colon is only a port separator when it comes after the closing bracket.
+    let (host, port) = match host_header.rfind(':') {
+        Some(idx) if idx > host_header.rfind(']').unwrap_or(0) => {
+            (&host_header[..idx], &host_header[idx + 1..])
+        }
+        _ => (host_header, ""),
+    };
+    let host = host.trim_matches(|c| c == '[' || c == ']');
+    let api_default = if host_header.is_empty() {
+        String::new()
+    } else if port.is_empty() {
+        format!("https://{}", host_header)
+    } else {
+        format!("https://{}:{}", host, port)
+    };
+    let api_server = first_non_empty(&[
+        overrides.api_server.as_deref().unwrap_or_default(),
+        &get_arg("nemo-client-api"),
+        &api_default,
+    ]);
+    // The rendezvous port is NOT the API port, so it is never taken from the Host
+    // header; the client's own default (21116) covers the normal case and is left
+    // implicit, exactly as a hand-typed address would be.
+    let rendezvous_port = get_arg_or("port", hbb_common::config::RENDEZVOUS_PORT.to_string());
+    let id_default = if host.is_empty() {
+        String::new()
+    } else if rendezvous_port == hbb_common::config::RENDEZVOUS_PORT.to_string() {
+        host.to_owned()
+    } else {
+        format!("{}:{}", host, rendezvous_port)
+    };
+    let id_server = first_non_empty(&[
+        overrides.id_server.as_deref().unwrap_or_default(),
+        &get_arg("nemo-client-id-server"),
+        &id_default,
+    ]);
+    // `-r` can carry several, comma separated; a client takes one address.
+    let relay_default = get_arg("relay-servers")
+        .split(',')
+        .map(str::trim)
+        .find(|s| !s.is_empty())
+        .unwrap_or_default()
+        .to_owned();
+    let relay_server = first_non_empty(&[
+        overrides.relay_server.as_deref().unwrap_or_default(),
+        &get_arg("nemo-client-relay"),
+        &relay_default,
+    ]);
+    // Only a self-signed certificate needs pinning; with a CA-signed one the client
+    // validates the normal way, and pinning it would strand the client at renewal.
+    let pin_default = API_CERT_INFO
+        .read()
+        .unwrap()
+        .as_ref()
+        .filter(|info| info.tls && info.mode == "self-signed")
+        .map(|info| info.fingerprint.clone())
+        .unwrap_or_default();
+    let api_cert_fingerprint = match overrides.api_cert_fingerprint.as_deref() {
+        // An explicit empty string means "do not pin", which is a real choice (a
+        // reverse proxy in front with its own certificate), so it is not overridden by
+        // the default below.
+        Some(explicit) => explicit.trim().to_owned(),
+        None => pin_default,
+    };
+    ClientSetupServer {
+        id_server,
+        relay_server,
+        api_server,
+        key: server_public_key.trim().to_owned(),
+        api_cert_fingerprint,
+    }
+}
+
+fn first_non_empty(candidates: &[&str]) -> String {
+    candidates
+        .iter()
+        .map(|c| c.trim())
+        .find(|c| !c.is_empty())
+        .unwrap_or_default()
+        .to_owned()
+}
+
+/// A filename an operator can keep apart from the next machine's.
+fn client_setup_filename(label: &str, with_key: bool) -> String {
+    let slug: String = label
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+        .collect();
+    let slug = slug.trim_matches('-').to_owned();
+    let stem = if slug.is_empty() { "tbfdesk".to_owned() } else { format!("tbfdesk-{}", slug) };
+    if with_key {
+        format!("{}-setup-with-key.tbfsetup", stem)
+    } else {
+        format!("{}-setup.tbfsetup", stem)
+    }
+}
+
+#[derive(Default, Deserialize)]
+struct ClientSetupRequest {
+    /// `None` = use the server's default; `Some("")` = deliberately blank.
+    #[serde(default)]
+    id_server: Option<String>,
+    #[serde(default)]
+    relay_server: Option<String>,
+    #[serde(default)]
+    api_server: Option<String>,
+    #[serde(default)]
+    api_cert_fingerprint: Option<String>,
+    #[serde(default)]
+    label: Option<String>,
+}
+
+#[derive(Serialize)]
+struct ClientSetupResponse {
+    server: ClientSetupServer,
+    /// The importable string. Carries no device key: this is the one an operator can
+    /// hand out freely to machines whose keys already exist.
+    setup_string: String,
+    filename: String,
+    /// What the defaults were derived from, so the dashboard can say so.
+    issued_from: String,
+}
+
+fn host_header(headers: &HeaderMap) -> String {
+    headers
+        .get(axum::http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_owned()
+}
+
+fn build_client_setup(
+    overrides: &ClientSetupRequest,
+    headers: &HeaderMap,
+    server_public_key: &str,
+    device_key: &str,
+) -> Result<(ClientSetupServer, String, String), String> {
+    let host = host_header(headers);
+    let server = client_setup_server(overrides, &host, server_public_key);
+    if server.id_server.is_empty() || server.api_server.is_empty() {
+        return Err(
+            "cannot work out this server's client-facing address; fill the ID server and \
+             api-server fields in, or start hbbs with --nemo-client-id-server / \
+             --nemo-client-api"
+                .to_owned(),
+        );
+    }
+    let label = overrides.label.clone().unwrap_or_default();
+    let bundle = ClientSetupBundle {
+        v: 1,
+        label: label.clone(),
+        issued_at: now_iso(),
+        issued_from: host.clone(),
+        server: server.clone(),
+        device_key: device_key.to_owned(),
+    };
+    let string = encode_client_setup(&bundle)?;
+    Ok((
+        server,
+        string,
+        client_setup_filename(&label, !device_key.is_empty()),
+    ))
+}
+
+/// GET: the defaults plus a ready-to-copy string with no device key in it.
+async fn get_client_setup(
+    Extension(state): Extension<HbbsApiState>,
+    headers: HeaderMap,
+) -> ApiResult<ClientSetupResponse> {
+    require_auth(&headers, &state.token)?;
+    let (server, setup_string, filename) = build_client_setup(
+        &ClientSetupRequest::default(),
+        &headers,
+        &state.server_public_key,
+        "",
+    )
+    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, &e))?;
+    Ok(Json(ClientSetupResponse {
+        server,
+        setup_string,
+        filename,
+        issued_from: host_header(&headers),
+    }))
+}
+
+/// POST: the same, with the operator's edits applied.
+async fn post_client_setup(
+    Extension(state): Extension<HbbsApiState>,
+    headers: HeaderMap,
+    Json(req): Json<ClientSetupRequest>,
+) -> ApiResult<ClientSetupResponse> {
+    require_auth(&headers, &state.token)?;
+    let (server, setup_string, filename) =
+        build_client_setup(&req, &headers, &state.server_public_key, "")
+            .map_err(|e| api_error(StatusCode::BAD_REQUEST, &e))?;
+    Ok(Json(ClientSetupResponse {
+        server,
+        setup_string,
+        filename,
+        issued_from: host_header(&headers),
+    }))
+}
+
 // --- S-DUALKEY: provisioned device keys -------------------------------------
 #[derive(Deserialize)]
 struct GenerateDeviceKeyRequest {
@@ -2769,6 +3062,11 @@ struct GenerateDeviceKeyRequest {
     /// M1: the peer id this key is generated FOR. Empty = unbound legacy key.
     #[serde(default)]
     peer_id: String,
+    /// The client-setup values to bake into this key's setup string. Omitted fields fall
+    /// back to the server's defaults, so a caller that sends nothing still gets a
+    /// complete, usable string.
+    #[serde(default, flatten)]
+    setup: ClientSetupRequest,
 }
 #[derive(Serialize)]
 struct GenerateDeviceKeyResponse {
@@ -2778,6 +3076,19 @@ struct GenerateDeviceKeyResponse {
     private_key: String,
     created_at: String,
     peer_id: String,
+    /// The whole first run in one string: this key's private half plus the six server
+    /// values a fresh client would otherwise have to be told by hand. Shown once, with
+    /// the private key, and never stored.
+    setup_string: String,
+    /// Suggested download name, so two machines' files do not collide in Downloads.
+    setup_filename: String,
+    /// What went into it, so the dashboard can show the operator what they are handing
+    /// over rather than an opaque blob.
+    setup_server: ClientSetupServer,
+    /// Non-empty when the setup string could NOT be built (the server cannot work out
+    /// its own client-facing address). The key itself is still generated and pinned -
+    /// losing the convenience must not lose the key.
+    setup_error: String,
 }
 async fn generate_device_key(
     Extension(state): Extension<HbbsApiState>,
@@ -2795,6 +3106,25 @@ async fn generate_device_key(
         created_at.clone(),
         req.peer_id,
     );
+    // The key is pinned at this point. The setup string is a convenience on top, so a
+    // failure to build it is reported in the response rather than losing the key.
+    let mut setup = ClientSetupRequest {
+        label: req.setup.label.clone().or_else(|| Some(dk.label.clone())),
+        ..req.setup
+    };
+    if setup.label.as_deref().unwrap_or_default().is_empty() {
+        setup.label = Some(dk.peer_id.clone());
+    }
+    let (setup_server, setup_string, setup_filename, setup_error) =
+        match build_client_setup(&setup, &headers, &state.server_public_key, &private_key) {
+            Ok((server, string, filename)) => (server, string, filename, String::new()),
+            Err(err) => (
+                ClientSetupServer::default(),
+                String::new(),
+                String::new(),
+                err,
+            ),
+        };
     Ok(Json(GenerateDeviceKeyResponse {
         id: dk.id,
         label: dk.label,
@@ -2802,6 +3132,10 @@ async fn generate_device_key(
         private_key,
         created_at,
         peer_id: dk.peer_id,
+        setup_string,
+        setup_filename,
+        setup_server,
+        setup_error,
     }))
 }
 async fn list_device_keys(
@@ -6931,6 +7265,109 @@ mod tests {
             "claim-peer-9"
         ));
         integration::unpin_device_key_for_test(&pub_b64);
+    }
+
+    // The first-run settings bundle. The default address comes from the Host header of
+    // the dashboard request, because that is the one address the operator has PROVEN a
+    // client can reach this API on - but the ports differ (the API is not the rendezvous
+    // port), an IPv6 literal is bracketed, and the operator has to be able to override
+    // every field for a roaming client. Those are the four things that can go wrong.
+    #[test]
+    fn client_setup_defaults_come_from_the_dashboard_address() {
+        let none = ClientSetupRequest::default();
+
+        // host:port -> api keeps the port, the ID server does NOT (21116 is the
+        // client's own default and a hand-typed address would leave it implicit too).
+        let s = client_setup_server(&none, "10.0.0.5:21120", " KEYB64 ");
+        assert_eq!(s.api_server, "https://10.0.0.5:21120");
+        assert_eq!(s.id_server, "10.0.0.5");
+        assert_eq!(s.key, "KEYB64", "the key is trimmed, not passed through raw");
+
+        // A Host header with no port at all (a reverse proxy on 443).
+        let s = client_setup_server(&none, "tbfdesk.example.com", "k");
+        assert_eq!(s.api_server, "https://tbfdesk.example.com");
+        assert_eq!(s.id_server, "tbfdesk.example.com");
+
+        // IPv6 literals are bracketed in a Host header, and the colons inside the
+        // address are not port separators.
+        let s = client_setup_server(&none, "[fd00::1]:21120", "k");
+        assert_eq!(s.api_server, "https://fd00::1:21120");
+        assert_eq!(s.id_server, "fd00::1");
+
+        // No Host header: nothing is invented, and build_client_setup refuses rather
+        // than handing out a bundle that points nowhere.
+        let s = client_setup_server(&none, "", "k");
+        assert!(s.api_server.is_empty() && s.id_server.is_empty());
+        assert!(build_client_setup(&none, &HeaderMap::new(), "k", "").is_err());
+
+        // The operator's edits win - the point of showing the fields at all, since a
+        // LAN dashboard session cannot know a roaming client's public address.
+        let edited = ClientSetupRequest {
+            id_server: Some("85.126.226.2".to_owned()),
+            relay_server: Some("85.126.226.2".to_owned()),
+            api_server: Some("https://tbfdesk.example.com:21120".to_owned()),
+            api_cert_fingerprint: Some("  ".to_owned()),
+            label: Some("Reception".to_owned()),
+        };
+        let s = client_setup_server(&edited, "10.0.0.5:21120", "k");
+        assert_eq!(s.id_server, "85.126.226.2");
+        assert_eq!(s.relay_server, "85.126.226.2");
+        assert_eq!(s.api_server, "https://tbfdesk.example.com:21120");
+        // An explicitly blank pin means "do not pin" (a proxy with its own cert), which
+        // must not be silently refilled from this server's self-signed fingerprint.
+        assert_eq!(s.api_cert_fingerprint, "");
+    }
+
+    #[test]
+    fn client_setup_string_round_trips_and_names_its_file() {
+        let bundle = ClientSetupBundle {
+            v: 1,
+            label: "Reception PC".to_owned(),
+            issued_at: "t0".to_owned(),
+            issued_from: "10.0.0.5:21120".to_owned(),
+            server: ClientSetupServer {
+                id_server: "10.0.0.5".to_owned(),
+                relay_server: String::new(),
+                api_server: "https://10.0.0.5:21120".to_owned(),
+                key: "serverkey".to_owned(),
+                api_cert_fingerprint: "AA:BB".to_owned(),
+            },
+            device_key: "privatekey".to_owned(),
+        };
+        let encoded = encode_client_setup(&bundle).unwrap();
+        assert!(encoded.starts_with("tbfdesk-setup-v1:"));
+        // The client decodes exactly this: prefix, then base64 of the JSON.
+        let raw = base64::decode(encoded.trim_start_matches("tbfdesk-setup-v1:")).unwrap();
+        let back: ClientSetupBundle = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(back.v, 1);
+        assert_eq!(back.server, bundle.server);
+        assert_eq!(back.device_key, "privatekey");
+
+        // An empty device key is OMITTED rather than sent as "", so a key-less bundle
+        // cannot be mistaken for one carrying an empty key.
+        let keyless = ClientSetupBundle {
+            device_key: String::new(),
+            ..bundle
+        };
+        let raw = base64::decode(
+            encode_client_setup(&keyless)
+                .unwrap()
+                .trim_start_matches("tbfdesk-setup-v1:"),
+        )
+        .unwrap();
+        assert!(!String::from_utf8_lossy(&raw).contains("device_key"));
+
+        // Filenames: a label becomes a slug, and the with-key variant says so, because
+        // one of the two files is a secret and the other is not.
+        assert_eq!(
+            client_setup_filename("Reception PC", true),
+            "tbfdesk-Reception-PC-setup-with-key.tbfsetup"
+        );
+        assert_eq!(client_setup_filename("", false), "tbfdesk-setup.tbfsetup");
+        assert_eq!(
+            client_setup_filename("../etc/passwd", false),
+            "tbfdesk-etc-passwd-setup.tbfsetup"
+        );
     }
 
     // TODO 8: where the controller identity comes from now that there is a field for
