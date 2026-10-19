@@ -734,6 +734,7 @@
                 <th title="The network address the peer registered from, as the server sees it.">Registered IP</th>
                 <th title="The public IP:port the server hands out to other peers for hole punching to reach this machine.">Public<br>Addr</th>
                 <th title="How long ago the peer last checked in (registration heartbeat).">Seen</th>
+                <th title="The TBFDesk build this machine reported on its last settings poll (clients 1.4.15 and newer). Green = the version published under Settings → Software update; amber = older; — = an older client, or it has not polled since the server started.">Version</th>
                 <th title="Number of direct (LAN / hole-punched) connection negotiations for this peer. Higher is good — it means sessions went direct.">Direct</th>
                 <th title="Number of times the server forced this peer onto the relay (e.g. a WAN↔LAN mismatch). 0 = never forced.">Forced<br>Relay</th>
                 <th title="The relay server address this peer would fall back to if a direct connection fails.">Relay</th>
@@ -1032,6 +1033,17 @@
         </div>
         <div class="col-grid" style="padding:14px 16px;">
           <div class="span-all" style="font-size:12px;opacity:0.75;line-height:1.4;max-width:900px;">This server is the <b>only</b> update source clients accept; the stock RustDesk updater is disabled on every client. Publish the current client build here: its version, the download URL &mdash; it must be on this server's origin, the client refuses any other host &mdash; and the SHA-256 of the file. <b>The server signs the manifest with its management key</b> each time a client asks for it; the client verifies that signature against its pinned management public key, then the file hash, and only then installs.</div>
+          <div class="span-all" style="font-weight:600;margin-top:4px;">Upload the installer</div>
+          <div class="span-all" style="font-size:12px;opacity:0.75;line-height:1.4;max-width:900px;">Choose <code>tbfdesk-&lt;version&gt;-x64-install.exe</code>. The server stores it, computes its SHA-256 and publishes it in one step. Clients with <b>Automatic client updates</b> on (ACL &amp; Policy) install it by themselves, never during an active session. Each client downloads it from the server address <i>it</i> uses, so machines inside the company network and outside on the internet both get it.</div>
+          <div class="span-all" style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
+            <input id="updFile" type="file" accept=".exe">
+            <input id="updUpVersion" type="text" placeholder="version, e.g. 1.4.15" autocomplete="off" style="width:150px;">
+            <button id="updUpload" class="primary">Upload &amp; publish</button>
+            <button id="updWithdraw" class="danger" title="Stop offering the published update. Clients that already installed it keep it.">Withdraw</button>
+            <span id="updUpMsg" style="font-size:12px;opacity:0.8;"></span>
+          </div>
+          <div class="span-all" id="updRollout" style="font-size:12px;line-height:1.5;"></div>
+          <div class="span-all" style="font-weight:600;margin-top:10px;">Or publish a manifest by hand</div>
           <div class="fld">
             <label for="updVersion">Version</label>
             <input id="updVersion" type="text" placeholder="1.4.2" autocomplete="off">
@@ -2083,6 +2095,84 @@
         setMsg("updMsg", "Saved — clients now see version " + version, true);
       } catch (e) { setMsg("updMsg", e.message, false); }
     });
+    // Server-driven rollout: upload the installer itself; the server hosts, hashes and
+    // publishes it (POST /nemo/api/update/upload). XHR rather than fetch for the
+    // upload progress -- the file is tens of MB.
+    $("updFile").addEventListener("change", () => {
+      const f = $("updFile").files[0];
+      const m = f && /tbfdesk-([0-9A-Za-z._-]+)-x64-install\.exe$/i.exec(f.name);
+      if (m) $("updUpVersion").value = m[1];
+    });
+    $("updUpload").addEventListener("click", () => {
+      const f = $("updFile").files[0];
+      const version = $("updUpVersion").value.trim();
+      if (!f) { setMsg("updUpMsg", "Choose the installer first", false); return; }
+      if (!/^[0-9A-Za-z._-]{1,32}$/.test(version)) { setMsg("updUpMsg", "Version: letters, digits, '.', '-', '_' (e.g. 1.4.15)", false); return; }
+      const xhr = new XMLHttpRequest();
+      xhr.open("POST", "/nemo/api/update/upload?version=" + encodeURIComponent(version));
+      const h = headers();
+      for (const k of Object.keys(h)) xhr.setRequestHeader(k, h[k]);
+      xhr.setRequestHeader("Content-Type", "application/octet-stream");
+      xhr.upload.onprogress = (e) => { if (e.lengthComputable) setMsg("updUpMsg", "Uploading… " + Math.round(100 * e.loaded / e.total) + " %"); };
+      xhr.onload = () => {
+        let body = {};
+        try { body = JSON.parse(xhr.responseText); } catch (_) {}
+        if (xhr.status >= 200 && xhr.status < 300) {
+          setMsg("updUpMsg", "Published " + body.version + " (" + (f.size / 1048576).toFixed(1) + " MB). Clients pick it up within a minute.", true);
+          loadUpdateManifest();
+        } else {
+          setMsg("updUpMsg", body.error || (xhr.status + " " + xhr.statusText), false);
+        }
+      };
+      xhr.onerror = () => setMsg("updUpMsg", "Upload failed (network)", false);
+      setMsg("updUpMsg", "Uploading…");
+      xhr.send(f);
+    });
+    $("updWithdraw").addEventListener("click", async () => {
+      if (!confirm("Stop offering the published update?")) return;
+      try {
+        await api("/nemo/api/update/delete", { method: "POST" });
+        state.publishedVersion = "";
+        setMsg("updUpMsg", "Withdrawn — no update is offered now", true);
+        renderRollout();
+      } catch (e) { setMsg("updUpMsg", e.message, false); }
+    });
+    function cmpVersion(a, b) {
+      const pa = String(a).split(/[.-]/).map((x) => parseInt(x, 10) || 0);
+      const pb = String(b).split(/[.-]/).map((x) => parseInt(x, 10) || 0);
+      for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+        const d = (pa[i] || 0) - (pb[i] || 0);
+        if (d) return d;
+      }
+      return 0;
+    }
+    function versionCell(peer) {
+      const v = peer.client_version;
+      if (!v) return '<span style="opacity:0.4" title="Older than 1.4.15, or no poll since the server started">—</span>';
+      const pub = state.publishedVersion;
+      const color = !pub ? "" : (cmpVersion(v, pub) >= 0 ? "color:#1a7a34" : "color:#b26a00");
+      const at = (peer.client_version_at || "").replace("T", " ").slice(0, 19);
+      return `<span style="${color}" title="${escapeAttr("Reported " + at)}">${escapeHtml(v)}</span>`;
+    }
+    // "Who runs what": counts over the peers the dashboard has loaded.
+    function renderRollout() {
+      const el = $("updRollout");
+      if (!el) return;
+      const peers = state.peers || [];
+      const pub = state.publishedVersion;
+      const counts = {};
+      let unknown = 0;
+      for (const p of peers) {
+        if (p.client_version) counts[p.client_version] = (counts[p.client_version] || 0) + 1;
+        else unknown++;
+      }
+      const versions = Object.keys(counts).sort((a, b) => cmpVersion(b, a));
+      const parts = versions.map((v) => `<b>${escapeHtml(v)}</b>: ${counts[v]}`);
+      const onPub = pub ? versions.filter((v) => cmpVersion(v, pub) >= 0).reduce((n, v) => n + counts[v], 0) : 0;
+      el.innerHTML = (pub ? `Published: <b>${escapeHtml(pub)}</b> — ${onPub} of ${peers.length} machines run it or newer.<br>` : "No update published.<br>")
+        + (parts.length ? "Reported versions: " + parts.join(", ") : "No client has reported a version yet")
+        + (unknown ? ` · ${unknown} without a report (older than 1.4.15, or not polled since the server started)` : "");
+    }
     // Prefill the form with what clients currently get. The endpoint answers 404 while
     // nothing is published — that is the empty state, not an error, so it is fetched
     // directly instead of through api(), which throws on any non-2xx.
@@ -2090,13 +2180,15 @@
       if (!$("updVersion")) return;
       try {
         const res = await fetch("/nemo/api/update/latest", { headers: headers() });
-        if (res.status === 404) { setMsg("updMsg", "No update published yet"); return; }
+        if (res.status === 404) { state.publishedVersion = ""; renderRollout(); setMsg("updMsg", "No update published yet"); return; }
         if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
         const m = await res.json();
         if (document.activeElement !== $("updVersion")) $("updVersion").value = m.version || "";
         if (document.activeElement !== $("updUrl")) $("updUrl").value = m.url || "";
         if (document.activeElement !== $("updSha256")) $("updSha256").value = m.sha256 || "";
         setMsg("updMsg", "Published: version " + (m.version || "?"));
+        state.publishedVersion = m.version || "";
+        renderRollout();
       } catch (e) { setMsg("updMsg", e.message, false); }
     }
     $("autoRefresh").addEventListener("change", schedule);
@@ -2158,6 +2250,15 @@
           $("requireSealedRequest").checked = !!health.require_sealed_request;
         }
         state.peers = peers.peers || [];
+        // The published version colours the Peers table's Version column. 404 = none.
+        fetch("/nemo/api/update/latest", { headers: headers() })
+          .then((r) => (r.ok ? r.json() : null))
+          .then((m) => {
+            const v = m ? (m.version || "") : "";
+            if (v !== (state.publishedVersion || "")) { state.publishedVersion = v; renderPeers(); }
+            renderRollout();
+          })
+          .catch(() => {});
         const currentIds = new Set(state.peers.map((peer) => peer.id));
         state.selectedIds = new Set([...state.selectedIds].filter((id) => currentIds.has(id)));
         if (state.selectedId && !currentIds.has(state.selectedId)) state.selectedId = null;
@@ -2169,6 +2270,7 @@
         renderSummary();
         renderRelaySessions();
         renderPeers();
+        renderRollout();
         renderDeviceKeyPeerList();
         renderEvents();
         renderDetail();
@@ -2450,6 +2552,7 @@
           event.stopPropagation();
           state.selectedId = peer.id;
           renderPeers();
+        renderRollout();
           renderDetail();
         });
         tr.innerHTML = `
@@ -2464,6 +2567,7 @@
           <td class="mono">${escapeHtml(peer.registered_ip || "")}</td>
           <td class="mono">${escapeHtml(peer.public_addr || "")}</td>
           <td>${formatSeen(peer.last_seen_ms_ago)}</td>
+          <td class="mono">${versionCell(peer)}</td>
           <td title="${escapeAttr(peer.stats?.last_direct_report ? "Last direct-endpoint report: " + peer.stats.last_direct_report : "Direct negotiations at this server; sessions over the published endpoint are counted separately")}">${peer.stats?.direct_attempts || 0}${peer.stats?.direct_endpoint_ok || peer.stats?.direct_endpoint_failed ? ` <span style="font-size:11px;opacity:0.75">· endpoint ${peer.stats.direct_endpoint_ok || 0} ok${peer.stats.direct_endpoint_failed ? ", " + peer.stats.direct_endpoint_failed + " failed" : ""}</span>` : ""}</td>
           <td>${peer.stats?.relay_forced || 0}</td>
           <td class="mono">${escapeHtml(peer.stats?.last_relay_server || "")}</td>
@@ -2745,6 +2849,7 @@
           detailDirty = false;
           setMsg("directEndpointMsg", peer.direct_endpoint ? "Saved — clients pick it up on their next poll" : "Cleared — back to hole punch / relay", true);
           renderPeers();
+        renderRollout();
         } catch (err) {
           setMsg("directEndpointMsg", err.message, false);
         }

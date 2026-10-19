@@ -55,6 +55,7 @@ const MAX_PUBLIC_REQUEST_BODY: usize = 64 * 1024;
 /// must stay in the admin tier.
 fn request_body_cap(path: &str) -> usize {
     let public = path.starts_with("/api/")
+        || path.starts_with("/nemo/api/update/file/")
         || path == "/nemo/api/client/policy"
         || path.starts_with("/nemo/api/client/audit/")
         || path == "/nemo/api/update/latest"
@@ -82,7 +83,15 @@ async fn limit_request_body(
     next: axum::middleware::Next<axum::body::Body>,
 ) -> Result<axum::response::Response, StatusCode> {
     use axum::body::HttpBody;
-    let cap = request_body_cap(req.uri().path());
+    // An installer upload is far over every other cap, and this middleware reads the
+    // body before any handler can check the token -- so the big cap is granted only to
+    // a request that already carries the admin token. Anyone else gets the normal cap
+    // and then the handler's 401.
+    let cap = if req.uri().path() == UPDATE_UPLOAD_ROUTE && admin_token_presented(req.headers()) {
+        MAX_UPDATE_UPLOAD
+    } else {
+        request_body_cap(req.uri().path())
+    };
     if let Some(declared) = req
         .headers()
         .get(axum::http::header::CONTENT_LENGTH)
@@ -551,6 +560,36 @@ fn peer_endpoints_delivered(id: &str) -> (usize, String) {
     }
 }
 
+// The client build each machine reported on its last poll ("<version> <iso>"), so the
+// dashboard can show who runs what during an update rollout. In memory: every client
+// polls every 30 s, so it is complete again half a minute after a restart.
+static PEER_CLIENT_VERSIONS: Lazy<std::sync::RwLock<HashMap<String, String>>> =
+    Lazy::new(|| std::sync::RwLock::new(HashMap::new()));
+
+fn record_peer_client_version(id: &str, version: &str) {
+    let version = version.trim();
+    if id.is_empty()
+        || version.is_empty()
+        || version.len() > 32
+        || !version.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_')
+    {
+        return;
+    }
+    let mut map = PEER_CLIENT_VERSIONS.write().unwrap();
+    evict_one_if_full(&mut map, id);
+    map.insert(id.to_owned(), format!("{} {}", version, now_iso()));
+}
+
+/// `(version, when reported)`, or empty strings if this id has not reported one since
+/// the server started (older clients never do).
+fn peer_client_version(id: &str) -> (String, String) {
+    let raw = PEER_CLIENT_VERSIONS.read().unwrap().get(id).cloned().unwrap_or_default();
+    match raw.split_once(' ') {
+        Some((v, at)) => (v.to_owned(), at.to_owned()),
+        None => (String::new(), String::new()),
+    }
+}
+
 #[derive(Clone)]
 struct HbbsApiState {
     pm: PeerMap,
@@ -754,6 +793,10 @@ struct ClientPolicyRequest {
     /// older clients, which keep receiving the signed-plaintext shape.
     #[serde(default)]
     sealed: Option<String>,
+    /// The client's build (crate::VERSION), for the dashboard's rollout view. Absent on
+    /// clients older than 1.4.15.
+    #[serde(default)]
+    client_version: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -855,6 +898,9 @@ struct PeerResponse {
     // actually told where to reach anything.
     endpoints_delivered: usize,
     endpoints_delivered_at: String,
+    // The client build this machine reported on its last poll (1.4.15+), and when.
+    client_version: String,
+    client_version_at: String,
 }
 
 #[derive(Serialize)]
@@ -1523,6 +1569,9 @@ pub(crate) async fn spawn_hbbs_api(
     }));
 
     let (login_enc_pk, login_enc_sk) = box_::gen_keypair();
+    if let Some(t) = token.as_ref() {
+        let _ = ADMIN_TOKEN.set(t.clone());
+    }
     let state = HbbsApiState {
         pm,
         token,
@@ -1565,6 +1614,17 @@ pub(crate) async fn spawn_hbbs_api(
             // Clients poll this for the update manifest; publishing one is an admin
             // route (POST /nemo/api/update) and is deliberately NOT here.
             .route("/nemo/api/update/latest", get(get_update_latest))
+            // The published installer itself. Same unauthenticated audience as the
+            // manifest; streamed from disk (HEAD and Content-Length included, no path
+            // traversal) so many clients updating at once do not each hold a copy of
+            // it in memory.
+            .nest(
+                UPDATE_FILE_ROUTE,
+                axum::routing::get_service(tower_http::services::ServeDir::new(update_files_dir()))
+                    .handle_error(|e: std::io::Error| async move {
+                        (StatusCode::INTERNAL_SERVER_ERROR, format!("cannot read the installer: {e}"))
+                    }),
+            )
     };
 
     let app = Router::new()
@@ -1658,6 +1718,7 @@ pub(crate) async fn spawn_hbbs_api(
         .route("/nemo/api/connections/cut", post(cut_connection))
         .route("/nemo/api/update", post(put_update_manifest))
         .route("/nemo/api/update/delete", post(delete_update_manifest))
+        .route(UPDATE_UPLOAD_ROUTE, post(upload_update_installer))
         .layer(axum::middleware::from_fn(bump_epoch_on_authz_change))
         .layer(Extension(state.clone()))
         // SEC-9: applied last so it wraps every route above, including the
@@ -3966,6 +4027,172 @@ async fn delete_update_manifest(
     Ok(Json(serde_json::json!({ "removed": removed })))
 }
 
+// ---- Hosted installers: upload in the dashboard, served by this server ----
+//
+// The operator uploads the Windows installer; the server stores it under
+// --nemo-update-dir (default ./nemo_updates), hashes it and publishes the manifest
+// itself, with the url pointing at UPDATE_FILE_ROUTE. A client of 1.4.15+ fetches that
+// PATH from the management server it is configured with, not from the host written in
+// the url: a server between two NATs is one address to the company network and another
+// to the internet, and each client only knows its own. The integrity check is the
+// signed sha256, never the URL.
+
+const UPDATE_UPLOAD_ROUTE: &str = "/nemo/api/update/upload";
+const UPDATE_FILE_ROUTE: &str = "/nemo/api/update/file";
+const MAX_UPDATE_UPLOAD: usize = 160 * 1024 * 1024;
+
+static ADMIN_TOKEN: once_cell::sync::OnceCell<String> = once_cell::sync::OnceCell::new();
+
+fn admin_token_presented(headers: &HeaderMap) -> bool {
+    let Some(token) = ADMIN_TOKEN.get() else {
+        return false;
+    };
+    headers
+        .get(AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| constant_time_eq(v, &format!("Bearer {}", token)))
+        .unwrap_or(false)
+}
+
+fn update_files_dir() -> String {
+    get_arg_or("nemo-update-dir", "nemo_updates".to_owned())
+}
+
+/// A version that is safe as part of a file name and in the signed manifest.
+fn valid_upload_version(v: &str) -> bool {
+    !v.is_empty()
+        && v.len() <= 32
+        && v.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_')
+        && !v.starts_with('.')
+}
+
+fn hosted_installer_name(version: &str) -> String {
+    format!("tbfdesk-{version}-x64-install.exe")
+}
+
+/// The origin written into the manifest url. Only clients older than 1.4.15 use it
+/// (newer ones take the path and their own server address): the configured api-server
+/// if there is one (validate_update_manifest pins it), else the address the operator's
+/// browser used.
+fn upload_origin(headers: &HeaderMap) -> Option<String> {
+    if let Some(api) = global_policy().options.get("api-server") {
+        if let Some(o) = url_origin(api.trim()) {
+            return Some(o);
+        }
+    }
+    if let Some(o) = headers
+        .get(axum::http::header::ORIGIN)
+        .and_then(|v| v.to_str().ok())
+        .and_then(url_origin)
+    {
+        return Some(o);
+    }
+    let host = headers.get(axum::http::header::HOST)?.to_str().ok()?;
+    url_origin(&format!("https://{host}"))
+}
+
+fn sha256_hex(data: &[u8]) -> String {
+    sodiumoxide::crypto::hash::sha256::hash(data)
+        .0
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+#[derive(Deserialize)]
+struct UpdateUploadQuery {
+    #[serde(default)]
+    version: String,
+}
+
+// POST /nemo/api/update/upload?version=1.4.15 (admin), body = the installer. Stores it,
+// publishes the signed manifest for it, and answers with what clients will receive.
+async fn upload_update_installer(
+    Extension(state): Extension<HbbsApiState>,
+    headers: HeaderMap,
+    Query(q): Query<UpdateUploadQuery>,
+    body: axum::body::Bytes,
+) -> ApiResult<SignedUpdateManifest> {
+    require_auth(&headers, &state.token)?;
+    let version = q.version.trim().to_owned();
+    if !valid_upload_version(&version) {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "version must be 1-32 characters of letters, digits, '.', '-' or '_' (e.g. 1.4.15)",
+        ));
+    }
+    if body.len() < 64 * 1024 || !body.starts_with(b"MZ") {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "that is not a Windows installer (expected the tbfdesk-<version>-x64-install.exe)",
+        ));
+    }
+    let Some(secret_key) = state.server_secret_key.as_ref() else {
+        return Err(api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "server has no signing key; cannot sign the update manifest",
+        ));
+    };
+    let Some(origin) = upload_origin(&headers) else {
+        return Err(api_error(StatusCode::BAD_REQUEST, "cannot tell this server's address from the request"));
+    };
+    let dir = std::path::PathBuf::from(update_files_dir());
+    let name = hosted_installer_name(&version);
+    let previous = read_update_manifest(std::path::Path::new(&update_manifest_path()))
+        .ok()
+        .flatten();
+    let sha256 = sha256_hex(&body);
+    {
+        let dir = dir.clone();
+        let name = name.clone();
+        let body = body.clone();
+        tokio::task::spawn_blocking(move || -> Result<(), String> {
+            std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+            // Written aside and renamed, so a client never downloads half a file.
+            let tmp = dir.join(format!(".{name}.part"));
+            std::fs::write(&tmp, &body).map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
+            std::fs::rename(&tmp, dir.join(&name)).map_err(|e| format!("cannot store {name}: {e}"))
+        })
+        .await
+        .map_err(server_error)?
+        .map_err(|e| {
+            log::error!("installer upload not stored: {e}");
+            server_error(e)
+        })?;
+    }
+    let manifest = validate_update_manifest(&UpdateManifest {
+        version: version.clone(),
+        url: format!("{origin}{UPDATE_FILE_ROUTE}/{name}"),
+        sha256: sha256.clone(),
+    })
+    .map_err(|e| api_error(StatusCode::BAD_REQUEST, &e))?;
+    write_update_manifest(std::path::Path::new(&update_manifest_path()), &manifest).map_err(|e| {
+        log::error!("failed to persist update manifest: {}", e);
+        server_error(e)
+    })?;
+    // Keep the new installer and the one published before it (a client may be halfway
+    // through downloading that); older uploads go.
+    let keep_previous = previous
+        .as_ref()
+        .and_then(|m| m.url.rsplit('/').next().map(str::to_owned))
+        .unwrap_or_default();
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for e in entries.flatten() {
+            let f = e.file_name().to_string_lossy().to_string();
+            if f.starts_with("tbfdesk-") && f.ends_with("-x64-install.exe") && f != name && f != keep_previous {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+    }
+    log::info!(
+        "Nemo update {} uploaded ({} bytes, sha256 {}) and published",
+        version,
+        body.len(),
+        sha256
+    );
+    Ok(Json(sign_update_manifest(&manifest, secret_key)))
+}
+
 // Verify a client's device-key signature over "{domain}:{id}:{ts}" (domain is
 // "nemo-poll" for the policy poll, "nemo-ab" for the address-book fetch and, Layer
 // 1, "nemo-login" for the sign-in — distinct domains so a captured signature for
@@ -4864,6 +5091,8 @@ const CONTROL_TICKET_BUCKET_SECS: u64 = 3600;
 const CONTROL_TICKET_LIFETIME_SECS: u64 = 4 * 3600;
 const OPTION_NEMO_CONTROL_TICKET: &str = "nemo-control-ticket";
 const OPTION_NEMO_CONTROL_EPOCH: &str = "nemo-control-epoch";
+/// The published client version, pushed with every poll (see the update manifest).
+const OPTION_NEMO_UPDATE_VERSION: &str = "nemo-update-version";
 
 /// Admin routes whose success can change who may control what.
 fn is_authz_path(path: &str) -> bool {
@@ -6125,6 +6354,17 @@ async fn client_policy(
     policy
         .options
         .insert(OPTION_NEMO_CONTROL_EPOCH.to_owned(), control_epoch().to_string());
+    // Update rollout: report what this machine runs, and tell it which version is
+    // published, so a client with automatic updates checks now instead of at its next
+    // daily check. The manifest itself (signed) is still fetched and verified.
+    if let Some(v) = request.client_version.as_deref() {
+        record_peer_client_version(&peer.id, v);
+    }
+    if let Ok(Some(m)) = read_update_manifest(std::path::Path::new(&update_manifest_path())) {
+        policy
+            .options
+            .insert(OPTION_NEMO_UPDATE_VERSION.to_owned(), m.version);
+    }
     if let Some(sk) = state.server_secret_key.as_ref() {
         let registered: Vec<String> = match state.pm.list_registered(100_000, 0).await {
             Ok(peers) => peers.into_iter().map(|p| p.id).collect(),
@@ -6608,6 +6848,7 @@ async fn peer_response(pm: &PeerMap, peer: RegisteredPeer) -> PeerResponse {
     let device_key = integration::device_key_for_peer(&peer.id);
     let pending = integration::pending_claim_for_peer(&peer.id);
     let delivered = peer_endpoints_delivered(&peer.id);
+    let (client_version, client_version_at) = peer_client_version(&peer.id);
     PeerResponse {
         id: peer.id.clone(),
         hostname: peer_hostname(&peer.id),
@@ -6652,6 +6893,8 @@ async fn peer_response(pm: &PeerMap, peer: RegisteredPeer) -> PeerResponse {
         direct_endpoint: peer_endpoint(&peer.id),
         endpoints_delivered: delivered.0,
         endpoints_delivered_at: delivered.1,
+        client_version,
+        client_version_at,
         stats: peer_stats(&peer.id).await,
     }
 }
