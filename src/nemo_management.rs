@@ -146,6 +146,12 @@ const CLIENT_MANAGEMENT_POLICY_KEYS: &[&str] = &[
     "disable-udp",
     "nemo-sealed-request",
     "nemo-auto-update",
+    // Management authorization on the TARGET (client nemo_control): refuse every
+    // session -- direct ones included -- that does not carry a valid control ticket.
+    "nemo-require-control-ticket",
+    // Lock the TARGET's desktop when a remote-control session to it ends, whatever the
+    // controller's own "Lock after session end" toggle says (client nemo_control).
+    "nemo-lock-after-session-end",
     // Direct connections + the optional SPA knock (see nemo_direct.rs on the client).
     // Named here so an operator can set them in the Global or a named device policy; the
     // endpoint map is normally assembled per-controller by direct_endpoint_map, but a
@@ -1652,6 +1658,7 @@ pub(crate) async fn spawn_hbbs_api(
         .route("/nemo/api/connections/cut", post(cut_connection))
         .route("/nemo/api/update", post(put_update_manifest))
         .route("/nemo/api/update/delete", post(delete_update_manifest))
+        .layer(axum::middleware::from_fn(bump_epoch_on_authz_change))
         .layer(Extension(state.clone()))
         // SEC-9: applied last so it wraps every route above, including the
         // unauthenticated ones, and runs before any extractor reads the body.
@@ -4779,13 +4786,27 @@ pub(crate) fn control_permissions_for(
     proto: Option<&NemoSource>,
     source_field: &str,
 ) -> Option<ControlPermissions> {
-    use hbb_common::protobuf::Enum;
     let (_, _, token) = controller_source_any(proto, source_field)?;
     let session = integration::session_for_token(token.as_deref()?)?;
     if !integration::user_is_enabled(&session.username) {
         return None;
     }
-    let policy = integration::user_policy(&session.username);
+    let bits = control_bits_for_user(&session.username);
+    if bits == 0 {
+        return None;
+    }
+    Some(ControlPermissions {
+        permissions: bits,
+        ..Default::default()
+    })
+}
+
+/// The ControlPermissions bits a user's policy decides (0 = decides nothing). Shared by
+/// the rendezvous (control_permissions_for) and the control ticket, so a direct session
+/// gets exactly the permissions a relayed one would.
+fn control_bits_for_user(username: &str) -> u64 {
+    use hbb_common::protobuf::Enum;
+    let policy = integration::user_policy(username);
     let mut bits: u64 = 0;
     for (key, permission) in CONTROL_PERMISSION_KEYS {
         let Some(value) = policy.options.get(*key) else {
@@ -4800,12 +4821,180 @@ pub(crate) fn control_permissions_for(
         let encoded: u64 = if value.eq_ignore_ascii_case("N") { 1 } else { 2 };
         bits |= encoded << (index * 2) as u64;
     }
-    if bits == 0 {
+    bits
+}
+
+// --- Management authorization for every session ("control tickets") ---------------
+//
+// A direct session never passes this server, so the user gates and permissions the
+// rendezvous enforces above never applied to one. The controller now gets a ticket
+// with its poll: who it is (peer id + device key), which LDAP user is signed in, the
+// permissions that user's policy decides, and the machines it may control -- the same
+// decisions controller_policy_rejection / nemo_user_connection_rejection /
+// control_permissions_for make at the rendezvous. The TARGET verifies the ticket
+// against its pinned management key at login (client nemo_control) and applies it;
+// with nemo-require-control-ticket it refuses any session without one.
+//
+// Revocation: CONTROL_EPOCH moves whenever authorization-relevant state changes
+// (bump_epoch_on_authz_change) and is pushed to every machine; a target refuses a
+// ticket older than the epoch it knows. Tickets are otherwise stable for an hour, so
+// a client does not rewrite its persisted policy on every poll.
+
+static CONTROL_EPOCH: Lazy<std::sync::atomic::AtomicU64> =
+    Lazy::new(|| std::sync::atomic::AtomicU64::new(now_secs()));
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn control_epoch() -> u64 {
+    CONTROL_EPOCH.load(Ordering::SeqCst)
+}
+
+fn bump_control_epoch() {
+    // Strictly increasing even for two changes within the same second.
+    let now = now_secs();
+    let _ = CONTROL_EPOCH.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |e| Some(now.max(e + 1)));
+}
+
+const CONTROL_TICKET_BUCKET_SECS: u64 = 3600;
+const CONTROL_TICKET_LIFETIME_SECS: u64 = 4 * 3600;
+const OPTION_NEMO_CONTROL_TICKET: &str = "nemo-control-ticket";
+const OPTION_NEMO_CONTROL_EPOCH: &str = "nemo-control-epoch";
+
+/// Admin routes whose success can change who may control what.
+fn is_authz_path(path: &str) -> bool {
+    const PREFIXES: &[&str] = &[
+        "/nemo/api/peers",
+        "/nemo/api/policy",
+        "/nemo/api/global-policy",
+        "/nemo/api/policies",
+        "/nemo/api/integration/permissions",
+        "/nemo/api/integration/ldap/users/set",
+        "/nemo/api/device-keys",
+        "/nemo/api/server-key/rotate",
+    ];
+    path == "/nemo/api/integration/ldap" || PREFIXES.iter().any(|p| path.starts_with(p))
+}
+
+async fn bump_epoch_on_authz_change(
+    req: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next<axum::body::Body>,
+) -> axum::response::Response {
+    let mutating = req.method() != axum::http::Method::GET && req.method() != axum::http::Method::HEAD;
+    let relevant = is_authz_path(req.uri().path());
+    let res = next.run(req).await;
+    if mutating && relevant && res.status().is_success() {
+        bump_control_epoch();
+    }
+    res
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+struct ControlTicket {
+    v: u32,
+    ctl: String,
+    dk: String,
+    user: String,
+    admin: bool,
+    targets: Vec<String>,
+    perm: u64,
+    iat: u64,
+    exp: u64,
+    epoch: u64,
+}
+
+fn sign_control_ticket(t: &ControlTicket, sk: &sign::SecretKey) -> String {
+    let payload = serde_json::to_vec(t).unwrap_or_default();
+    let sig = sign::sign_detached(&payload, sk);
+    format!("{}.{}", base64::encode(&payload), base64::encode(sig.as_ref()))
+}
+
+/// The machines a controller may control: what the user is allowed (admin = all) and
+/// what the controller's own policy allows (outbound targets), minus blocked machines.
+/// `["*"]` when nothing restricts it, so machines registered later are covered too.
+fn ticket_targets(
+    controller_id: &str,
+    user: Option<(bool, &[String])>,
+    outbound_targets: Option<&String>,
+    blocked: &[String],
+    registered: &[String],
+) -> Vec<String> {
+    let outbound_open = outbound_targets
+        .map(|t| t.trim().is_empty() || t.split(|c: char| c == ',' || c == ';' || c.is_whitespace()).any(|x| x.trim() == "*"))
+        .unwrap_or(true);
+    let user_open = match user {
+        None => true,
+        Some((is_admin, allowed)) => is_admin || allowed.iter().any(|t| t == "*"),
+    };
+    if outbound_open && user_open && blocked.is_empty() {
+        return vec!["*".to_owned()];
+    }
+    registered
+        .iter()
+        .filter(|t| t.as_str() != controller_id)
+        .filter(|t| !blocked.contains(t))
+        .filter(|t| target_allowed_by_controller_policy(outbound_targets, t))
+        .filter(|t| match user {
+            None => true,
+            Some((is_admin, allowed)) => integration::user_allowed_target(is_admin, allowed, t),
+        })
+        .cloned()
+        .collect()
+}
+
+/// Build this controller's ticket, or None when it must not get one (no proven device
+/// key, blocked, outgoing disabled, or sign-in required but nobody signed in).
+fn build_control_ticket(
+    controller_id: &str,
+    controller_blocked: bool,
+    device_key_pub: Option<&str>,
+    username: Option<&str>,
+    require_login: bool,
+    policy_options: &HashMap<String, String>,
+    blocked: &[String],
+    registered: &[String],
+    now: u64,
+) -> Option<ControlTicket> {
+    let dk = device_key_pub.filter(|k| !k.trim().is_empty())?;
+    if controller_blocked {
         return None;
     }
-    Some(ControlPermissions {
-        permissions: bits,
-        ..Default::default()
+    if policy_options.get(OPTION_NEMO_OUTBOUND_ENABLED).map(|v| v == "N").unwrap_or(false) {
+        return None;
+    }
+    if username.is_none() && require_login {
+        return None;
+    }
+    let (user, admin, allowed, perm) = match username {
+        Some(u) => {
+            let (is_admin, allowed) = integration::effective_permission(u);
+            (u.to_owned(), is_admin, allowed, control_bits_for_user(u))
+        }
+        None => (String::new(), false, Vec::new(), 0),
+    };
+    let targets = ticket_targets(
+        controller_id,
+        username.map(|_| (admin, allowed.as_slice())),
+        policy_options.get(OPTION_NEMO_OUTBOUND_TARGETS),
+        blocked,
+        registered,
+    );
+    let iat = (now / CONTROL_TICKET_BUCKET_SECS) * CONTROL_TICKET_BUCKET_SECS;
+    Some(ControlTicket {
+        v: 1,
+        ctl: controller_id.to_owned(),
+        dk: dk.trim().to_owned(),
+        user,
+        admin,
+        targets,
+        perm,
+        iat,
+        exp: iat + CONTROL_TICKET_LIFETIME_SECS,
+        epoch: control_epoch(),
     })
 }
 
@@ -5931,6 +6120,33 @@ async fn client_policy(
             .map(|s| s.as_str())
             .unwrap_or(""),
     );
+    // Management authorization: every machine learns the current epoch (as a target
+    // it refuses older tickets); a controller gets its ticket.
+    policy
+        .options
+        .insert(OPTION_NEMO_CONTROL_EPOCH.to_owned(), control_epoch().to_string());
+    if let Some(sk) = state.server_secret_key.as_ref() {
+        let registered: Vec<String> = match state.pm.list_registered(100_000, 0).await {
+            Ok(peers) => peers.into_iter().map(|p| p.id).collect(),
+            Err(_) => Vec::new(),
+        };
+        let username = policy.options.get("nemo-logged-in-user").cloned();
+        if let Some(ticket) = build_control_ticket(
+            &peer.id,
+            matches!(peer.status, Some(0)),
+            if device_key_ok { request.device_key_pub.as_deref() } else { None },
+            username.as_deref(),
+            require_login,
+            &policy.options,
+            &blocked,
+            &registered,
+            now_secs(),
+        ) {
+            policy
+                .options
+                .insert(OPTION_NEMO_CONTROL_TICKET.to_owned(), sign_control_ticket(&ticket, sk));
+        }
+    }
     // The other half of a direct endpoint is a listener on the far side. Configuring an
     // endpoint for a machine IS the instruction to make it reachable, so turn its direct
     // access server on rather than leaving the operator to discover, after every attempt
@@ -8343,6 +8559,83 @@ mod tests {
             validate_client_policy_request(&peer, &mismatch).unwrap_err().0,
             StatusCode::UNAUTHORIZED
         );
+    }
+
+    /// The ticket carries the same decisions the rendezvous makes: who may control which
+    /// machine. Unrestricted = "*" (covers machines registered later); a restricted user,
+    /// a controller policy with outbound targets, or blocked machines = an explicit list.
+    #[test]
+    fn a_control_ticket_names_exactly_the_machines_the_rules_allow() {
+        let reg: Vec<String> = ["c", "t1", "t2", "t3"].iter().map(|s| s.to_string()).collect();
+        let none: Vec<String> = vec![];
+        // Admin or no user, nothing restricting: everything.
+        assert_eq!(ticket_targets("c", Some((true, &none)), None, &none, &reg), vec!["*"]);
+        assert_eq!(ticket_targets("c", None, None, &none, &reg), vec!["*"]);
+        // A user allowed t1 and t3 only.
+        let allowed = vec!["t1".to_owned(), "t3".to_owned()];
+        assert_eq!(ticket_targets("c", Some((false, &allowed)), None, &none, &reg), vec!["t1", "t3"]);
+        // ...and the controller's own policy only allows t3.
+        let outbound = "t3".to_owned();
+        assert_eq!(ticket_targets("c", Some((false, &allowed)), Some(&outbound), &none, &reg), vec!["t3"]);
+        // A blocked machine is never in the list, and never "*" while anything is blocked.
+        let blocked = vec!["t2".to_owned()];
+        assert_eq!(ticket_targets("c", Some((true, &none)), None, &blocked, &reg), vec!["t1", "t3"]);
+        // A user with no allowed machines gets none.
+        assert!(ticket_targets("c", Some((false, &none)), None, &none, &reg).is_empty());
+    }
+
+    #[test]
+    fn no_ticket_for_a_controller_the_rendezvous_would_refuse() {
+        let opts = HashMap::new();
+        let reg = vec!["t1".to_owned()];
+        let b = |dk: Option<&str>, blocked: bool, user: Option<&str>, require: bool, o: &HashMap<String, String>| {
+            build_control_ticket("c", blocked, dk, user, require, o, &[], &reg, 10_000)
+        };
+        assert!(b(None, false, None, false, &opts).is_none(), "no proven device key");
+        assert!(b(Some("k"), true, None, false, &opts).is_none(), "blocked controller");
+        assert!(b(Some("k"), false, None, true, &opts).is_none(), "sign-in required, nobody signed in");
+        let mut off = HashMap::new();
+        off.insert(OPTION_NEMO_OUTBOUND_ENABLED.to_owned(), "N".to_owned());
+        assert!(b(Some("k"), false, None, false, &off).is_none(), "outgoing disabled");
+        let t = b(Some("k"), false, None, false, &opts).expect("anonymous allowed when sign-in is optional");
+        assert_eq!((t.ctl.as_str(), t.dk.as_str(), t.v), ("c", "k", 1));
+        assert_eq!(t.iat % CONTROL_TICKET_BUCKET_SECS, 0, "stable within the hour");
+        assert!(t.exp > 10_000);
+    }
+
+    /// The wire format the client's nemo_control::parse_and_verify expects:
+    /// base64(json).base64(detached Ed25519 signature over the json bytes), with
+    /// exactly these field names.
+    #[test]
+    fn a_signed_control_ticket_matches_the_client_contract() {
+        sodiumoxide::init().ok();
+        let (pk, sk) = sign::gen_keypair();
+        let t = ControlTicket {
+            v: 1, ctl: "c".into(), dk: "k".into(), user: "userA".into(), admin: false,
+            targets: vec!["t1".into()], perm: 1 << 4, iat: 3600, exp: 18000, epoch: 7,
+        };
+        let raw = sign_control_ticket(&t, &sk);
+        let (p, s) = raw.split_once('.').unwrap();
+        let payload = base64::decode(p).unwrap();
+        let sig = sign::Signature::from_bytes(&base64::decode(s).unwrap()).unwrap();
+        assert!(sign::verify_detached(&sig, &payload, &pk));
+        let v: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        for k in ["v", "ctl", "dk", "user", "admin", "targets", "perm", "iat", "exp", "epoch"] {
+            assert!(v.get(k).is_some(), "field {k}");
+        }
+    }
+
+    #[test]
+    fn the_authorization_epoch_only_moves_forward() {
+        let a = control_epoch();
+        bump_control_epoch();
+        let b = control_epoch();
+        bump_control_epoch();
+        assert!(b > a && control_epoch() > b);
+        assert!(is_authz_path("/nemo/api/integration/permissions"));
+        assert!(is_authz_path("/nemo/api/peers/123/block"));
+        assert!(!is_authz_path("/nemo/api/integration/ldap/test"));
+        assert!(!is_authz_path("/nemo/api/connections/cut"));
     }
 
     /// A controller's direct-endpoint report is the only record of a direct session the
