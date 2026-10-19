@@ -668,6 +668,7 @@
     .conn-path { font-size: 12px; font-weight: 700; padding: 1px 8px; border-radius: 4px; color: #fff; }
     .conn-path.direct { background: #2e9e5b; }
     .conn-path.relay { background: #d98324; }
+    .conn-path.failed { background: #c0392b; }
   </style>
 </head>
 <body>
@@ -767,14 +768,14 @@
             <button id="connRefresh">Refresh</button>
           </div>
         </div>
-        <div style="padding:6px 16px 0;font-size:12px;opacity:0.7;line-height:1.4;">Connections the server has negotiated, most recent first, by path. <b>Direct</b> (direct-local / direct-punch) is the fast path; <b>relay</b> is the fallback. The server observes connection setup, not live byte flow — a direct entry means a direct session was established. History is kept by <b>count</b> (Settings → Connection history size), with no time cutoff.</div>
+        <div style="padding:6px 16px 0;font-size:12px;opacity:0.7;line-height:1.4;">Connections the server has negotiated or been told about, most recent first, by path. <b>Direct</b> is the fast path: direct-local / direct-punch were negotiated here; <b>direct-endpoint</b> sessions bypass this server entirely and are reported by the connecting client (<b>direct-failed</b> = it tried the published endpoint and could not reach it — the log has the reason). <b>Relay</b> is the fallback. The server observes connection setup, not live byte flow. History is kept by <b>count</b> (Settings → Connection history size), with no time cutoff.</div>
         <div class="table-wrap">
           <table>
             <thead>
               <tr>
                 <th title="The controlling peer (who initiated the connection).">From (source)</th>
                 <th title="The peer being connected to (the office computer).">To (target)</th>
-                <th title="direct-local = same LAN (fastest); direct-punch = direct across NAT; relay = fell back through the relay server.">Path</th>
+                <th title="direct-local = same LAN (fastest); direct-punch = direct across NAT; direct-endpoint = straight to the published endpoint (reported by the controller); direct-failed = the endpoint could not be reached; relay = fell back through the relay server.">Path</th>
                 <th title="Relay server used, if the connection fell back to relay.">Relay</th>
                 <th title="The target's NAT type as the server sees it.">NAT</th>
                 <th title="How long ago the last negotiation for this pair happened.">Last seen</th>
@@ -2460,7 +2461,7 @@
           <td class="mono">${escapeHtml(peer.registered_ip || "")}</td>
           <td class="mono">${escapeHtml(peer.public_addr || "")}</td>
           <td>${formatSeen(peer.last_seen_ms_ago)}</td>
-          <td>${peer.stats?.direct_attempts || 0}</td>
+          <td title="${escapeAttr(peer.stats?.last_direct_report ? "Last direct-endpoint report: " + peer.stats.last_direct_report : "Direct negotiations at this server; sessions over the published endpoint are counted separately")}">${peer.stats?.direct_attempts || 0}${peer.stats?.direct_endpoint_ok || peer.stats?.direct_endpoint_failed ? ` <span style="font-size:11px;opacity:0.75">· endpoint ${peer.stats.direct_endpoint_ok || 0} ok${peer.stats.direct_endpoint_failed ? ", " + peer.stats.direct_endpoint_failed + " failed" : ""}</span>` : ""}</td>
           <td>${peer.stats?.relay_forced || 0}</td>
           <td class="mono">${escapeHtml(peer.stats?.last_relay_server || "")}</td>
           <td>
@@ -3558,7 +3559,7 @@
     }
 
     function pathBadge(path) {
-      const cls = path === "relay" ? "relay" : "direct";
+      const cls = path === "relay" ? "relay" : path === "direct-failed" ? "failed" : "direct";
       return `<span class="conn-path ${cls}">${escapeHtml(path)}</span>`;
     }
 

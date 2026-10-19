@@ -596,7 +596,7 @@ struct ConnectionRecord {
     target_id: String,
     source_addr: String,
     target_addr: String,
-    path: String, // "direct-local" | "direct-punch" | "relay"
+    path: String, // "direct-local" | "direct-punch" | "direct-endpoint" | "direct-failed" | "relay"
     relay_server: String,
     nat_type: String,
     first_seen: std::time::Instant,
@@ -645,6 +645,12 @@ pub(crate) struct NemoPeerStats {
     last_relay_server: Option<String>,
     last_forced_relay: bool,
     last_same_intranet: bool,
+    // Sessions controllers established / failed to establish over this machine's
+    // published direct endpoint, as THEY reported it (kind "direct" audit). The
+    // rendezvous never sees these.
+    direct_endpoint_ok: u64,
+    direct_endpoint_failed: u64,
+    last_direct_report: Option<String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -4078,7 +4084,10 @@ fn verify_device_signature_proof(
 // event, deliberately (an unproven audit line is worse than none). Recorded in
 // the events ring the dashboard shows (/nemo/api/events): in-memory, bounded by
 // log_history_limit(), like every other event there.
-const CLIENT_AUDIT_KINDS: &[&str] = &["conn", "file", "alarm"];
+// "direct": a CONTROLLER's report of one attempt at a published direct endpoint. A direct
+// session never touches the rendezvous, so without it the server has no record of the
+// sessions that matter most (see record_direct_report).
+const CLIENT_AUDIT_KINDS: &[&str] = &["conn", "file", "alarm", "direct"];
 const MAX_AUDIT_DETAIL: usize = 4096;
 
 // The proven peer id of an audit body, or None when the body carries no valid
@@ -4437,7 +4446,7 @@ async fn get_connections(
     connections.sort_by_key(|c| c.age_ms); // most recent first
     let direct = connections
         .iter()
-        .filter(|c| c.path.starts_with("direct"))
+        .filter(|c| c.path.starts_with("direct") && c.path != "direct-failed")
         .count();
     let relay = connections.iter().filter(|c| c.path == "relay").count();
     let totals = ConnectionTotals {
@@ -5408,20 +5417,70 @@ pub(crate) async fn record_connection_negotiation(
         &mut store,
         &source_id,
         id,
-        from_addr,
-        to_addr,
+        &from_addr.to_string(),
+        &to_addr.to_string(),
         path,
         relay_server,
         nat_type_name(nat_type),
     );
 }
 
+/// A controller's report of one attempt at a published direct endpoint, into the live
+/// Connections view and the target's stats. The controller is the proven sender (device
+/// key); the target and the numbers are its claim, so they are bounded and only ever
+/// informational -- nothing here grants or blocks anything.
+fn record_direct_report(
+    store: &mut NemoStatsStore,
+    controller: &str,
+    body: &serde_json::Value,
+    from: Option<SocketAddr>,
+) {
+    let field = |k: &str, max: usize| -> String {
+        body.get(k)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .chars()
+            .take(max)
+            .collect()
+    };
+    let target = field("peer", 32);
+    if target.is_empty() || !target.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+        return;
+    }
+    let result = field("result", 16);
+    let path = match result.as_str() {
+        "established" => "direct-endpoint",
+        "failed" => "direct-failed",
+        // "not-tried" (a relay-only setting on the controller) stays in the event log
+        // only: the relay negotiation that follows records the session itself.
+        _ => return,
+    };
+    let endpoint = field("endpoint", 128);
+    let reason = field("detail", 200);
+    let ms = body.get("ms").and_then(|v| v.as_u64());
+    let source_addr = from.map(|a| a.to_string()).unwrap_or_default();
+    upsert_connection(store, controller, &target, &source_addr, &endpoint, path, "", "");
+    let summary = match (path, ms) {
+        ("direct-endpoint", Some(ms)) => format!("{} established {} ms via {}", controller, ms, endpoint),
+        ("direct-endpoint", None) => format!("{} established via {}", controller, endpoint),
+        _ => format!("{} failed via {}: {}", controller, endpoint, reason),
+    };
+    let peer = peer_stats_mut(store, &target);
+    if path == "direct-endpoint" {
+        peer.direct_endpoint_ok += 1;
+    } else {
+        peer.direct_endpoint_failed += 1;
+    }
+    peer.last_direct_report = Some(format!("{} ({})", summary, now_iso()));
+}
+
 fn upsert_connection(
     store: &mut NemoStatsStore,
     source_id: &str,
     target_id: &str,
-    from_addr: SocketAddr,
-    to_addr: SocketAddr,
+    from_addr: &str,
+    to_addr: &str,
     path: &str,
     relay_server: &str,
     nat_type: &str,
@@ -5435,16 +5494,16 @@ fn upsert_connection(
         existing.last_seen = now;
         existing.negotiations += 1;
         existing.path = path.to_owned();
-        existing.source_addr = from_addr.to_string();
-        existing.target_addr = to_addr.to_string();
+        existing.source_addr = from_addr.to_owned();
+        existing.target_addr = to_addr.to_owned();
         existing.relay_server = relay_server.to_owned();
         existing.nat_type = nat_type.to_owned();
     } else {
         store.connections.push(ConnectionRecord {
             source_id: source_id.to_owned(),
             target_id: target_id.to_owned(),
-            source_addr: from_addr.to_string(),
-            target_addr: to_addr.to_string(),
+            source_addr: from_addr.to_owned(),
+            target_addr: to_addr.to_owned(),
             path: path.to_owned(),
             relay_server: relay_server.to_owned(),
             nat_type: nat_type.to_owned(),
@@ -5687,14 +5746,12 @@ async fn client_audit(
         return Err(api_error(StatusCode::NOT_FOUND, "peer not found"));
     }
     let detail = client_audit_detail(&mut body);
+    let from = peer_addr.map(|ConnectInfo(addr)| addr);
     let mut store = STATS.write().await;
-    record_event_locked(
-        &mut store,
-        &format!("client-audit-{}", kind),
-        Some(&id),
-        peer_addr.map(|ConnectInfo(addr)| addr),
-        detail,
-    );
+    record_event_locked(&mut store, &format!("client-audit-{}", kind), Some(&id), from, detail);
+    if kind == "direct" {
+        record_direct_report(&mut store, &id, &body, from);
+    }
     Ok(Json(serde_json::json!({})))
 }
 
@@ -8288,24 +8345,65 @@ mod tests {
         );
     }
 
+    /// A controller's direct-endpoint report is the only record of a direct session the
+    /// server ever gets: it must land in the Connections view and the target's stats, a
+    /// failure must not count as a direct session, and a malformed target must be dropped.
+    #[test]
+    fn a_direct_report_lands_in_connections_and_stats() {
+        let mut store = NemoStatsStore::default();
+        let from: SocketAddr = "92.180.230.164:51000".parse().unwrap();
+        let ok = serde_json::json!({
+            "peer": "352069946", "endpoint": "85.126.226.2:21666",
+            "result": "established", "ms": 84,
+        });
+        record_direct_report(&mut store, "480170882", &ok, Some(from));
+        assert_eq!(store.connections.len(), 1);
+        let c = &store.connections[0];
+        assert_eq!((c.source_id.as_str(), c.target_id.as_str()), ("480170882", "352069946"));
+        assert_eq!(c.path, "direct-endpoint");
+        assert_eq!(c.target_addr, "85.126.226.2:21666");
+        assert_eq!(c.source_addr, "92.180.230.164:51000");
+        let st = &store.peers["352069946"];
+        assert_eq!(st.direct_endpoint_ok, 1);
+        assert!(st.last_direct_report.as_deref().unwrap().contains("established 84 ms"));
+
+        let failed = serde_json::json!({
+            "peer": "352069946", "endpoint": "85.126.226.2:21666",
+            "result": "failed", "detail": "connection refused",
+        });
+        record_direct_report(&mut store, "480170882", &failed, Some(from));
+        assert_eq!(store.connections[0].path, "direct-failed", "same pair, latest outcome");
+        assert_eq!(store.peers["352069946"].direct_endpoint_failed, 1);
+
+        // Not a session: a relay-only skip is logged only; a bad target is ignored.
+        for body in [
+            serde_json::json!({"peer": "352069946", "result": "not-tried"}),
+            serde_json::json!({"peer": "35 20; drop", "result": "established"}),
+            serde_json::json!({"result": "established"}),
+        ] {
+            record_direct_report(&mut store, "480170882", &body, Some(from));
+        }
+        assert_eq!(store.connections.len(), 1);
+    }
+
     #[test]
     fn upsert_connection_dedupes_pair_and_classifies_path() {
         let mut store = NemoStatsStore::default();
         let a: SocketAddr = "192.168.0.102:4646".parse().unwrap();
         let b: SocketAddr = "192.168.0.176:43739".parse().unwrap();
         // First negotiation for the pair.
-        upsert_connection(&mut store, "src1", "tgt1", a, b, "direct-local", "", "ASYMMETRIC");
+        upsert_connection(&mut store, "src1", "tgt1", &a.to_string(), &b.to_string(), "direct-local", "", "ASYMMETRIC");
         assert_eq!(store.connections.len(), 1);
         assert_eq!(store.connections[0].negotiations, 1);
         assert_eq!(store.connections[0].path, "direct-local");
         // Same pair re-negotiates -> merged, count bumped, path updated.
-        upsert_connection(&mut store, "src1", "tgt1", a, b, "relay", "192.168.0.176:21117", "SYMMETRIC");
+        upsert_connection(&mut store, "src1", "tgt1", &a.to_string(), &b.to_string(), "relay", "192.168.0.176:21117", "SYMMETRIC");
         assert_eq!(store.connections.len(), 1);
         assert_eq!(store.connections[0].negotiations, 2);
         assert_eq!(store.connections[0].path, "relay");
         assert_eq!(store.connections[0].relay_server, "192.168.0.176:21117");
         // A different pair is a separate row.
-        upsert_connection(&mut store, "src2", "tgt1", a, b, "direct-punch", "", "PORT_RESTRICTED");
+        upsert_connection(&mut store, "src2", "tgt1", &a.to_string(), &b.to_string(), "direct-punch", "", "PORT_RESTRICTED");
         assert_eq!(store.connections.len(), 2);
     }
 
@@ -8318,9 +8416,9 @@ mod tests {
         let mut store = NemoStatsStore::default();
         let a: SocketAddr = "192.168.0.102:4646".parse().unwrap();
         let b: SocketAddr = "192.168.0.176:43739".parse().unwrap();
-        upsert_connection(&mut store, "s1", "t1", a, b, "direct-local", "", "ASYMMETRIC");
-        upsert_connection(&mut store, "s2", "t2", a, b, "direct-local", "", "ASYMMETRIC");
-        upsert_connection(&mut store, "s3", "t3", a, b, "direct-local", "", "ASYMMETRIC");
+        upsert_connection(&mut store, "s1", "t1", &a.to_string(), &b.to_string(), "direct-local", "", "ASYMMETRIC");
+        upsert_connection(&mut store, "s2", "t2", &a.to_string(), &b.to_string(), "direct-local", "", "ASYMMETRIC");
+        upsert_connection(&mut store, "s3", "t3", &a.to_string(), &b.to_string(), "direct-local", "", "ASYMMETRIC");
         assert_eq!(store.connections.len(), 2);
         // Oldest (t1) evicted; the two most recent remain.
         assert!(!store.connections.iter().any(|c| c.target_id == "t1"));
