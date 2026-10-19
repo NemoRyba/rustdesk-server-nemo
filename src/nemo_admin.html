@@ -1034,10 +1034,16 @@
         <div class="col-grid" style="padding:14px 16px;">
           <div class="span-all" style="font-size:12px;opacity:0.75;line-height:1.4;max-width:900px;">This server is the <b>only</b> update source clients accept; the stock RustDesk updater is disabled on every client. <b>The server signs the manifest (version, file, SHA-256) with its management key</b> each time a client asks for it; the client verifies that signature against its pinned management public key, then the file hash, and only then installs. Every client is told about a newly published version on its next settings poll (about 30 s).</div>
           <div class="span-all" style="font-weight:600;margin-top:4px;">Upload the installer</div>
-          <div class="span-all" style="font-size:12px;opacity:0.75;line-height:1.4;max-width:900px;">Choose <code>tbfdesk-&lt;version&gt;-x64-install.exe</code>. The server stores it, computes its SHA-256 and publishes it in one step. Clients with <b>Automatic client updates</b> on (ACL &amp; Policy) install it by themselves, never during an active session. Each client downloads it from the server address <i>it</i> uses, so machines inside the company network and outside on the internet both get it.</div>
+          <div class="span-all" style="font-size:12px;opacity:0.75;line-height:1.4;max-width:900px;">Choose the Windows installer <code>tbfdesk-&lt;version&gt;-x64-install.exe</code> or a Linux package (<code>.deb</code>, <code>.rpm</code>, <code>.pkg.tar.zst</code>); upload one file per platform with the same version to complete a release. A newer version starts a new release. The server stores each file, computes its SHA-256 and publishes it in one step. Clients with <b>Automatic client updates</b> on (ACL &amp; Policy) install it by themselves, never during an active session. Each client downloads it from the server address <i>it</i> uses, so machines inside the company network and outside on the internet both get it.</div>
           <div class="span-all" style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
             <input id="updFile" type="file" accept=".exe">
-            <input id="updUpVersion" type="text" placeholder="version, e.g. 1.4.15" autocomplete="off" style="width:150px;">
+            <input id="updUpVersion" type="text" placeholder="version, e.g. 1.4.16" autocomplete="off" style="width:150px;">
+            <select id="updPlatform" title="Which clients install this file">
+              <option value="windows-x64">Windows (x64)</option>
+              <option value="linux-deb">Linux: Debian / Ubuntu (.deb)</option>
+              <option value="linux-rpm">Linux: Fedora / RHEL / SUSE (.rpm)</option>
+              <option value="linux-arch">Linux: Arch (.pkg.tar.zst)</option>
+            </select>
             <button id="updUpload" class="primary">Upload &amp; publish</button>
             <button id="updWithdraw" class="danger" title="Stop offering the published update. Clients that already installed it keep it.">Withdraw</button>
             <span id="updUpMsg" style="font-size:12px;opacity:0.8;"></span>
@@ -2100,7 +2106,12 @@
     // upload progress -- the file is tens of MB.
     $("updFile").addEventListener("change", () => {
       const f = $("updFile").files[0];
-      const m = f && /tbfdesk-([0-9A-Za-z._-]+)-x64-install\.exe$/i.exec(f.name);
+      if (!f) return;
+      const n = f.name.toLowerCase();
+      const platform = n.endsWith(".exe") ? "windows-x64" : n.endsWith(".deb") ? "linux-deb"
+        : n.endsWith(".rpm") ? "linux-rpm" : /\.pkg\.tar\.(zst|xz)$/.test(n) ? "linux-arch" : "";
+      if (platform) $("updPlatform").value = platform;
+      const m = /^(?:tbfdesk|rustdesk)[-_]([0-9][0-9A-Za-z.]*?)(?:[-_](?:x64|amd64|x86_64|0|1)|\.x86_64|-install|\.exe|\.deb|\.rpm)/i.exec(f.name);
       if (m) $("updUpVersion").value = m[1];
     });
     $("updUpload").addEventListener("click", () => {
@@ -2109,7 +2120,7 @@
       if (!f) { setMsg("updUpMsg", "Choose the installer first", false); return; }
       if (!/^[0-9A-Za-z._-]{1,32}$/.test(version)) { setMsg("updUpMsg", "Version: letters, digits, '.', '-', '_' (e.g. 1.4.15)", false); return; }
       const xhr = new XMLHttpRequest();
-      xhr.open("POST", "/nemo/api/update/upload?version=" + encodeURIComponent(version));
+      xhr.open("POST", "/nemo/api/update/upload?version=" + encodeURIComponent(version) + "&platform=" + encodeURIComponent($("updPlatform").value));
       const h = headers();
       for (const k of Object.keys(h)) xhr.setRequestHeader(k, h[k]);
       xhr.setRequestHeader("Content-Type", "application/octet-stream");
@@ -2118,7 +2129,7 @@
         let body = {};
         try { body = JSON.parse(xhr.responseText); } catch (_) {}
         if (xhr.status >= 200 && xhr.status < 300) {
-          setMsg("updUpMsg", "Published " + body.version + " (" + (f.size / 1048576).toFixed(1) + " MB). Clients pick it up within a minute.", true);
+          setMsg("updUpMsg", "Published " + body.version + " for " + $("updPlatform").selectedOptions[0].textContent + " (" + (f.size / 1048576).toFixed(1) + " MB). Clients pick it up within a minute.", true);
           loadUpdateManifest();
         } else {
           setMsg("updUpMsg", body.error || (xhr.status + " " + xhr.statusText), false);
@@ -2186,7 +2197,9 @@
         if (document.activeElement !== $("updVersion")) $("updVersion").value = m.version || "";
         if (document.activeElement !== $("updUrl")) $("updUrl").value = m.url || "";
         if (document.activeElement !== $("updSha256")) $("updSha256").value = m.sha256 || "";
-        setMsg("updMsg", "Published: version " + (m.version || "?"));
+        const names = { "linux-deb": "Debian/Ubuntu", "linux-rpm": "RPM", "linux-arch": "Arch" };
+        const covered = (m.url ? ["Windows"] : []).concat(Object.keys(m.platforms || {}).map((k) => names[k] || k));
+        setMsg("updMsg", "Published: version " + (m.version || "?") + " for " + (covered.join(", ") || "no platform"));
         state.publishedVersion = m.version || "";
         renderRollout();
       } catch (e) { setMsg("updMsg", e.message, false); }

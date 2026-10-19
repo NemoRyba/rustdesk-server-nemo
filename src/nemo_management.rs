@@ -3814,7 +3814,12 @@ const MAX_UPDATE_URL_LEN: usize = 2048;
 /// The operator-authored manifest, exactly as stored on disk (no `sig` — that is
 /// never persisted; it is recomputed per request, so nothing on disk goes stale
 /// if the management key is ever rotated).
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+///
+/// The top-level url/sha256 is the WINDOWS installer: that is where every client older
+/// than 1.4.16 looks, so it stays there. Other platforms (Linux packages) live in
+/// `platforms`, keyed by UPDATE_PLATFORMS, all for the same `version`. The top level is
+/// empty when only non-Windows packages are published.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 struct UpdateManifest {
     #[serde(default)]
     version: String,
@@ -3822,6 +3827,28 @@ struct UpdateManifest {
     url: String,
     #[serde(default)]
     sha256: String,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    platforms: std::collections::BTreeMap<String, UpdateArtifact>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+struct UpdateArtifact {
+    #[serde(default)]
+    url: String,
+    #[serde(default)]
+    sha256: String,
+}
+
+/// The platform keys an installer can be published for. "windows-x64" is the top level
+/// of the manifest; the others go into `platforms`.
+const UPDATE_PLATFORM_WINDOWS: &str = "windows-x64";
+const UPDATE_PLATFORMS: &[&str] = &[UPDATE_PLATFORM_WINDOWS, "linux-deb", "linux-rpm", "linux-arch"];
+
+#[derive(Serialize)]
+struct SignedUpdateArtifact {
+    url: String,
+    sha256: String,
+    sig: String,
 }
 
 /// What GET /nemo/api/update/latest returns: the manifest plus its signature.
@@ -3834,6 +3861,10 @@ struct SignedUpdateManifest {
     /// update_manifest_message() — the cross-fork contract with the client's
     /// nemo_verify_update_manifest.
     sig: String,
+    /// Non-Windows packages, each signed over "version|url|sha256" exactly like the top
+    /// level, so the client verifies them with the same function.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    platforms: std::collections::BTreeMap<String, SignedUpdateArtifact>,
 }
 
 // The exact byte string both sides sign/verify. validate_update_manifest forbids
@@ -3844,13 +3875,38 @@ fn update_manifest_message(m: &UpdateManifest) -> String {
     format!("{}|{}|{}", m.version, m.url, m.sha256)
 }
 
+fn sign_update_artifact(version: &str, url: &str, sha256: &str, sk: &sign::SecretKey) -> String {
+    let sig = sign::sign_detached(format!("{version}|{url}|{sha256}").as_bytes(), sk);
+    base64::encode(sig.as_ref())
+}
+
 fn sign_update_manifest(m: &UpdateManifest, sk: &sign::SecretKey) -> SignedUpdateManifest {
-    let sig = sign::sign_detached(update_manifest_message(m).as_bytes(), sk);
+    // No Windows installer published: an empty, unsigned top level, which every client
+    // refuses -- older Windows clients then simply see no update.
+    let sig = if m.url.is_empty() {
+        String::new()
+    } else {
+        sign_update_artifact(&m.version, &m.url, &m.sha256, sk)
+    };
     SignedUpdateManifest {
         version: m.version.clone(),
         url: m.url.clone(),
         sha256: m.sha256.clone(),
-        sig: base64::encode(sig.as_ref()),
+        sig,
+        platforms: m
+            .platforms
+            .iter()
+            .map(|(k, a)| {
+                (
+                    k.clone(),
+                    SignedUpdateArtifact {
+                        url: a.url.clone(),
+                        sha256: a.sha256.clone(),
+                        sig: sign_update_artifact(&m.version, &a.url, &a.sha256, sk),
+                    },
+                )
+            })
+            .collect(),
     }
 }
 
@@ -3860,14 +3916,40 @@ fn sign_update_manifest(m: &UpdateManifest, sk: &sign::SecretKey) -> SignedUpdat
 // form that is stored, signed and served.
 fn validate_update_manifest(m: &UpdateManifest) -> Result<UpdateManifest, String> {
     let version = m.version.trim().to_owned();
-    let url = m.url.trim().to_owned();
-    let sha256 = m.sha256.trim().to_ascii_lowercase();
     let clean = |s: &str| !s.chars().any(|c| c == '|' || c.is_whitespace() || c.is_control());
     if version.is_empty() || version.len() > MAX_UPDATE_VERSION_LEN || !clean(&version) {
         return Err(
             "update manifest: version must be non-empty, without '|' or whitespace".to_owned(),
         );
     }
+    let mut platforms = std::collections::BTreeMap::new();
+    for (k, a) in &m.platforms {
+        if k == UPDATE_PLATFORM_WINDOWS || !UPDATE_PLATFORMS.contains(&k.as_str()) {
+            return Err(format!("update manifest: unknown platform '{k}'"));
+        }
+        let (url, sha256) = validate_update_artifact(&a.url, &a.sha256)?;
+        platforms.insert(k.clone(), UpdateArtifact { url, sha256 });
+    }
+    // The Windows installer (top level) may be absent when Linux packages are published.
+    let (url, sha256) = if m.url.trim().is_empty() && m.sha256.trim().is_empty() && !platforms.is_empty() {
+        (String::new(), String::new())
+    } else {
+        validate_update_artifact(&m.url, &m.sha256)?
+    };
+    Ok(UpdateManifest {
+        version,
+        url,
+        sha256,
+        platforms,
+    })
+}
+
+/// One installer's url and sha256, canonicalised: an http(s) url (on this server's
+/// origin when api-server is set) and 64 lower-case hex digits.
+fn validate_update_artifact(url: &str, sha256: &str) -> Result<(String, String), String> {
+    let url = url.trim().to_owned();
+    let sha256 = sha256.trim().to_ascii_lowercase();
+    let clean = |s: &str| !s.chars().any(|c| c == '|' || c.is_whitespace() || c.is_control());
     let host_and_path = url
         .strip_prefix("https://")
         .or_else(|| url.strip_prefix("http://"))
@@ -3896,11 +3978,7 @@ fn validate_update_manifest(m: &UpdateManifest) -> Result<UpdateManifest, String
             }
         }
     }
-    Ok(UpdateManifest {
-        version,
-        url,
-        sha256,
-    })
+    Ok((url, sha256))
 }
 
 /// scheme://host[:port] of an http(s) URL, lowercased. None if it is not http(s).
@@ -4066,8 +4144,49 @@ fn valid_upload_version(v: &str) -> bool {
         && !v.starts_with('.')
 }
 
-fn hosted_installer_name(version: &str) -> String {
-    format!("tbfdesk-{version}-x64-install.exe")
+/// The stored file name for `platform`, after checking that `body` is that kind of
+/// package (by its magic bytes). Err = a message for the operator.
+fn hosted_installer_name(version: &str, platform: &str, body: &[u8]) -> Result<String, String> {
+    let (ok, name, what) = match platform {
+        "windows-x64" => (
+            body.starts_with(b"MZ"),
+            format!("tbfdesk-{version}-x64-install.exe"),
+            "a Windows installer (tbfdesk-<version>-x64-install.exe)",
+        ),
+        "linux-deb" => (
+            body.starts_with(b"!<arch>\ndebian-binary"),
+            format!("tbfdesk-{version}-amd64.deb"),
+            "a Debian/Ubuntu package (.deb)",
+        ),
+        "linux-rpm" => (
+            body.starts_with(&[0xED, 0xAB, 0xEE, 0xDB]),
+            format!("tbfdesk-{version}-x86_64.rpm"),
+            "an RPM package (.rpm)",
+        ),
+        "linux-arch" => {
+            let zst = body.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]);
+            let xz = body.starts_with(&[0xFD, b'7', b'z', b'X', b'Z', 0x00]);
+            (
+                zst || xz,
+                format!("tbfdesk-{version}-x86_64.pkg.tar.{}", if xz { "xz" } else { "zst" }),
+                "an Arch package (.pkg.tar.zst)",
+            )
+        }
+        _ => return Err(format!("unknown platform '{platform}' (one of {})", UPDATE_PLATFORMS.join(", "))),
+    };
+    if body.len() < 64 * 1024 || !ok {
+        return Err(format!("that is not {what}"));
+    }
+    Ok(name)
+}
+
+/// Every file a manifest refers to (for pruning the update directory).
+fn manifest_files(m: &UpdateManifest) -> Vec<String> {
+    std::iter::once(m.url.as_str())
+        .chain(m.platforms.values().map(|a| a.url.as_str()))
+        .filter(|u| !u.is_empty())
+        .filter_map(|u| u.rsplit('/').next().map(str::to_owned))
+        .collect()
 }
 
 /// The origin written into the manifest url. Only clients older than 1.4.15 use it
@@ -4107,10 +4226,16 @@ fn sha256_hex(data: &[u8]) -> String {
 struct UpdateUploadQuery {
     #[serde(default)]
     version: String,
+    /// windows-x64 (default), linux-deb, linux-rpm or linux-arch.
+    #[serde(default)]
+    platform: String,
 }
 
-// POST /nemo/api/update/upload?version=1.4.15 (admin), body = the installer. Stores it,
-// publishes the signed manifest for it, and answers with what clients will receive.
+// POST /nemo/api/update/upload?version=1.4.16&platform=linux-deb (admin), body = the
+// installer or package. Stores it, publishes it in the signed manifest, and answers with
+// what clients will receive. A release is one version: the same version adds or replaces
+// that platform's file; a newer version starts a new release (upload each platform
+// again); an older one is refused.
 async fn upload_update_installer(
     Extension(state): Extension<HbbsApiState>,
     headers: HeaderMap,
@@ -4126,11 +4251,26 @@ async fn upload_update_installer(
             "version must be 1-32 characters of letters, digits, '.', '-' or '_' (e.g. 1.4.15)",
         ));
     }
-    if body.len() < 64 * 1024 || !body.starts_with(b"MZ") {
-        return Err(api_error(
-            StatusCode::BAD_REQUEST,
-            "that is not a Windows installer (expected the tbfdesk-<version>-x64-install.exe)",
-        ));
+    let platform = if q.platform.trim().is_empty() {
+        UPDATE_PLATFORM_WINDOWS.to_owned()
+    } else {
+        q.platform.trim().to_owned()
+    };
+    let name = hosted_installer_name(&version, &platform, &body)
+        .map_err(|e| api_error(StatusCode::BAD_REQUEST, &e))?;
+    let previous = read_update_manifest(std::path::Path::new(&update_manifest_path()))
+        .ok()
+        .flatten();
+    if let Some(prev) = previous.as_ref() {
+        if hbb_common::get_version_number(&version) < hbb_common::get_version_number(&prev.version) {
+            return Err(api_error(
+                StatusCode::CONFLICT,
+                &format!(
+                    "{version} is older than the published {}; withdraw that first",
+                    prev.version
+                ),
+            ));
+        }
     }
     let Some(secret_key) = state.server_secret_key.as_ref() else {
         return Err(api_error(
@@ -4142,10 +4282,6 @@ async fn upload_update_installer(
         return Err(api_error(StatusCode::BAD_REQUEST, "cannot tell this server's address from the request"));
     };
     let dir = std::path::PathBuf::from(update_files_dir());
-    let name = hosted_installer_name(&version);
-    let previous = read_update_manifest(std::path::Path::new(&update_manifest_path()))
-        .ok()
-        .flatten();
     let sha256 = sha256_hex(&body);
     {
         let dir = dir.clone();
@@ -4165,33 +4301,45 @@ async fn upload_update_installer(
             server_error(e)
         })?;
     }
-    let manifest = validate_update_manifest(&UpdateManifest {
-        version: version.clone(),
-        url: format!("{origin}{UPDATE_FILE_ROUTE}/{name}"),
-        sha256: sha256.clone(),
-    })
-    .map_err(|e| api_error(StatusCode::BAD_REQUEST, &e))?;
+    // Same version: add to that release. Newer (or nothing published): a new release.
+    let mut next = match previous.as_ref() {
+        Some(prev) if prev.version == version => prev.clone(),
+        _ => UpdateManifest {
+            version: version.clone(),
+            ..Default::default()
+        },
+    };
+    let url = format!("{origin}{UPDATE_FILE_ROUTE}/{name}");
+    if platform == UPDATE_PLATFORM_WINDOWS {
+        next.url = url;
+        next.sha256 = sha256.clone();
+    } else {
+        next.platforms.insert(platform.clone(), UpdateArtifact { url, sha256: sha256.clone() });
+    }
+    let manifest =
+        validate_update_manifest(&next).map_err(|e| api_error(StatusCode::BAD_REQUEST, &e))?;
     write_update_manifest(std::path::Path::new(&update_manifest_path()), &manifest).map_err(|e| {
         log::error!("failed to persist update manifest: {}", e);
         server_error(e)
     })?;
-    // Keep the new installer and the one published before it (a client may be halfway
-    // through downloading that); older uploads go.
-    let keep_previous = previous
-        .as_ref()
-        .and_then(|m| m.url.rsplit('/').next().map(str::to_owned))
-        .unwrap_or_default();
+    // Keep every file of the new release and of the one before it (a client may be
+    // halfway through downloading that); older uploads go.
+    let mut keep = manifest_files(&manifest);
+    if let Some(prev) = previous.as_ref() {
+        keep.extend(manifest_files(prev));
+    }
     if let Ok(entries) = std::fs::read_dir(&dir) {
         for e in entries.flatten() {
             let f = e.file_name().to_string_lossy().to_string();
-            if f.starts_with("tbfdesk-") && f.ends_with("-x64-install.exe") && f != name && f != keep_previous {
+            if f.starts_with("tbfdesk-") && !keep.contains(&f) {
                 let _ = std::fs::remove_file(e.path());
             }
         }
     }
     log::info!(
-        "Nemo update {} uploaded ({} bytes, sha256 {}) and published",
+        "Nemo update {} for {} uploaded ({} bytes, sha256 {}) and published",
         version,
+        platform,
         body.len(),
         sha256
     );
@@ -7849,6 +7997,7 @@ mod tests {
             version: "1.4.7".to_owned(),
             url: "https://tbf.example.com:21114/dl/tbfdesk-1.4.7.exe".to_owned(),
             sha256: "ab".repeat(32),
+            platforms: Default::default(),
         };
         let signed = sign_update_manifest(&m, &sk);
         assert_eq!(signed.version, m.version);
@@ -7877,6 +8026,87 @@ mod tests {
         assert_eq!(keys, ["sha256", "sig", "url", "version"]);
     }
 
+    // A release can carry Linux packages next to (or without) the Windows installer. Each
+    // entry is signed over the same "version|url|sha256" contract, so the client checks
+    // them with the function it already uses for the top level.
+    #[test]
+    fn a_multi_platform_release_signs_every_package_and_keeps_windows_on_top() {
+        sodiumoxide::init().ok();
+        let (pk, sk) = sign::gen_keypair();
+        let deb = UpdateArtifact {
+            url: "https://tbf.example.com/nemo/api/update/file/tbfdesk-1.4.16-amd64.deb".to_owned(),
+            sha256: "cd".repeat(32),
+        };
+        let mut m = UpdateManifest {
+            version: "1.4.16".to_owned(),
+            url: "https://tbf.example.com/nemo/api/update/file/tbfdesk-1.4.16-x64-install.exe".to_owned(),
+            sha256: "ab".repeat(32),
+            platforms: Default::default(),
+        };
+        m.platforms.insert("linux-deb".to_owned(), deb.clone());
+        let m = validate_update_manifest(&m).expect("valid");
+        let signed = sign_update_manifest(&m, &sk);
+        let check = |url: &str, sha: &str, sig: &str| {
+            let sig = sign::Signature::from_bytes(&base64::decode(sig).unwrap()).unwrap();
+            sign::verify_detached(&sig, format!("1.4.16|{url}|{sha}").as_bytes(), &pk)
+        };
+        assert!(check(&signed.url, &signed.sha256, &signed.sig), "windows entry");
+        let d = &signed.platforms["linux-deb"];
+        assert!(check(&d.url, &d.sha256, &d.sig), "deb entry");
+        // A Linux-only release: the top level is empty and unsigned (older Windows
+        // clients refuse it and see no update), the package is still signed.
+        let linux_only = validate_update_manifest(&UpdateManifest {
+            version: "1.4.16".to_owned(),
+            platforms: [("linux-deb".to_owned(), deb.clone())].into_iter().collect(),
+            ..Default::default()
+        })
+        .expect("linux-only release is valid");
+        let signed = sign_update_manifest(&linux_only, &sk);
+        assert!(signed.url.is_empty() && signed.sig.is_empty());
+        let d = &signed.platforms["linux-deb"];
+        assert!(check(&d.url, &d.sha256, &d.sig));
+        // Unknown platform names and a nameless empty release are refused.
+        for bad in [
+            UpdateManifest {
+                version: "1.4.16".to_owned(),
+                platforms: [("linux-snap".to_owned(), deb.clone())].into_iter().collect(),
+                ..Default::default()
+            },
+            UpdateManifest { version: "1.4.16".to_owned(), ..Default::default() },
+        ] {
+            assert!(validate_update_manifest(&bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn uploads_are_recognised_by_their_magic_bytes() {
+        let pad = |head: &[u8]| {
+            let mut v = head.to_vec();
+            v.resize(70 * 1024, 0);
+            v
+        };
+        assert_eq!(
+            hosted_installer_name("1.4.16", "windows-x64", &pad(b"MZ")).unwrap(),
+            "tbfdesk-1.4.16-x64-install.exe"
+        );
+        assert_eq!(
+            hosted_installer_name("1.4.16", "linux-deb", &pad(b"!<arch>\ndebian-binary   ")).unwrap(),
+            "tbfdesk-1.4.16-amd64.deb"
+        );
+        assert_eq!(
+            hosted_installer_name("1.4.16", "linux-rpm", &pad(&[0xED, 0xAB, 0xEE, 0xDB])).unwrap(),
+            "tbfdesk-1.4.16-x86_64.rpm"
+        );
+        assert_eq!(
+            hosted_installer_name("1.4.16", "linux-arch", &pad(&[0x28, 0xB5, 0x2F, 0xFD])).unwrap(),
+            "tbfdesk-1.4.16-x86_64.pkg.tar.zst"
+        );
+        // The wrong kind of file for the platform, a tiny file, an unknown platform.
+        assert!(hosted_installer_name("1.4.16", "linux-deb", &pad(b"MZ")).is_err());
+        assert!(hosted_installer_name("1.4.16", "windows-x64", b"MZ").is_err());
+        assert!(hosted_installer_name("1.4.16", "linux-snap", &pad(b"MZ")).is_err());
+    }
+
     #[test]
     fn update_manifest_validation_canonicalises_and_refuses_bad_fields() {
         let ok_url = "https://tbf.example.com/dl/x.exe";
@@ -7885,6 +8115,7 @@ mod tests {
             version: " 1.4.7 ".to_owned(),
             url: format!(" {} ", ok_url),
             sha256: ok_sha.clone(),
+            platforms: Default::default(),
         })
         .expect("valid manifest");
         assert_eq!(m.version, "1.4.7");
@@ -7895,6 +8126,7 @@ mod tests {
                 version: version.to_owned(),
                 url: url.to_owned(),
                 sha256: sha256.to_owned(),
+                platforms: Default::default(),
             })
             .is_err()
         };
@@ -7933,6 +8165,7 @@ mod tests {
             version: "1.4.7".to_owned(),
             url: "https://tbf.example.com/dl/x.exe".to_owned(),
             sha256: "cd".repeat(32),
+            platforms: Default::default(),
         };
         write_update_manifest(&path, &m).expect("write");
         // On disk: the three fields and NO sig (it is computed per request).
@@ -8757,6 +8990,7 @@ mod tests {
             device_key_sig: None,
             sealed_token: None,
             sealed: None,
+            client_version: None,
         };
         assert!(validate_client_policy_request(&peer, &ok).is_ok());
         // Empty id.
@@ -8770,6 +9004,7 @@ mod tests {
             device_key_sig: None,
             sealed_token: None,
             sealed: None,
+            client_version: None,
         };
         assert_eq!(
             validate_client_policy_request(&peer, &no_id).unwrap_err().0,
@@ -8786,6 +9021,7 @@ mod tests {
             device_key_sig: None,
             sealed_token: None,
             sealed: None,
+            client_version: None,
         };
         assert_eq!(
             validate_client_policy_request(&peer, &bad_b64).unwrap_err().0,
@@ -8802,6 +9038,7 @@ mod tests {
             device_key_sig: None,
             sealed_token: None,
             sealed: None,
+            client_version: None,
         };
         assert_eq!(
             validate_client_policy_request(&peer, &mismatch).unwrap_err().0,
