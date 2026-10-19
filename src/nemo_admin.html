@@ -1032,7 +1032,7 @@
           <h2 class="panel-title">Software update</h2>
         </div>
         <div class="col-grid" style="padding:14px 16px;">
-          <div class="span-all" style="font-size:12px;opacity:0.75;line-height:1.4;max-width:900px;">This server is the <b>only</b> update source clients accept; the stock RustDesk updater is disabled on every client. Publish the current client build here: its version, the download URL &mdash; it must be on this server's origin, the client refuses any other host &mdash; and the SHA-256 of the file. <b>The server signs the manifest with its management key</b> each time a client asks for it; the client verifies that signature against its pinned management public key, then the file hash, and only then installs.</div>
+          <div class="span-all" style="font-size:12px;opacity:0.75;line-height:1.4;max-width:900px;">This server is the <b>only</b> update source clients accept; the stock RustDesk updater is disabled on every client. <b>The server signs the manifest (version, file, SHA-256) with its management key</b> each time a client asks for it; the client verifies that signature against its pinned management public key, then the file hash, and only then installs. Every client is told about a newly published version on its next settings poll (about 30 s).</div>
           <div class="span-all" style="font-weight:600;margin-top:4px;">Upload the installer</div>
           <div class="span-all" style="font-size:12px;opacity:0.75;line-height:1.4;max-width:900px;">Choose <code>tbfdesk-&lt;version&gt;-x64-install.exe</code>. The server stores it, computes its SHA-256 and publishes it in one step. Clients with <b>Automatic client updates</b> on (ACL &amp; Policy) install it by themselves, never during an active session. Each client downloads it from the server address <i>it</i> uses, so machines inside the company network and outside on the internet both get it.</div>
           <div class="span-all" style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
@@ -1049,7 +1049,7 @@
             <input id="updVersion" type="text" placeholder="1.4.2" autocomplete="off">
           </div>
           <div class="fld span-all">
-            <label for="updUrl">Download URL (on this server)</label>
+            <label for="updUrl">Download URL (on this server's origin; an uploaded installer is fetched by every client through its own server address)</label>
             <input id="updUrl" type="text" placeholder="https://&lt;this server's api-server origin&gt;/tbfdesk-1.4.2-setup.exe" autocomplete="off" spellcheck="false">
           </div>
           <div class="fld span-all">

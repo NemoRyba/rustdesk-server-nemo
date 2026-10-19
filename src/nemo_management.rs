@@ -4074,7 +4074,7 @@ fn hosted_installer_name(version: &str) -> String {
 /// (newer ones take the path and their own server address): the configured api-server
 /// if there is one (validate_update_manifest pins it), else the address the operator's
 /// browser used.
-fn upload_origin(headers: &HeaderMap) -> Option<String> {
+fn upload_origin(headers: &HeaderMap, uri: &axum::http::Uri) -> Option<String> {
     if let Some(api) = global_policy().options.get("api-server") {
         if let Some(o) = url_origin(api.trim()) {
             return Some(o);
@@ -4086,6 +4086,10 @@ fn upload_origin(headers: &HeaderMap) -> Option<String> {
         .and_then(url_origin)
     {
         return Some(o);
+    }
+    // HTTP/2 carries the address as the request's :authority, not as a Host header.
+    if let Some(authority) = uri.authority() {
+        return url_origin(&format!("{}://{}", uri.scheme_str().unwrap_or("https"), authority));
     }
     let host = headers.get(axum::http::header::HOST)?.to_str().ok()?;
     url_origin(&format!("https://{host}"))
@@ -4110,6 +4114,7 @@ struct UpdateUploadQuery {
 async fn upload_update_installer(
     Extension(state): Extension<HbbsApiState>,
     headers: HeaderMap,
+    uri: axum::http::Uri,
     Query(q): Query<UpdateUploadQuery>,
     body: axum::body::Bytes,
 ) -> ApiResult<SignedUpdateManifest> {
@@ -4133,7 +4138,7 @@ async fn upload_update_installer(
             "server has no signing key; cannot sign the update manifest",
         ));
     };
-    let Some(origin) = upload_origin(&headers) else {
+    let Some(origin) = upload_origin(&headers, &uri) else {
         return Err(api_error(StatusCode::BAD_REQUEST, "cannot tell this server's address from the request"));
     };
     let dir = std::path::PathBuf::from(update_files_dir());
