@@ -2808,6 +2808,28 @@
             <b>ACL &amp; Policy &rarr; Global policy</b> (<code>nemo-knock-enabled</code>,
             <code>nemo-knock-key</code>, <code>nemo-knock-hmac-key</code>).
           </div>
+          <div class="fld" style="margin-top:14px;border-top:1px solid rgba(128,128,128,0.25);padding-top:12px;">
+            <label title="A knock key belonging to THIS workstation only. When set, only controllers allowed to reach this peer receive it, so a key leaked from one machine cannot open another's port. Leave empty to use the fleet-wide knock key.">Per-peer knock key ${peer.knock_key_configured ? '<span class="badge allowed" style="margin-left:4px" title="This workstation has its own SPA key. Controllers that may reach it receive this key instead of the fleet-wide one.">own key set</span>' : '<span class="badge" style="margin-left:4px;opacity:0.7" title="No per-peer key: this workstation uses the fleet-wide knock key from Global policy.">fleet-wide key</span>'}</label>
+            <div style="display:flex;gap:8px;align-items:center;margin-top:4px;flex-wrap:wrap;">
+              <input id="knockKeyRij" type="text" class="mono" style="flex:1;min-width:190px;" placeholder="${peer.knock_key_configured ? "— set; hidden — enter to replace —" : "Rijndael (AES-256) key, base64"}">
+              <input id="knockKeyHmac" type="text" class="mono" style="flex:1;min-width:190px;" placeholder="${peer.knock_key_configured ? "— set; hidden — enter to replace —" : "HMAC-SHA256 key, base64"}">
+            </div>
+            <div style="display:flex;gap:8px;align-items:center;margin-top:6px;flex-wrap:wrap;">
+              <button id="knockKeyGen" type="button" title="Fill both fields with a fresh random key pair, generated in your browser (never sent until you Save).">Generate</button>
+              <button id="knockKeyCopy" type="button" title="Copy a ready fwknopd access.conf + OpenWrt uci stanza for this workstation's router, with these keys and its external port filled in.">Copy router stanza</button>
+              <button id="knockKeySave">Save</button>
+              <button id="knockKeyClear" type="button" title="Remove this peer's own key; it falls back to the fleet-wide knock key.">Clear</button>
+              <span id="knockKeyMsg" style="font-size:12px;opacity:0.8;"></span>
+            </div>
+            <div style="font-size:12px;opacity:0.75;line-height:1.5;margin-top:8px;">
+              Optional. Use this when several workstations sit behind <b>one</b> router, each on its own
+              forwarded port, and a key lifted from one machine must stay useless against the others
+              (router runbook &sect;11, Option B). The key is a <b>secret</b>: it is never shown again after
+              saving &mdash; this panel only reports whether one is set. Put the matching keys on the router
+              with <b>Copy router stanza</b>. Only controllers already allowed to reach this peer are handed
+              its key.
+            </div>
+          </div>
         </div>
         <div class="management-policy">
           <h3>Management</h3>
@@ -2871,6 +2893,99 @@
       if (dep) dep.addEventListener("keydown", (event) => {
         if (event.key === "Enter") { event.preventDefault(); saveEndpoint(); }
       });
+
+      // ---- Per-peer knock key ----
+      // 32 random bytes, base64 — a full Rijndael/HMAC key, generated in the browser so a
+      // plaintext secret never travels until the operator Saves it.
+      const randKeyB64 = () => {
+        const b = new Uint8Array(32);
+        crypto.getRandomValues(b);
+        let s = "";
+        for (const x of b) s += String.fromCharCode(x);
+        return btoa(s);
+      };
+      const kkRij = $("knockKeyRij");
+      const kkHmac = $("knockKeyHmac");
+      const kkGen = $("knockKeyGen");
+      if (kkGen) kkGen.addEventListener("click", () => {
+        kkRij.value = randKeyB64();
+        kkHmac.value = randKeyB64();
+        detailDirty = true;
+        setMsg("knockKeyMsg", "Generated — Save to store, or Copy router stanza first", true);
+      });
+      const kkCopy = $("knockKeyCopy");
+      if (kkCopy) kkCopy.addEventListener("click", async () => {
+        const rij = kkRij.value.trim(), hmac = kkHmac.value.trim();
+        if (!rij || !hmac) {
+          setMsg("knockKeyMsg", "Generate or paste both keys first", false);
+          return;
+        }
+        // External port for OPEN_PORTS comes from the published endpoint (host:port[,knock]);
+        // the internal FORCE_NAT target is on the LAN, which the server does not know, so it
+        // stays a clearly-marked placeholder for the technician to fill on site.
+        const ep = (peer.direct_endpoint || "").split(",")[0];
+        const port = ep.includes(":") ? ep.slice(ep.lastIndexOf(":") + 1) : "21118";
+        const stanza =
+`# TBFDesk per-peer knock key for ${peer.id}${peer.alias ? " (" + peer.alias + ")" : ""}
+# --- fwknopd access.conf stanza ---
+SOURCE                  ANY
+REQUIRE_SOURCE_ADDRESS  N
+KEY_BASE64              ${rij}
+HMAC_KEY_BASE64         ${hmac}
+OPEN_PORTS              tcp/${port}
+FW_ACCESS_TIMEOUT       30
+FORCE_NAT               <internal ip> <internal port>
+# --- OpenWrt uci (append a stanza) ---
+uci add fwknopd access
+uci set fwknopd.@access[-1].SOURCE=ANY
+uci set fwknopd.@access[-1].KEY_BASE64='${rij}'
+uci set fwknopd.@access[-1].HMAC_KEY_BASE64='${hmac}'
+uci set fwknopd.@access[-1].OPEN_PORTS='tcp/${port}'
+uci set fwknopd.@access[-1].FW_ACCESS_TIMEOUT=30
+uci set fwknopd.@access[-1].FORCE_NAT='<internal ip> <internal port>'
+uci commit fwknopd; /etc/init.d/fwknopd restart`;
+        try {
+          await navigator.clipboard.writeText(stanza);
+          setMsg("knockKeyMsg", "Router stanza copied — set FORCE_NAT to this machine's LAN address", true);
+        } catch (e) {
+          // No clipboard (plain-http dashboard): show it so it can be copied by hand.
+          window.prompt("Copy the router stanza:", stanza);
+        }
+      });
+      const saveKnockKey = async (clear) => {
+        const rij = clear ? "" : kkRij.value.trim();
+        const hmac = clear ? "" : kkHmac.value.trim();
+        if (!clear && (!rij || !hmac)) {
+          setMsg("knockKeyMsg", "Enter BOTH the Rijndael and HMAC keys (or use Generate)", false);
+          return;
+        }
+        try {
+          const res = await api(`/nemo/api/peers/${encodeURIComponent(peer.id)}/knock-key`, {
+            method: "POST",
+            body: JSON.stringify({ key: rij, hmac_key: hmac })
+          });
+          peer.knock_key_configured = !!res.configured;
+          kkRij.value = ""; kkHmac.value = "";
+          detailDirty = false;
+          setMsg("knockKeyMsg", res.configured
+            ? "Saved — allowed controllers get it on their next poll"
+            : "Cleared — this peer uses the fleet-wide knock key", true);
+          renderDetail(true);
+        } catch (err) {
+          setMsg("knockKeyMsg", err.message, false);
+        }
+      };
+      const kkSave = $("knockKeySave");
+      if (kkSave) kkSave.addEventListener("click", () => saveKnockKey(false));
+      const kkClear = $("knockKeyClear");
+      if (kkClear) kkClear.addEventListener("click", () => {
+        if (!peer.knock_key_configured && !kkRij.value && !kkHmac.value) {
+          setMsg("knockKeyMsg", "Nothing to clear — already on the fleet-wide key", true);
+          return;
+        }
+        saveKnockKey(true);
+      });
+
       const dps = $("devicePolicySelect");
       if (dps) dps.addEventListener("change", async () => {
         try {
