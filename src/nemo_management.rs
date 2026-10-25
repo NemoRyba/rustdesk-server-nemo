@@ -134,6 +134,11 @@ const OPTION_NEMO_OUTBOUND_TARGETS: &str = "nemo-outbound-targets";
 const OPTION_NEMO_DIRECT_ENDPOINTS: &str = "nemo-direct-endpoints";
 const OPTION_NEMO_KNOCK_KEY: &str = "nemo-knock-key";
 const OPTION_NEMO_KNOCK_HMAC_KEY: &str = "nemo-knock-hmac-key";
+// Per-peer SPA keys: `id,rijndael_b64,hmac_b64;...`, assembled per-controller from
+// PEER_KNOCK_KEYS by knock_key_map, filtered by the same ACL as the endpoint map, and
+// pushed inside the SEALED policy. Gives each workstation its own knock key, so a key
+// leaked from one machine opens only the one port it belongs to. SECRET.
+const OPTION_NEMO_KNOCK_KEYS: &str = "nemo-knock-keys";
 // Current client policy keys that are newer than this server fork's embedded
 // hbb_common key tables, plus Nemo-only GUI/management options.
 const CLIENT_MANAGEMENT_POLICY_KEYS: &[&str] = &[
@@ -892,6 +897,10 @@ struct PeerResponse {
     // Where controllers may reach this workstation without the relay, as the operator
     // configured it ("host:port[,knockport]"). Empty => hole punch / relay only.
     direct_endpoint: String,
+    // Whether this peer has its OWN SPA knock key (so a key leaked elsewhere can't open
+    // its port). False => it falls back to the fleet-wide knock key. The key is a secret
+    // and is never returned, only this flag.
+    knock_key_configured: bool,
     // How many direct endpoints THIS machine was handed on its last management poll,
     // and when. The other half of the direct-access question: `direct_endpoint` says
     // where this machine can be reached, these say whether it (as a controller) was
@@ -943,6 +952,24 @@ struct PeerEndpointResponse {
     id: String,
     /// The stored, normalized value — empty when cleared.
     endpoint: String,
+}
+
+#[derive(Deserialize)]
+struct PeerKnockKeyRequest {
+    /// base64 Rijndael (AES-256) key. Empty/absent (with `hmac_key` too) clears the pair.
+    #[serde(default)]
+    key: Option<String>,
+    /// base64 HMAC-SHA256 key.
+    #[serde(default)]
+    hmac_key: Option<String>,
+}
+
+#[derive(Serialize)]
+struct PeerKnockKeyResponse {
+    id: String,
+    /// Whether a per-peer key pair is now stored for this peer. The keys themselves are
+    /// never echoed back — they are secrets.
+    configured: bool,
 }
 
 #[derive(Serialize)]
@@ -1486,6 +1513,146 @@ fn direct_endpoint_map(blocked: &[String], targets: Option<&String>) -> String {
     rows.join(";")
 }
 
+// ---- Per-peer SPA knock keys ------------------------------------------------
+//
+// PEER_KNOCK_KEYS holds `id -> (rijndael_b64, hmac_b64)`, operator-set exactly like
+// PEER_ENDPOINTS (never self-reported — a peer that could set its own knock key could
+// make the edge open for traffic it should gate). knock_key_map assembles the
+// `nemo-knock-keys` value for ONE controller, filtered by the same blocked + outbound-
+// targets ACL as the endpoint map, so a controller only ever receives the keys for the
+// workstations it is allowed to dial. That filtering is what makes a leaked key useless
+// beyond its own machine. The value is a secret, pushed only inside the sealed policy.
+
+// base64 of a 128-byte key is ~172 chars; leave headroom but keep one row bounded.
+const MAX_KNOCK_KEY_B64_LEN: usize = 256;
+// Matches the client's MAX_SPA_KEY_LEN: fwknop refuses keys longer than this.
+const MAX_SPA_KEY_LEN: usize = 128;
+
+static PEER_KNOCK_KEYS: Lazy<std::sync::RwLock<HashMap<String, (String, String)>>> =
+    Lazy::new(|| std::sync::RwLock::new(load_peer_knock_keys()));
+
+fn peer_knock_keys_path() -> String {
+    get_arg_or(
+        "nemo-peer-knock-keys-file",
+        "nemo_peer_knock_keys.json".to_owned(),
+    )
+}
+
+fn load_peer_knock_keys() -> HashMap<String, (String, String)> {
+    std::fs::read_to_string(peer_knock_keys_path())
+        .ok()
+        .and_then(|s| serde_json::from_str::<HashMap<String, (String, String)>>(&s).ok())
+        .map(|map| {
+            // Re-validate on load: a hand-edited file must not be able to inject a
+            // separator and smuggle extra rows into every controller's sealed policy.
+            map.into_iter()
+                .filter_map(|(id, (k, h))| normalize_knock_key_pair(&k, &h).map(|p| (id, p)))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Validate one base64 SPA key: non-empty, no separator/whitespace (which could forge
+/// extra rows or fields), decodes as base64 to 1..=MAX_SPA_KEY_LEN bytes. Returns the
+/// trimmed base64, unchanged — the client decodes it with the same rules.
+fn normalize_knock_key(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    if raw.is_empty() || raw.len() > MAX_KNOCK_KEY_B64_LEN {
+        return None;
+    }
+    if raw.contains(';') || raw.contains(',') || raw.chars().any(char::is_whitespace) {
+        return None;
+    }
+    let decoded = base64::decode(raw).ok()?;
+    if decoded.is_empty() || decoded.len() > MAX_SPA_KEY_LEN {
+        return None;
+    }
+    Some(raw.to_owned())
+}
+
+fn normalize_knock_key_pair(rijndael: &str, hmac: &str) -> Option<(String, String)> {
+    Some((normalize_knock_key(rijndael)?, normalize_knock_key(hmac)?))
+}
+
+fn save_peer_knock_keys(snapshot: &HashMap<String, (String, String)>) {
+    match serde_json::to_string_pretty(snapshot) {
+        Ok(json) => {
+            let path = peer_knock_keys_path();
+            // The file holds shared secrets; keep it owner-only like the server key.
+            if let Err(e) = write_private(&path, json.as_bytes()) {
+                log::error!("failed to persist peer knock keys to {}: {}", path, e);
+            }
+        }
+        Err(e) => log::error!("failed to serialize peer knock keys: {}", e),
+    }
+}
+
+/// Set (`Some`) or clear (`None`) one peer's per-peer SPA key pair. `Err` carries the
+/// reason a value was rejected, so the dashboard can show it instead of storing a key the
+/// client would silently drop (leaving the peer on the fleet-wide key with no symptom).
+fn set_peer_knock_key(id: &str, pair: Option<(&str, &str)>) -> Result<bool, String> {
+    let id = id.trim();
+    if id.is_empty() {
+        return Err("peer id is required".to_owned());
+    }
+    let normalized = match pair {
+        Some((k, h)) if !k.trim().is_empty() || !h.trim().is_empty() => {
+            Some(normalize_knock_key_pair(k, h).ok_or_else(|| {
+                "both the Rijndael and HMAC keys must be base64 of 1..=128 bytes with no \
+                 comma, semicolon or whitespace"
+                    .to_owned()
+            })?)
+        }
+        _ => None,
+    };
+    let snapshot = {
+        let mut map = PEER_KNOCK_KEYS.write().unwrap();
+        match &normalized {
+            Some(pair) => {
+                if map.len() >= MAX_PEER_LABELS && !map.contains_key(id) {
+                    if let Some(victim) = map.keys().next().cloned() {
+                        map.remove(&victim);
+                    }
+                }
+                map.insert(id.to_owned(), pair.clone());
+            }
+            None => {
+                map.remove(id);
+            }
+        }
+        map.clone()
+    };
+    save_peer_knock_keys(&snapshot);
+    Ok(normalized.is_some())
+}
+
+/// Build the `nemo-knock-keys` value for ONE controller.
+///
+/// Filtered exactly like `direct_endpoint_map`: blocked peers withheld, and a key handed
+/// over only for targets this controller's own outbound policy already lets it dial. That
+/// is the whole security property — pc2's controller never receives pc7's key, so a key
+/// lifted off pc2 can open only pc2's forwarded port. Sorted by id for a byte-stable
+/// value (an unstable string would rewrite every client's sealed policy each poll).
+fn knock_key_map(blocked: &[String], targets: Option<&String>) -> String {
+    let keys = PEER_KNOCK_KEYS.read().unwrap().clone();
+    if keys.is_empty() {
+        return String::new();
+    }
+    let blocked: HashSet<&str> = blocked.iter().map(String::as_str).collect();
+    let mut rows: Vec<String> = keys
+        .into_iter()
+        .filter(|(id, _)| !blocked.contains(id.as_str()))
+        .filter(|(id, _)| target_allowed_by_controller_policy(targets, id))
+        .map(|(id, (k, h))| format!("{id},{k},{h}"))
+        .collect();
+    rows.sort();
+    rows.join(";")
+}
+
+fn peer_has_knock_key(id: &str) -> bool {
+    PEER_KNOCK_KEYS.read().unwrap().contains_key(id)
+}
+
 pub(crate) fn init_from_args() {
     // CLI default first, then a persisted dashboard toggle wins if present.
     COMPANY_ONLY.store(is_truthy(&get_arg("nemo-company-only")), Ordering::SeqCst);
@@ -1654,6 +1821,10 @@ pub(crate) async fn spawn_hbbs_api(
         .route(
             "/nemo/api/peers/:id/direct-endpoint",
             post(set_peer_direct_endpoint),
+        )
+        .route(
+            "/nemo/api/peers/:id/knock-key",
+            post(set_peer_knock_key_route),
         )
         .route(
             "/nemo/api/peers/:id/management-policy",
@@ -6488,6 +6659,16 @@ async fn client_policy(
             .options
             .insert(OPTION_NEMO_DIRECT_ENDPOINTS.to_owned(), endpoints);
     }
+    // Per-peer knock keys, filtered by the SAME ACL as the endpoints so a controller gets
+    // a key only for a workstation it may dial. Secret: stripped below if the response
+    // cannot be sealed, like the fleet-wide knock key. Only overwrites a hand-written
+    // value when the operator has actually configured per-peer keys.
+    let knock_keys = knock_key_map(&blocked, policy.options.get(OPTION_NEMO_OUTBOUND_TARGETS));
+    if !knock_keys.is_empty() {
+        policy
+            .options
+            .insert(OPTION_NEMO_KNOCK_KEYS.to_owned(), knock_keys);
+    }
     // Record what this poll actually HANDED OVER. Configuring a port forward in the
     // dashboard and the controller being able to use it are two different facts, and
     // until now only the first was visible: an endpoint typed into the peer's row looked
@@ -6716,6 +6897,39 @@ async fn set_peer_direct_endpoint(
         );
     }
     Ok(Json(PeerEndpointResponse { id, endpoint }))
+}
+
+/// Set or clear one workstation's per-peer SPA key pair. Sending both keys empty (or
+/// omitting them) clears the pair, returning that peer to the fleet-wide knock key.
+async fn set_peer_knock_key_route(
+    Path(id): Path<String>,
+    Extension(state): Extension<HbbsApiState>,
+    headers: HeaderMap,
+    Json(request): Json<PeerKnockKeyRequest>,
+) -> ApiResult<PeerKnockKeyResponse> {
+    require_auth(&headers, &state.token)?;
+    let pair = match (request.key.as_deref(), request.hmac_key.as_deref()) {
+        (None, None) => None,
+        (k, h) => Some((k.unwrap_or(""), h.unwrap_or(""))),
+    };
+    let configured = set_peer_knock_key(&id, pair)
+        .map_err(|reason| api_error(StatusCode::BAD_REQUEST, &reason))?;
+    {
+        let mut store = STATS.write().await;
+        record_event_locked(
+            &mut store,
+            "peer-knock-key",
+            Some(&id),
+            None,
+            if configured {
+                "per-peer knock key set (only controllers allowed to dial this peer receive it)"
+                    .to_owned()
+            } else {
+                "per-peer knock key cleared; this peer uses the fleet-wide knock key".to_owned()
+            },
+        );
+    }
+    Ok(Json(PeerKnockKeyResponse { id, configured }))
 }
 
 async fn reset_peer_policy(
@@ -7044,6 +7258,7 @@ async fn peer_response(pm: &PeerMap, peer: RegisteredPeer) -> PeerResponse {
         pending_claim_via: pending.as_ref().map(|c| c.via.clone()).unwrap_or_default(),
         pending_claim_denied: pending.as_ref().map(|c| c.denied).unwrap_or(false),
         direct_endpoint: peer_endpoint(&peer.id),
+        knock_key_configured: peer_has_knock_key(&peer.id),
         endpoints_delivered: delivered.0,
         endpoints_delivered_at: delivered.1,
         client_version,
@@ -7098,6 +7313,9 @@ const SECRET_POLICY_KEYS: &[&str] = &[
     // responses and stripped from any policy we cannot seal, exactly like a password.
     OPTION_NEMO_KNOCK_KEY,
     OPTION_NEMO_KNOCK_HMAC_KEY,
+    // The per-peer SPA key map is assembled into the sealed policy per poll; name it here
+    // so it is stripped on the plaintext fallback path exactly like the fleet-wide key.
+    OPTION_NEMO_KNOCK_KEYS,
 ];
 const MANAGED_SECRET_MASK: &str = "<managed-secret>";
 
@@ -8314,6 +8532,62 @@ mod tests {
         // Nothing configured => the key is never pushed, so the whole fleet keeps today's
         // hole-punch / relay behaviour untouched.
         assert_eq!(direct_endpoint_map(&[], None), "");
+    }
+
+    #[test]
+    fn knock_key_normalisation_refuses_what_would_forge_rows() {
+        // A valid 32-byte key, base64. Round-trips unchanged.
+        let k = base64::encode([7u8; 32]);
+        assert_eq!(normalize_knock_key(&format!("  {k}  ")), Some(k.clone()));
+        // A separator would forge extra rows/fields; whitespace breaks the parse.
+        assert_eq!(normalize_knock_key(&format!("{k},x")), None);
+        assert_eq!(normalize_knock_key(&format!("{k};x")), None);
+        assert_eq!(normalize_knock_key("not valid base64"), None);
+        assert_eq!(normalize_knock_key(""), None);
+        // Decoded length bounds: empty decode and over-long are both refused.
+        assert_eq!(normalize_knock_key(&base64::encode(Vec::<u8>::new())), None);
+        assert_eq!(normalize_knock_key(&base64::encode(vec![0u8; MAX_SPA_KEY_LEN + 1])), None);
+        // The pair requires both halves valid.
+        assert!(normalize_knock_key_pair(&k, &k).is_some());
+        assert!(normalize_knock_key_pair(&k, "bad,key").is_none());
+    }
+
+    // The isolation property, server side: a controller receives a per-peer key ONLY for
+    // a target its outbound ACL already lets it dial. pc2's controller never learns pc7's
+    // key, so a key lifted off pc2 opens only pc2's forwarded port. Touches the
+    // process-wide PEER_KNOCK_KEYS, so all of it lives in one test (like the endpoint one).
+    #[test]
+    fn knock_key_map_is_filtered_like_endpoints() {
+        let k2 = base64::encode([0x22u8; 32]);
+        let h2 = base64::encode([0x33u8; 32]);
+        let k7 = base64::encode([0x77u8; 32]);
+        let h7 = base64::encode([0x88u8; 32]);
+        {
+            let mut map = PEER_KNOCK_KEYS.write().unwrap();
+            map.clear();
+            map.insert("pc2".to_owned(), (k2.clone(), h2.clone()));
+            map.insert("pc7".to_owned(), (k7.clone(), h7.clone()));
+        }
+        // No ACL: both rows, sorted by id, byte-stable across polls.
+        assert_eq!(
+            knock_key_map(&[], None),
+            format!("pc2,{k2},{h2};pc7,{k7},{h7}")
+        );
+        // A controller restricted to pc2 gets ONLY pc2's key — pc7's never leaves the
+        // server for it. This is the whole point of per-peer keys.
+        let targets = "pc2".to_owned();
+        assert_eq!(knock_key_map(&[], Some(&targets)), format!("pc2,{k2},{h2}"));
+        assert!(!knock_key_map(&[], Some(&targets)).contains("pc7"));
+        // A blocked peer's key is withheld even with an explicit grant.
+        assert_eq!(knock_key_map(&["pc2".to_owned()], Some(&targets)), "");
+        // "*" still means all.
+        assert_eq!(knock_key_map(&[], Some(&"*".to_owned())).split(';').count(), 2);
+        {
+            PEER_KNOCK_KEYS.write().unwrap().clear();
+        }
+        // Nothing configured => the key is never pushed; the fleet-wide key path is
+        // untouched.
+        assert_eq!(knock_key_map(&[], None), "");
     }
 
     // Rotation is a fleet-wide revocation, so the two things that must hold are that it
