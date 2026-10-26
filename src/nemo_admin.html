@@ -694,6 +694,7 @@
       <button class="navbtn" data-view="integration">Integration</button>
       <button class="navbtn" data-view="acl">ACL &amp; Policy</button>
       <button class="navbtn" data-view="log">Log</button>
+      <button class="navbtn" data-view="security">Security</button>
     </nav>
 
     <div id="view-peers" class="view">
@@ -825,6 +826,99 @@
         <div id="events" class="events empty">No events loaded</div>
       </section>
       </div>
+    </div>
+
+    <div id="view-security" class="view" hidden>
+    <div style="display:flex;flex-direction:column;gap:14px;padding:14px 18px 18px;min-height:0;">
+      <section class="panel">
+        <div class="panel-head">
+          <h2 class="panel-title">Security &amp; abuse defences</h2>
+          <div class="peer-tools">
+            <label class="switch"><input id="secAutoRefresh" type="checkbox" checked>Auto</label>
+            <button id="secRefresh">Refresh</button>
+          </div>
+        </div>
+        <div style="padding:6px 16px 0;font-size:12px;opacity:0.7;line-height:1.4;">What the server's automatic abuse defences are doing right now. These block <b>by themselves</b> &mdash; a password-spray from one source, a volumetric flood of unauthenticated requests, or an account under sustained failed logins. A block is always <b>temporary</b> and lifts itself after its cooldown; the <b>Unblock</b> / <b>Reset</b> / <b>Clear</b> buttons let you lift one early if a legitimate source (for example a shared office NAT) was caught. Lifting a block only clears the limiter's own state &mdash; it never grants a peer access that admission policy would otherwise deny. Every lift is written to the <b>Log</b>, where spray tripwires and backoff-cap events are also recorded.</div>
+
+        <div class="summary" style="grid-template-columns:repeat(6,minmax(120px,1fr));">
+          <div class="metric"><span title="Unauthenticated requests shed with HTTP 429 by the pre-gate per-source rate limit, since the server started.">Rate-limit sheds</span><strong id="secUnauthShed">0</strong></div>
+          <div class="metric"><span title="Times a single source IP tripped the per-IP password-spray cooldown.">Per-IP spray trips</span><strong id="secIpTrips">0</strong></div>
+          <div class="metric"><span title="Times the fleet-wide spray tripwire fired (refuse all directory binds for a cooldown).">Fleet spray trips</span><strong id="secGlobalTrips">0</strong></div>
+          <div class="metric"><span title="Times an account's login backoff first reached the 30s cap (an account being hammered).">Backoff caps</span><strong id="secBackoffCaps">0</strong></div>
+          <div class="metric"><span title="Logins refused before the directory bind because a spray block was active.">Pre-bind refusals</span><strong id="secPreBind">0</strong></div>
+          <div class="metric"><span title="Sources blocked or throttled at this moment (sum of the tables below).">Active blocks now</span><strong id="secActiveNow">0</strong></div>
+        </div>
+
+        <div id="secGlobalBanner" style="display:none;margin:12px 16px 0;padding:10px 12px;border-radius:8px;font-size:13px;line-height:1.45;background:rgba(170,20,20,0.10);border:1px solid rgba(170,20,20,0.35);">
+          <b>Fleet-wide spray tripwire is ACTIVE.</b> <span id="secGlobalDetail"></span>
+          <button id="secClearGlobal" class="danger" style="margin-left:10px;">Clear tripwire</button>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <h2 class="panel-title">Blocked source IPs <small class="mini-stats" id="secBlocksSub"></small></h2>
+        </div>
+        <div style="padding:6px 16px 0;font-size:12px;opacity:0.7;line-height:1.4;">IPs inside a per-IP password-spray cooldown &mdash; directory binds from them are refused until the timer expires. <b>Unblock</b> clears the cooldown immediately.</div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th title="The source IP as the server sees it (a whole office behind NAT shares one).">Source IP</th>
+                <th title="Distinct usernames this source failed within the window.">Distinct users</th>
+                <th title="Time left on the cooldown before it lifts by itself.">Expires in</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody id="secIpBlocks"></tbody>
+          </table>
+          <div id="secIpBlocksEmpty" class="empty">No IPs are blocked right now</div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <h2 class="panel-title">Rate-limited sources <small class="mini-stats" id="secThrottleSub"></small></h2>
+        </div>
+        <div style="padding:6px 16px 0;font-size:12px;opacity:0.7;line-height:1.4;">Sources whose unauthenticated-request budget is below full. <b>Shedding</b> means requests from it are being answered with 429 right now. <b>Reset</b> refills its budget.</div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th title="The source IP.">Source IP</th>
+                <th title="Tokens left in its bucket (full budget is the burst capacity).">Budget left</th>
+                <th title="Whether requests from it are being shed with 429 at this moment.">State</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody id="secThrottled"></tbody>
+          </table>
+          <div id="secThrottledEmpty" class="empty">No sources are being rate-limited right now</div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <h2 class="panel-title">Accounts under login backoff <small class="mini-stats" id="secBackoffSub"></small></h2>
+        </div>
+        <div style="padding:6px 16px 0;font-size:12px;opacity:0.7;line-height:1.4;">Accounts with consecutive failed logins in the window. Each failure delays the next attempt (exponential, capped at 30s); a correct password clears it instantly, so real users are never locked out. <b>Clear</b> resets the delay for one account.</div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th title="The account name (directory username).">Account</th>
+                <th title="Consecutive failures within the window.">Failures</th>
+                <th title="Delay currently applied before the next failed attempt returns.">Current delay</th>
+                <th title="How long ago the last failure was.">Last failure</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody id="secBackoff"></tbody>
+          </table>
+          <div id="secBackoffEmpty" class="empty">No accounts are under backoff right now</div>
+        </div>
+      </section>
+    </div>
     </div>
 
     <div id="view-settings" class="view" hidden>
@@ -1371,6 +1465,14 @@
       loadAll();
     });
     $("refresh").addEventListener("click", loadAll);
+    // Security panel (C4) controls.
+    $("secRefresh").addEventListener("click", loadSecurity);
+    $("secAutoRefresh").addEventListener("change", startSecTimer);
+    $("secClearGlobal").addEventListener("click", async () => {
+      if (!confirm("Lift the fleet-wide spray tripwire now?\n\nThe server will resume accepting directory binds immediately. The tripwire re-arms on its own if spraying continues.")) return;
+      try { await api("/nemo/api/security/unblock", { method: "POST", body: JSON.stringify({ scope: "global" }) }); loadSecurity(); }
+      catch (err) { alert("Clear failed: " + err.message); }
+    });
     // Nemo: top-nav view switching (Peers / Settings / Log).
     document.querySelectorAll(".navbtn").forEach((btn) => {
       btn.addEventListener("click", () => {
@@ -1382,6 +1484,8 @@
         if (view === "settings") { refreshGlobalPolicy(); loadDeviceKeys(); loadUpdateManifest(); }
         // Connections now live under the Log view (#6): load + auto-refresh there.
         if (view === "log") { loadConnections(); startConnTimer(); } else { stopConnTimer(); }
+        // Security panel (C4): live defensive state + unblock controls.
+        if (view === "security") { loadSecurity(); startSecTimer(); } else { stopSecTimer(); }
       });
     });
     // #5 Reorderable + persistent top nav. Drag a menu button to reorder it; the
@@ -3792,6 +3896,132 @@ uci commit fwknopd; /etc/init.d/fwknopd restart`;
     function stopConnTimer() {
       if (connTimer) clearInterval(connTimer);
       connTimer = null;
+    }
+
+    // ---- Security panel (C4): live defensive state + unblock controls ----
+    let secTimer = null;
+    function startSecTimer() {
+      stopSecTimer();
+      if ($("secAutoRefresh").checked && !$("view-security").hidden) {
+        secTimer = setInterval(loadSecurity, 4000);
+      }
+    }
+    function stopSecTimer() {
+      if (secTimer) clearInterval(secTimer);
+      secTimer = null;
+    }
+
+    function fmtRemain(secs) {
+      const s = Number(secs || 0);
+      if (s <= 0) return "—";
+      if (s < 60) return s + "s";
+      return Math.floor(s / 60) + "m " + (s % 60) + "s";
+    }
+
+    async function loadSecurity() {
+      try {
+        const snap = await api("/nemo/api/security");
+        renderSecurity(snap);
+      } catch (err) {
+        // Keep the tables as they were; surface the error unobtrusively in the sub-labels.
+        $("secBlocksSub").textContent = "load failed: " + (err.message || "error");
+      }
+    }
+
+    function renderSecurity(snap) {
+      const c = snap.counters || {};
+      $("secUnauthShed").textContent = c.unauth_shed || 0;
+      $("secIpTrips").textContent = c.ip_spray_trips || 0;
+      $("secGlobalTrips").textContent = c.global_spray_trips || 0;
+      $("secBackoffCaps").textContent = c.backoff_cap_hits || 0;
+      $("secPreBind").textContent = c.pre_bind_refusals || 0;
+
+      const ipBlocks = snap.ip_blocks || [];
+      const throttled = snap.throttled_ips || [];
+      const backoff = snap.backoff_accounts || [];
+      $("secActiveNow").textContent = ipBlocks.length + throttled.length + backoff.length;
+
+      // Fleet-wide tripwire banner.
+      const g = snap.global_tripwire || {};
+      if (g.active) {
+        $("secGlobalBanner").style.display = "";
+        $("secGlobalDetail").textContent =
+          `Directory binds are refused for everyone for another ${fmtRemain(g.remaining_secs)}.`;
+      } else {
+        $("secGlobalBanner").style.display = "none";
+      }
+
+      // Blocked source IPs.
+      const ipBody = $("secIpBlocks");
+      $("secBlocksSub").textContent = ipBlocks.length ? `${ipBlocks.length} blocked` : "";
+      if (!ipBlocks.length) {
+        ipBody.innerHTML = "";
+        $("secIpBlocksEmpty").style.display = "";
+      } else {
+        $("secIpBlocksEmpty").style.display = "none";
+        ipBody.innerHTML = ipBlocks.map((b) => `
+          <tr>
+            <td class="mono">${escapeHtml(b.ip)}</td>
+            <td>${b.distinct_users}</td>
+            <td>${fmtRemain(b.remaining_secs)}</td>
+            <td><button class="sec-unblock" data-scope="ip" data-key="${escapeAttr(b.ip)}" title="Lift this IP's spray cooldown now.">Unblock</button></td>
+          </tr>`).join("");
+      }
+
+      // Rate-limited sources.
+      const thBody = $("secThrottled");
+      const shedding = throttled.filter((t) => t.shedding).length;
+      $("secThrottleSub").textContent = throttled.length
+        ? `${throttled.length} limited${shedding ? ` · ${shedding} shedding` : ""}` : "";
+      if (!throttled.length) {
+        thBody.innerHTML = "";
+        $("secThrottledEmpty").style.display = "";
+      } else {
+        $("secThrottledEmpty").style.display = "none";
+        const cap = (snap.config && snap.config.unauth_bucket_capacity) || 40;
+        thBody.innerHTML = throttled.map((t) => `
+          <tr>
+            <td class="mono">${escapeHtml(t.ip)}</td>
+            <td>${t.tokens} / ${cap}</td>
+            <td>${t.shedding ? '<span class="badge blocked">shedding (429)</span>' : '<span class="badge unapproved">under pressure</span>'}</td>
+            <td><button class="sec-unblock" data-scope="throttle" data-key="${escapeAttr(t.ip)}" title="Refill this source's request budget now.">Reset</button></td>
+          </tr>`).join("");
+      }
+
+      // Accounts under backoff.
+      const boBody = $("secBackoff");
+      $("secBackoffSub").textContent = backoff.length ? `${backoff.length} account${backoff.length === 1 ? "" : "s"}` : "";
+      if (!backoff.length) {
+        boBody.innerHTML = "";
+        $("secBackoffEmpty").style.display = "";
+      } else {
+        $("secBackoffEmpty").style.display = "none";
+        boBody.innerHTML = backoff.map((a) => `
+          <tr>
+            <td class="mono">${escapeHtml(a.username)}</td>
+            <td>${a.failures}${a.at_cap ? ' <span class="badge blocked">at cap</span>' : ""}</td>
+            <td>${(a.backoff_ms / 1000).toFixed(a.backoff_ms < 1000 ? 2 : 1)}s</td>
+            <td>${fmtRemain(a.last_failure_secs_ago)} ago</td>
+            <td><button class="sec-unblock" data-scope="backoff" data-key="${escapeAttr(a.username)}" title="Reset this account's login backoff.">Clear</button></td>
+          </tr>`).join("");
+      }
+
+      // Wire every unblock button (ip / throttle / backoff share one handler).
+      document.querySelectorAll(".sec-unblock").forEach((btn) => {
+        btn.addEventListener("click", async (e) => {
+          const el = e.target;
+          const scope = el.dataset.scope;
+          const key = el.dataset.key;
+          el.disabled = true;
+          try {
+            await api("/nemo/api/security/unblock", { method: "POST", body: JSON.stringify({ scope, key }) });
+            loadSecurity();
+          } catch (err) {
+            el.disabled = false;
+            alert("Unblock failed: " + err.message);
+          }
+        });
+      });
     }
 
     function pathBadge(path) {

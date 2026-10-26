@@ -6,7 +6,7 @@ use crate::{
 use axum::{
     extract::{ConnectInfo, Extension, Path, Query},
     http::{header::AUTHORIZATION, HeaderMap, StatusCode},
-    response::Html,
+    response::{Html, IntoResponse},
     routing::{get, post},
     Json, Router,
 };
@@ -125,6 +125,57 @@ async fn limit_request_body(
     let req = axum::http::Request::from_parts(parts, axum::body::Body::from(buf));
     Ok(next.run(req).await)
 }
+
+// C1 (pentest 08-IMPROVEMENTS): per-source pre-gate rate limit for the
+// unauthenticated sign-in/bootstrap routes (/api/login, /api/login-key,
+// /api/tls-cert-info). Runs before any extractor or sealedbox open, so a
+// volumetric flood is shed as a cheap 429 instead of being unsealed. Scoped to
+// those routes only -- NOT the device-key-gated policy poll -- so a large NAT of
+// legitimately-polling clients is never throttled. The in-app bucket is the
+// backstop for when no edge proxy/WAF fronts the API (07-HARDENING R1).
+async fn unauth_rate_limit(
+    req: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next<axum::body::Body>,
+) -> axum::response::Response {
+    // ConnectInfo is placed in the request extensions by
+    // into_make_service_with_connect_info (same source the handlers read).
+    let ip = req
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ConnectInfo(a)| a.ip().to_string());
+    if integration::unauth_rate_block(ip.as_deref()) {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many requests; slow down and retry",
+        )
+            .into_response();
+    }
+    next.run(req).await
+}
+
+// C3 (pentest 08-IMPROVEMENTS): enforce the admin token BEFORE any body
+// extractor runs. axum extractors execute before the handler body, so each admin
+// handler's own `require_auth` call fires only AFTER `Json<T>` has already parsed
+// the body -- which let an unauthenticated request get a `422` (leaking the
+// expected field name) and do a small pre-auth parse. Applied as a route_layer on
+// the authenticated admin sub-router, this rejects a tokenless/forged request
+// with `401` before the body is touched. No bypass existed; this removes the
+// unauthenticated parse surface. Handlers keep their internal require_auth as
+// defence in depth.
+async fn require_auth_mw(
+    req: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next<axum::body::Body>,
+) -> axum::response::Response {
+    let token = req
+        .extensions()
+        .get::<HbbsApiState>()
+        .and_then(|s| s.token.clone());
+    match require_auth(req.headers(), &token) {
+        Ok(()) => next.run(req).await,
+        Err(failure) => failure.into_response(),
+    }
+}
+
 const MAX_MANAGEMENT_POLICY_VALUE_LEN: usize = 4096;
 const NEMO_SOURCE_PREFIX: &str = "nemo-source-v1:";
 const OPTION_NEMO_OUTBOUND_ENABLED: &str = "nemo-outbound-enabled";
@@ -1761,7 +1812,11 @@ pub(crate) async fn spawn_hbbs_api(
     // arrives on: these routes authenticate the CLIENT (device-key signature, or the
     // login credential), never the admin token, so exposing this set is not exposing
     // the admin API.
-    let client_routes = || {
+    // C1: the unauthenticated sign-in / trust-bootstrap routes, behind a per-source
+    // pre-gate rate limit (route_layer so it runs before each handler's extractors).
+    // Kept separate from the periodic, device-key-gated client routes below so a NAT
+    // of legitimately-polling clients is never throttled.
+    let unauth_rate_limited = || {
         Router::new()
             // The client's first call: "is this TLS certificate yours?" (it pins the
             // fingerprint from the setup bundle). Unauthenticated by necessity — it is
@@ -1773,6 +1828,10 @@ pub(crate) async fn spawn_hbbs_api(
             )
             .route("/api/login-key", get(api_login_key).post(api_login_key))
             .route("/api/login", post(api_login))
+            .route_layer(axum::middleware::from_fn(unauth_rate_limit))
+    };
+    let client_routes = || {
+        Router::new()
             .route("/api/logout", post(api_logout))
             .route("/api/currentUser", post(api_current_user))
             .route("/api/ab/get", post(api_ab_get))
@@ -1794,21 +1853,11 @@ pub(crate) async fn spawn_hbbs_api(
             )
     };
 
-    let app = Router::new()
-        .merge(client_routes())
-        // TASK-18: the dashboard HTML is a complete map of the management surface
-        // -- every /nemo/api route, every pushed policy key, the LDAP and device-key
-        // workflows, the running build id -- and the shipped systemd unit binds
-        // 0.0.0.0:21120, so it must not be served to a tokenless caller. A browser
-        // navigation cannot carry an Authorization header, so the three navigable
-        // paths serve a structureless login shell and the shell XHRs the real page
-        // from /nemo/admin/app WITH the header. One credential, one predicate
-        // (require_auth), no cookie and therefore no CSRF surface.
-        .route("/nemo", get(admin_shell))
-        .route("/nemo/admin", get(admin_shell))
-        .route("/nemo/admin/", get(admin_shell))
-        .route("/nemo/admin/app", get(admin_gui))
-        .route("/nemo/api/health", get(health))
+    // C3: every token-gated admin route, behind require_auth_mw as a route_layer so
+    // the token is checked BEFORE any body extractor runs (no pre-auth parse / field
+    // leak). Handlers keep their own require_auth as defence in depth. The navigable
+    // shell (/nemo, /nemo/admin[/app]) and /nemo/api/health stay on the base app.
+    let admin_api = Router::new()
         .route("/nemo/api/peers", get(list_peers))
         .route("/nemo/api/peers/delete", post(delete_peers))
         .route("/nemo/api/peers/:id", get(get_peer))
@@ -1816,8 +1865,6 @@ pub(crate) async fn spawn_hbbs_api(
         .route("/nemo/api/peers/:id/block", post(block_peer))
         .route("/nemo/api/peers/:id/allow", post(allow_peer))
         .route("/nemo/api/peers/:id/reset-policy", post(reset_peer_policy))
-        // Where this workstation is reachable without the relay (a port forward the
-        // operator configured on its site's routers).
         .route(
             "/nemo/api/peers/:id/direct-endpoint",
             post(set_peer_direct_endpoint),
@@ -1831,13 +1878,9 @@ pub(crate) async fn spawn_hbbs_api(
             get(get_peer_management_policy).put(update_peer_management_policy),
         )
         .route("/nemo/api/policy", get(get_policy).put(update_policy))
-        // Break-glass: mint a new server identity key and retire the current one. Locks out
-        // every client still carrying the old key, so it needs an explicit confirmation in
-        // the body on top of the dashboard's dialog.
         .route("/nemo/api/server-key/rotate", post(rotate_server_key_route))
         .route("/nemo/api/stats", get(get_stats))
         .route("/nemo/api/events", get(get_events))
-        // Nemo integration: LDAP config + per-user RBAC (admin dashboard).
         .route(
             "/nemo/api/integration/ldap",
             get(get_ldap_config).put(put_ldap_config),
@@ -1855,13 +1898,10 @@ pub(crate) async fn spawn_hbbs_api(
             get(list_device_keys).post(generate_device_key),
         )
         .route("/nemo/api/device-keys/:id/delete", post(delete_device_key))
-        // The first-run settings bundle: GET for the defaults + a key-less string, POST
-        // to apply the operator's edits.
         .route(
             "/nemo/api/client-setup",
             get(get_client_setup).post(post_client_setup),
         )
-        // M1-CLAIM: the pending-claim queue and the editable "Bound to ID" field.
         .route("/nemo/api/device-key-claims", get(list_device_key_claims))
         .route(
             "/nemo/api/device-keys/:id/claim/approve",
@@ -1876,10 +1916,7 @@ pub(crate) async fn spawn_hbbs_api(
             post(forget_device_key_claim),
         )
         .route("/nemo/api/device-keys/:id/peer-id", post(set_device_key_peer_id))
-        .route(
-            "/nemo/api/policies",
-            get(get_policies).put(put_policies),
-        )
+        .route("/nemo/api/policies", get(get_policies).put(put_policies))
         .route("/nemo/api/policies/device", post(set_device_policy_route))
         .route(
             "/nemo/api/global-policy",
@@ -1887,9 +1924,32 @@ pub(crate) async fn spawn_hbbs_api(
         )
         .route("/nemo/api/connections", get(get_connections))
         .route("/nemo/api/connections/cut", post(cut_connection))
+        // C4: live defensive state + metrics for the Security panel, and the operator
+        // control to lift an auto-block (both token-gated by the route_layer below).
+        .route("/nemo/api/security", get(get_security))
+        .route("/nemo/api/security/unblock", post(post_security_unblock))
         .route("/nemo/api/update", post(put_update_manifest))
         .route("/nemo/api/update/delete", post(delete_update_manifest))
         .route(UPDATE_UPLOAD_ROUTE, post(upload_update_installer))
+        .route_layer(axum::middleware::from_fn(require_auth_mw));
+
+    let app = Router::new()
+        .merge(client_routes())
+        .merge(unauth_rate_limited())
+        // TASK-18: the dashboard HTML is a complete map of the management surface
+        // -- every /nemo/api route, every pushed policy key, the LDAP and device-key
+        // workflows, the running build id -- and the shipped systemd unit binds
+        // 0.0.0.0:21120, so it must not be served to a tokenless caller. A browser
+        // navigation cannot carry an Authorization header, so the three navigable
+        // paths serve a structureless login shell and the shell XHRs the real page
+        // from /nemo/admin/app WITH the header. One credential, one predicate
+        // (require_auth), no cookie and therefore no CSRF surface.
+        .route("/nemo", get(admin_shell))
+        .route("/nemo/admin", get(admin_shell))
+        .route("/nemo/admin/", get(admin_shell))
+        .route("/nemo/admin/app", get(admin_gui))
+        .route("/nemo/api/health", get(health))
+        .merge(admin_api)
         .layer(axum::middleware::from_fn(bump_epoch_on_authz_change))
         .layer(Extension(state.clone()))
         // SEC-9: applied last so it wraps every route above, including the
@@ -1981,6 +2041,7 @@ pub(crate) async fn spawn_hbbs_api(
             );
         }
         let client_app = client_routes()
+            .merge(unauth_rate_limited())
             .layer(Extension(state))
             .layer(axum::middleware::from_fn(limit_request_body));
         // No admin token crosses this bind and no admin route is mounted on it, so the
@@ -2641,9 +2702,45 @@ async fn api_login(
             // Per-username exponential backoff: slows online brute force / credential
             // stuffing hard, but never hard-locks (a correct password succeeds
             // instantly and clears the counter, so real users are never blocked).
-            integration::note_login_spray(source_ip, &username);
+            let tripped = integration::note_login_spray(source_ip, &username);
             let failures = integration::note_login_failure(&username);
             let delay = integration::login_backoff_ms(failures);
+            // C4: record the discrete anomalies into the dashboard event log -- NOT
+            // every failed attempt (that would bury the log), only the transitions:
+            // a spray tripwire firing, and an account's backoff first hitting the cap.
+            let cap = integration::login_backoff_max_ms();
+            let hit_cap = delay >= cap
+                && integration::login_backoff_ms(failures.saturating_sub(1)) < cap;
+            if tripped || hit_cap {
+                let mut store = STATS.write().await;
+                if tripped {
+                    record_event_locked(
+                        &mut store,
+                        "login-spray",
+                        None,
+                        None,
+                        format!(
+                            "password-spray tripwire fired (source {}); directory binds \
+                             refused during cooldown",
+                            source_ip.unwrap_or("?")
+                        ),
+                    );
+                }
+                if hit_cap {
+                    record_event_locked(
+                        &mut store,
+                        "login-backoff-cap",
+                        None,
+                        None,
+                        format!(
+                            "account under sustained failed logins reached the {}s backoff \
+                             cap (source {})",
+                            cap / 1000,
+                            source_ip.unwrap_or("?")
+                        ),
+                    );
+                }
+            }
             if delay > 0 {
                 tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
             }
@@ -7147,6 +7244,99 @@ async fn get_events(
         .cloned()
         .collect();
     Ok(Json(EventsResponse { events }))
+}
+
+// --------------------------------------------------------------------------
+// C4: Security panel API -- live defensive state, metrics, and operator unblock.
+// --------------------------------------------------------------------------
+
+/// `GET /nemo/api/security` -- the snapshot the Security dashboard renders: counters,
+/// thresholds, currently-blocked IPs, accounts under backoff, and throttled sources.
+/// Read-only; exposes no secret.
+async fn get_security(
+    Extension(state): Extension<HbbsApiState>,
+    headers: HeaderMap,
+) -> ApiResult<integration::SecuritySnapshot> {
+    require_auth(&headers, &state.token)?;
+    Ok(Json(integration::security_snapshot()))
+}
+
+#[derive(Deserialize)]
+struct UnblockRequest {
+    /// "ip" (lift per-IP spray cooldown), "throttle" (refill unauth bucket),
+    /// "backoff" (reset an account's login backoff), or "global" (clear the
+    /// fleet-wide tripwire).
+    scope: String,
+    /// The IP (ip/throttle) or username (backoff); ignored for "global".
+    #[serde(default)]
+    key: String,
+}
+
+#[derive(Serialize)]
+struct UnblockResponse {
+    ok: bool,
+    /// Whether an entry actually existed and was cleared (false = nothing to lift).
+    cleared: bool,
+}
+
+/// `POST /nemo/api/security/unblock` -- the "re-enable" control. An authenticated
+/// admin lifts one auto-imposed block so a source wrongly caught (e.g. a shared NAT
+/// egress) is let back in without waiting out the cooldown. Every call is written to
+/// the event log as an audit trail. It only ever REMOVES a limiter's own state; it
+/// cannot grant access the admission policy would otherwise deny.
+async fn post_security_unblock(
+    Extension(state): Extension<HbbsApiState>,
+    headers: HeaderMap,
+    Json(req): Json<UnblockRequest>,
+) -> ApiResult<UnblockResponse> {
+    require_auth(&headers, &state.token)?;
+    let scope = req.scope.trim().to_lowercase();
+    let key = req.key.trim();
+    let (cleared, detail) = match scope.as_str() {
+        "ip" => {
+            if key.is_empty() {
+                return Err(api_error(StatusCode::BAD_REQUEST, "key (IP) required"));
+            }
+            (
+                integration::clear_ip_spray_block(key),
+                format!("admin lifted the per-IP spray block on {key}"),
+            )
+        }
+        "throttle" => {
+            if key.is_empty() {
+                return Err(api_error(StatusCode::BAD_REQUEST, "key (IP) required"));
+            }
+            (
+                integration::clear_unauth_throttle(key),
+                format!("admin reset the unauth rate-limit bucket for {key}"),
+            )
+        }
+        "backoff" => {
+            if key.is_empty() {
+                return Err(api_error(StatusCode::BAD_REQUEST, "key (username) required"));
+            }
+            (
+                integration::clear_backoff(key),
+                format!("admin cleared the login backoff for account '{key}'"),
+            )
+        }
+        "global" => {
+            integration::clear_global_tripwire();
+            (true, "admin lifted the fleet-wide spray tripwire".to_owned())
+        }
+        other => {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                &format!("unknown scope '{other}' (expected ip|throttle|backoff|global)"),
+            ));
+        }
+    };
+    log::warn!("Nemo security: {detail}");
+    {
+        let mut store = STATS.write().await;
+        record_event_locked(&mut store, "security-unblock", None, None, detail);
+    }
+    Ok(Json(UnblockResponse { ok: true, cleared }))
 }
 
 async fn delete_peer_ids(pm: &PeerMap, ids: Vec<String>) -> ApiResult<DeletePeersResponse> {

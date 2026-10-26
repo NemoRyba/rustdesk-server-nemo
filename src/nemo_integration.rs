@@ -1811,6 +1811,15 @@ pub fn note_login_failure(username: &str) -> u32 {
     }
     entry.0 = entry.0.saturating_add(1);
     entry.1 = now;
+    // C4: count the moment an account's backoff first reaches the 30s cap (the
+    // transition, not every subsequent capped failure), so the security panel can
+    // surface "an account is being hammered hard" as a discrete anomaly.
+    if entry.0 >= 1
+        && login_backoff_ms(entry.0) >= LOGIN_BACKOFF_MAX_MS
+        && login_backoff_ms(entry.0.saturating_sub(1)) < LOGIN_BACKOFF_MAX_MS
+    {
+        SEC_BACKOFF_CAP_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     entry.0
 }
 
@@ -1820,6 +1829,12 @@ pub fn clear_login_failures(username: &str) {
         .lock()
         .unwrap()
         .remove(&normalize_lookup_username(username));
+}
+
+/// The ceiling `login_backoff_ms` saturates at, exposed so callers can detect the
+/// moment an account's backoff first reaches the cap (a loggable anomaly).
+pub fn login_backoff_max_ms() -> u64 {
+    LOGIN_BACKOFF_MAX_MS
 }
 
 /// Delay to apply before returning a failed login, given the consecutive
@@ -1906,6 +1921,7 @@ pub fn login_spray_block(source_ip: Option<&str>) -> Option<&'static str> {
     {
         let mut global = SPRAY_GLOBAL.lock().unwrap();
         if now < global.blocked_until {
+            SEC_PRE_BIND_REFUSALS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return Some("too many failed sign-ins on this server right now; try again shortly");
         }
         global.roll(now, SPRAY_GLOBAL_WINDOW_SECS);
@@ -1914,6 +1930,7 @@ pub fn login_spray_block(source_ip: Option<&str>) -> Option<&'static str> {
     let mut map = SPRAY_BY_IP.lock().unwrap();
     let entry = map.get_mut(ip)?;
     if now < entry.blocked_until {
+        SEC_PRE_BIND_REFUSALS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return Some("too many failed sign-ins from your network; try again shortly");
     }
     None
@@ -1937,6 +1954,7 @@ pub fn note_login_spray(source_ip: Option<&str>, username: &str) -> bool {
             && global.trip(now, SPRAY_GLOBAL_COOLDOWN_SECS)
         {
             tripped = true;
+            SEC_GLOBAL_SPRAY_TRIPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             log::error!(
                 "Nemo login: more than {} distinct usernames failed within {}s across all \
                  sources - refusing directory binds for {}s (password spraying)",
@@ -1971,16 +1989,326 @@ pub fn note_login_spray(source_ip: Option<&str>, username: &str) -> bool {
             ip,
             SPRAY_IP_COOLDOWN_SECS,
         );
+        SEC_IP_SPRAY_TRIPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         tripped = true;
     }
     tripped
 }
 
-/// Test hook: forget all spray state. Not used at runtime.
+// --------------------------------------------------------------------------
+// C1 (pentest 08-IMPROVEMENTS): pre-gate volumetric rate limit for the
+// UNAUTHENTICATED mgmt-API routes (/api/login, /api/login-key,
+// /api/tls-cert-info). The credential defences above (per-username backoff and
+// the spray tripwires) only engage AFTER a sealedbox open and a valid username,
+// so none of them blunt a raw flood of TLS handshakes + unseal attempts. This
+// per-source token bucket sheds such a flood BEFORE the sealedbox open, with a
+// budget set well above any human-paced sign-in so a legitimate client -- even
+// many behind one NAT -- is never throttled. It is a backstop for when no edge
+// proxy/WAF fronts the API; see 07-HARDENING R1.
+const UNAUTH_BUCKET_CAPACITY: f64 = 40.0; // burst
+const UNAUTH_REFILL_PER_SEC: f64 = 2.0; // sustained ~20 / 10 s
+const UNAUTH_MAX_TRACKED_IPS: usize = 8192;
+
+struct TokenBucket {
+    tokens: f64,
+    last_ms: u64,
+}
+
+static UNAUTH_RATE: Lazy<Mutex<HashMap<String, TokenBucket>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+/// `true` means SHED this request (respond 429) before any sealedbox open.
+/// Consumes one token per call. A missing source IP is allowed -- it cannot be
+/// keyed, and this is a volumetric backstop, not the primary control (the
+/// device-key gate still runs behind it).
+pub fn unauth_rate_block(source_ip: Option<&str>) -> bool {
+    let Some(ip) = source_ip else {
+        return false;
+    };
+    let now = now_ms();
+    let mut map = UNAUTH_RATE.lock().unwrap();
+    // Bound the table: when full and this is a new IP, drop buckets that have
+    // refilled to full (idle) so churn cannot grow it without limit. A TCP+TLS
+    // flood cannot spoof its source, so distinct IPs are real reachable hosts.
+    if map.len() >= UNAUTH_MAX_TRACKED_IPS && !map.contains_key(ip) {
+        map.retain(|_, b| {
+            let elapsed = now.saturating_sub(b.last_ms) as f64 / 1000.0;
+            (b.tokens + elapsed * UNAUTH_REFILL_PER_SEC) < UNAUTH_BUCKET_CAPACITY
+        });
+        if map.len() >= UNAUTH_MAX_TRACKED_IPS {
+            // Still full of actively-limited sources: don't start tracking a new
+            // one (and don't block it) -- the ones in the table are the ones
+            // being throttled, and the global/credential controls still apply.
+            return false;
+        }
+    }
+    let b = map.entry(ip.to_owned()).or_insert(TokenBucket {
+        tokens: UNAUTH_BUCKET_CAPACITY,
+        last_ms: now,
+    });
+    let elapsed = now.saturating_sub(b.last_ms) as f64 / 1000.0;
+    b.tokens = (b.tokens + elapsed * UNAUTH_REFILL_PER_SEC).min(UNAUTH_BUCKET_CAPACITY);
+    b.last_ms = now;
+    if b.tokens >= 1.0 {
+        b.tokens -= 1.0;
+        false
+    } else {
+        SEC_UNAUTH_SHED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        true
+    }
+}
+
+// --------------------------------------------------------------------------
+// C4 (pentest 08-IMPROVEMENTS): security observability + operator controls
+// --------------------------------------------------------------------------
+//
+// The limiters above only `log::warn!/error!` when they trip, so a live spray or
+// flood is invisible to an operator and there is no way to lift an auto-block short
+// of waiting out the cooldown. These two things fix that:
+//   * monotonic counters incremented at each trip point (metrics for the panel), and
+//   * a read-only snapshot of the *current* defensive state (who is blocked, for how
+//     long, which accounts are under backoff, which IPs are being throttled), plus
+//   * explicit clear_* controls so an admin can re-enable a source that was blocked
+//     by mistake (e.g. a shared NAT egress that legitimately tripped the per-IP gate).
+// None of this weakens a control: clearing is an authenticated, audited admin action,
+// and the counters/snapshot expose no secret.
+
+static SEC_UNAUTH_SHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SEC_IP_SPRAY_TRIPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SEC_GLOBAL_SPRAY_TRIPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SEC_BACKOFF_CAP_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SEC_PRE_BIND_REFUSALS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Monotonic since-boot counters for the security dashboard. Cheap to read.
+#[derive(Clone, Default, Serialize)]
+pub struct SecurityCounters {
+    /// Unauthenticated requests shed with 429 by the pre-gate token bucket (C1).
+    pub unauth_shed: u64,
+    /// Times a single source IP tripped the per-IP spray cooldown.
+    pub ip_spray_trips: u64,
+    /// Times the fleet-wide spray tripwire fired (refuse-all cooldown).
+    pub global_spray_trips: u64,
+    /// Times an account's login backoff first reached the 30s cap.
+    pub backoff_cap_hits: u64,
+    /// Logins refused before the directory bind by an active spray block.
+    pub pre_bind_refusals: u64,
+}
+
+fn load_counter(c: &std::sync::atomic::AtomicU64) -> u64 {
+    c.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The thresholds behind the limiters, so the panel can show "10 users / 300s"
+/// beside each block rather than hard-coding them in the HTML.
+#[derive(Clone, Serialize)]
+pub struct SecurityConfig {
+    pub spray_ip_window_secs: u64,
+    pub spray_ip_max_users: usize,
+    pub spray_ip_cooldown_secs: u64,
+    pub spray_global_window_secs: u64,
+    pub spray_global_max_users: usize,
+    pub spray_global_cooldown_secs: u64,
+    pub backoff_max_ms: u64,
+    pub unauth_bucket_capacity: f64,
+    pub unauth_refill_per_sec: f64,
+}
+
+/// An IP currently inside a per-IP spray cooldown (a directory-bind block).
+#[derive(Clone, Serialize)]
+pub struct IpSprayBlock {
+    pub ip: String,
+    pub remaining_secs: u64,
+    pub distinct_users: usize,
+}
+
+/// The fleet-wide tripwire state.
+#[derive(Clone, Serialize)]
+pub struct GlobalTripwire {
+    pub active: bool,
+    pub remaining_secs: u64,
+    pub distinct_users_window: usize,
+}
+
+/// An account currently under login backoff (consecutive failures in the window).
+#[derive(Clone, Serialize)]
+pub struct BackoffAccount {
+    pub username: String,
+    pub failures: u32,
+    pub backoff_ms: u64,
+    pub at_cap: bool,
+    pub last_failure_secs_ago: u64,
+}
+
+/// An IP whose unauth token bucket is depleted below full (under rate pressure).
+#[derive(Clone, Serialize)]
+pub struct ThrottledIp {
+    pub ip: String,
+    pub tokens: f64,
+    pub shedding: bool,
+}
+
+/// Everything the Security panel renders, captured under the relevant locks.
+#[derive(Clone, Serialize)]
+pub struct SecuritySnapshot {
+    pub now_secs: u64,
+    pub counters: SecurityCounters,
+    pub config: SecurityConfig,
+    pub global_tripwire: GlobalTripwire,
+    pub ip_blocks: Vec<IpSprayBlock>,
+    pub backoff_accounts: Vec<BackoffAccount>,
+    pub throttled_ips: Vec<ThrottledIp>,
+}
+
+/// Read the current counters.
+pub fn security_counters() -> SecurityCounters {
+    SecurityCounters {
+        unauth_shed: load_counter(&SEC_UNAUTH_SHED),
+        ip_spray_trips: load_counter(&SEC_IP_SPRAY_TRIPS),
+        global_spray_trips: load_counter(&SEC_GLOBAL_SPRAY_TRIPS),
+        backoff_cap_hits: load_counter(&SEC_BACKOFF_CAP_HITS),
+        pre_bind_refusals: load_counter(&SEC_PRE_BIND_REFUSALS),
+    }
+}
+
+/// Snapshot the live defensive state for the admin dashboard. Read-only: it never
+/// writes back a refilled bucket or rolls a window, so observing never alters the
+/// controls.
+pub fn security_snapshot() -> SecuritySnapshot {
+    let now = now_secs();
+    let now_ms_v = now_ms();
+
+    let global_tripwire = {
+        let g = SPRAY_GLOBAL.lock().unwrap();
+        GlobalTripwire {
+            active: now < g.blocked_until,
+            remaining_secs: g.blocked_until.saturating_sub(now),
+            distinct_users_window: g.users.len(),
+        }
+    };
+
+    let ip_blocks = {
+        let map = SPRAY_BY_IP.lock().unwrap();
+        let mut v: Vec<IpSprayBlock> = map
+            .iter()
+            .filter(|(_, w)| now < w.blocked_until)
+            .map(|(ip, w)| IpSprayBlock {
+                ip: ip.clone(),
+                remaining_secs: w.blocked_until.saturating_sub(now),
+                distinct_users: w.users.len(),
+            })
+            .collect();
+        v.sort_by(|a, b| b.remaining_secs.cmp(&a.remaining_secs));
+        v
+    };
+
+    let backoff_accounts = {
+        let map = LOGIN_FAILURES.lock().unwrap();
+        let mut v: Vec<BackoffAccount> = map
+            .iter()
+            .filter(|(_, (fails, last))| {
+                *fails > 0 && now.saturating_sub(*last) < LOGIN_FAILURE_WINDOW_SECS
+            })
+            .map(|(user, (fails, last))| {
+                let ms = login_backoff_ms(*fails);
+                BackoffAccount {
+                    username: user.clone(),
+                    failures: *fails,
+                    backoff_ms: ms,
+                    at_cap: ms >= LOGIN_BACKOFF_MAX_MS,
+                    last_failure_secs_ago: now.saturating_sub(*last),
+                }
+            })
+            .collect();
+        v.sort_by(|a, b| b.failures.cmp(&a.failures));
+        v
+    };
+
+    let throttled_ips = {
+        let map = UNAUTH_RATE.lock().unwrap();
+        let mut v: Vec<ThrottledIp> = map
+            .iter()
+            .filter_map(|(ip, b)| {
+                let elapsed = now_ms_v.saturating_sub(b.last_ms) as f64 / 1000.0;
+                let tokens =
+                    (b.tokens + elapsed * UNAUTH_REFILL_PER_SEC).min(UNAUTH_BUCKET_CAPACITY);
+                // Only surface IPs still below full budget -- a bucket at capacity is
+                // an idle, unremarkable source.
+                if tokens < UNAUTH_BUCKET_CAPACITY - 0.5 {
+                    Some(ThrottledIp {
+                        ip: ip.clone(),
+                        tokens: (tokens * 10.0).round() / 10.0,
+                        shedding: tokens < 1.0,
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect();
+        v.sort_by(|a, b| a.tokens.partial_cmp(&b.tokens).unwrap_or(std::cmp::Ordering::Equal));
+        v
+    };
+
+    SecuritySnapshot {
+        now_secs: now,
+        counters: security_counters(),
+        config: SecurityConfig {
+            spray_ip_window_secs: SPRAY_IP_WINDOW_SECS,
+            spray_ip_max_users: SPRAY_IP_MAX_USERS,
+            spray_ip_cooldown_secs: SPRAY_IP_COOLDOWN_SECS,
+            spray_global_window_secs: SPRAY_GLOBAL_WINDOW_SECS,
+            spray_global_max_users: SPRAY_GLOBAL_MAX_USERS,
+            spray_global_cooldown_secs: SPRAY_GLOBAL_COOLDOWN_SECS,
+            backoff_max_ms: LOGIN_BACKOFF_MAX_MS,
+            unauth_bucket_capacity: UNAUTH_BUCKET_CAPACITY,
+            unauth_refill_per_sec: UNAUTH_REFILL_PER_SEC,
+        },
+        global_tripwire,
+        ip_blocks,
+        backoff_accounts,
+        throttled_ips,
+    }
+}
+
+/// Operator control: lift the per-IP spray cooldown for `ip`. Returns true if an
+/// entry existed (removing it clears both the counting window and the cooldown, so
+/// the source starts clean). Use when a shared/NAT egress tripped the gate.
+pub fn clear_ip_spray_block(ip: &str) -> bool {
+    SPRAY_BY_IP.lock().unwrap().remove(ip).is_some()
+}
+
+/// Operator control: lift the fleet-wide spray tripwire immediately.
+pub fn clear_global_tripwire() {
+    *SPRAY_GLOBAL.lock().unwrap() = SprayWindow::default();
+}
+
+/// Operator control: reset an account's login-failure backoff. Returns true if the
+/// account had a live failure counter.
+pub fn clear_backoff(username: &str) -> bool {
+    LOGIN_FAILURES
+        .lock()
+        .unwrap()
+        .remove(&normalize_lookup_username(username))
+        .is_some()
+}
+
+/// Operator control: refill an IP's unauth token bucket (drop its entry so its next
+/// request starts at full budget). Returns true if the IP was being tracked.
+pub fn clear_unauth_throttle(ip: &str) -> bool {
+    UNAUTH_RATE.lock().unwrap().remove(ip).is_some()
+}
+
+/// Test hook: forget all spray + rate-limit state. Not used at runtime.
 #[cfg(test)]
 fn reset_spray_state() {
     SPRAY_BY_IP.lock().unwrap().clear();
     *SPRAY_GLOBAL.lock().unwrap() = SprayWindow::default();
+    UNAUTH_RATE.lock().unwrap().clear();
+    LOGIN_FAILURES.lock().unwrap().clear();
+    SEC_UNAUTH_SHED.store(0, std::sync::atomic::Ordering::Relaxed);
+    SEC_IP_SPRAY_TRIPS.store(0, std::sync::atomic::Ordering::Relaxed);
+    SEC_GLOBAL_SPRAY_TRIPS.store(0, std::sync::atomic::Ordering::Relaxed);
+    SEC_BACKOFF_CAP_HITS.store(0, std::sync::atomic::Ordering::Relaxed);
+    SEC_PRE_BIND_REFUSALS.store(0, std::sync::atomic::Ordering::Relaxed);
 }
 
 // --------------------------------------------------------------------------
@@ -2121,6 +2449,13 @@ fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
+        .unwrap_or_default()
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
         .unwrap_or_default()
 }
 
@@ -2916,6 +3251,13 @@ pub async fn authenticate_ldap(
 mod tests {
     use super::*;
 
+    /// The spray / rate-limit / backoff limiters all key off process-global statics,
+    /// so the tests that drive them (and call `reset_spray_state`) must not run at the
+    /// same time or one will clear or trip state out from under another. Every such
+    /// test takes this lock first to serialise them. `parking_lot`-free: a poisoned
+    /// std Mutex from a panicking test is fine here -- we only need mutual exclusion.
+    static SPRAY_TEST_GUARD: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+
     // Named-policy resolution: an assigned named policy wins over a user's inline
     // policy and provides the device policy; a dangling name falls back to inline.
     // Mutates the process-global CONFIG directly (no disk write) with unique keys
@@ -3573,10 +3915,12 @@ mod tests {
         assert!(login_backoff_ms(7) <= 30_000);
     }
 
-    // SEC-10. One test, not several: the limiter's state is process-global, so
-    // separate #[test] fns would race each other under the default parallel runner.
+    // SEC-10. The limiter state is process-global; this test and
+    // `security_snapshot_reflects_...` both drive it, so both hold SPRAY_TEST_GUARD to
+    // run serially (otherwise one's reset/trip races the other under the parallel runner).
     #[test]
     fn spray_limiter_counts_distinct_usernames_and_trips_before_the_bind() {
+        let _guard = SPRAY_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         reset_spray_state();
 
         // A user fat-fingering the SAME account never trips it, however often.
@@ -3621,6 +3965,98 @@ mod tests {
 
         reset_spray_state();
         assert_eq!(login_spray_block(None), None);
+
+        // C1: the pre-gate per-source token bucket. Shares this one test because its
+        // table is process-global too (reset_spray_state clears it).
+        reset_spray_state();
+        // No source IP: never shed (cannot be keyed) -- the device-key gate still runs.
+        for _ in 0..100 {
+            assert!(!unauth_rate_block(None));
+        }
+        // A rapid burst from one source: the first ~CAPACITY pass, then it sheds.
+        let cap = UNAUTH_BUCKET_CAPACITY as usize;
+        let mut passed = 0usize;
+        for _ in 0..(cap + 20) {
+            if !unauth_rate_block(Some("203.0.113.7")) {
+                passed += 1;
+            }
+        }
+        assert!(passed <= cap + 2, "burst not capped: {passed} passed");
+        assert!(passed >= cap - 2, "a legitimate burst was wrongly shed: {passed}");
+        assert!(
+            unauth_rate_block(Some("203.0.113.7")),
+            "a sustained flood from one source should stay shed"
+        );
+        // A different source has its own full bucket -- one flooder cannot starve others.
+        assert!(!unauth_rate_block(Some("203.0.113.8")));
+        reset_spray_state();
+    }
+
+    #[test]
+    fn security_snapshot_reflects_blocks_and_controls_clear_them() {
+        let _guard = SPRAY_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        reset_spray_state();
+
+        // Trip the per-IP spray gate: >SPRAY_IP_MAX_USERS distinct names from one IP.
+        for n in 0..=SPRAY_IP_MAX_USERS {
+            note_login_spray(Some("198.51.100.5"), &format!("victim{n}"));
+        }
+        // Drive one IP's unauth bucket to shedding so it shows as throttled.
+        for _ in 0..(UNAUTH_BUCKET_CAPACITY as usize + 5) {
+            unauth_rate_block(Some("198.51.100.9"));
+        }
+        // An account under backoff.
+        for _ in 0..3 {
+            note_login_failure("bob");
+        }
+
+        let snap = security_snapshot();
+        // The spray trip is both counted and visible as a live block.
+        assert_eq!(snap.counters.ip_spray_trips, 1, "one per-IP trip counted");
+        assert!(
+            snap.ip_blocks.iter().any(|b| b.ip == "198.51.100.5" && b.remaining_secs > 0),
+            "the blocked IP must appear with time remaining"
+        );
+        // The flooded IP is shedding and surfaced as throttled; the shed counter moved.
+        assert!(snap.counters.unauth_shed >= 1, "shed requests counted");
+        assert!(
+            snap.throttled_ips.iter().any(|t| t.ip == "198.51.100.9" && t.shedding),
+            "the flooded IP must appear as shedding"
+        );
+        // The failing account is listed under backoff.
+        assert!(
+            snap.backoff_accounts.iter().any(|a| a.username == "bob" && a.failures == 3),
+            "the backed-off account must be listed"
+        );
+        // Config is surfaced for the panel.
+        assert_eq!(snap.config.spray_ip_max_users, SPRAY_IP_MAX_USERS);
+
+        // Operator controls lift each block, and a snapshot taken after is clean.
+        assert!(clear_ip_spray_block("198.51.100.5"));
+        assert!(!clear_ip_spray_block("198.51.100.5"), "second clear is a no-op");
+        assert!(clear_unauth_throttle("198.51.100.9"));
+        assert!(clear_backoff("bob"));
+        assert!(!clear_backoff("bob"), "second clear is a no-op");
+
+        let after = security_snapshot();
+        assert!(after.ip_blocks.is_empty(), "block lifted");
+        assert!(after.backoff_accounts.is_empty(), "backoff cleared");
+        assert!(
+            after.throttled_ips.iter().all(|t| t.ip != "198.51.100.9"),
+            "throttle reset -> bucket refills to full, no longer listed"
+        );
+        // Clearing a source does NOT rewrite the monotonic counters (they are an
+        // audit trail of what has happened, not the current block set).
+        assert_eq!(after.counters.ip_spray_trips, 1);
+
+        // Global tripwire can be tripped and then lifted by the operator.
+        for n in 0..=SPRAY_GLOBAL_MAX_USERS {
+            note_login_spray(Some(&format!("10.9.9.{n}")), &format!("g{n}"));
+        }
+        assert!(security_snapshot().global_tripwire.active, "global tripwire active");
+        clear_global_tripwire();
+        assert!(!security_snapshot().global_tripwire.active, "global tripwire lifted");
+        reset_spray_state();
     }
 
     #[test]
