@@ -19,6 +19,11 @@ set -uo pipefail
 APP_NAME="TBFDesk"
 PKG="rustdesk"                                  # Linux package/service/bin name
 CONFIG_DIR="${HOME}/.config/tbfdesk"            # client config (per the app's ProjectDirs)
+# TBFDesk's pre-rename config. The client copies it into $CONFIG_DIR on first start
+# (hbb_common migrate_legacy_app_name), so leaving it let the next install resurrect the
+# old ID, keypair, device key and servers.
+LEGACY_NAME="RustDesk"
+LEGACY_CONFIG_DIR="${HOME}/.config/rustdesk"
 DRY_RUN="${DRY_RUN:-0}"
 # Non-interactive mode for scripting/automation: set COMPONENTS to "all" or a comma list
 # (e.g. "svc,keys,db"). ASSUME_YES=1 skips the confirmation. No dialog is shown.
@@ -28,7 +33,8 @@ NONINT=0; [ -n "$COMPONENTS" ] && NONINT=1
 
 have(){ command -v "$1" >/dev/null 2>&1; }
 GUI=""
-if [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]; then
+# Non-interactive never opens a dialog: the closing "Done" box would block a script forever.
+if [ "$NONINT" = 0 ] && [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]; then
   if have zenity; then GUI=zenity; elif have kdialog; then GUI=kdialog; fi
 fi
 
@@ -122,13 +128,19 @@ do_client(){
     plan "Remove systemd unit file"                    "$(sudo_if_needed rm -f /etc/systemd/system/$PKG.service /usr/lib/systemd/system/$PKG.service); $(sudo_if_needed systemctl daemon-reload); true"
   fi
 
-  if [ "$wipe_all" = 1 ] && [ -d "$CONFIG_DIR" ]; then
-    plan "Wipe entire config dir ($CONFIG_DIR): settings, ID, keypair, device key, logs" "rm -rf '$CONFIG_DIR'"
+  if [ "$wipe_all" = 1 ]; then
+    [ -d "$CONFIG_DIR" ] && plan "Wipe entire config dir ($CONFIG_DIR): settings, ID, keypair, device key, logs" "rm -rf '$CONFIG_DIR'"
+    [ -d "$LEGACY_CONFIG_DIR" ] && plan "Wipe the pre-rename config ($LEGACY_CONFIG_DIR) the client would import again" "rm -rf '$LEGACY_CONFIG_DIR'"
   else
-    grep -qx identity <<<"$sel" && plan "Remove device ID & keypair ($CONFIG_DIR/$APP_NAME.toml)"        "rm -f '$CONFIG_DIR/$APP_NAME.toml'"
-    grep -qx devkey   <<<"$sel" && plan "Remove device key & policy cache ($CONFIG_DIR/${APP_NAME}2.toml)" "rm -f '$CONFIG_DIR/${APP_NAME}2.toml'"
-    grep -qx settings <<<"$sel" && plan "Remove local settings & peer cache"                              "rm -f '$CONFIG_DIR/${APP_NAME}_local.toml' '$CONFIG_DIR'/peers.toml ; rm -rf '$CONFIG_DIR'/peers '$CONFIG_DIR'/ab"
-    grep -qx logs     <<<"$sel" && plan "Remove logs"                                                     "rm -rf '$CONFIG_DIR'/log '$CONFIG_DIR'/*.log"
+    # Both names, and every file's .bak twin (the client falls back to it when the file is missing).
+    for pair in "$CONFIG_DIR|$APP_NAME" "$LEGACY_CONFIG_DIR|$LEGACY_NAME"; do
+      d=${pair%%|*}; n=${pair##*|}
+      [ -d "$d" ] || continue
+      grep -qx identity <<<"$sel" && plan "Remove device ID & keypair ($d/$n.toml)"        "rm -f '$d/$n.toml' '$d/$n.toml.bak'"
+      grep -qx devkey   <<<"$sel" && plan "Remove device key & policy cache ($d/${n}2.toml)" "rm -f '$d/${n}2.toml' '$d/${n}2.toml.bak'"
+      grep -qx settings <<<"$sel" && plan "Remove local settings & peer cache ($d)"          "rm -f '$d/${n}_local.toml' '$d/${n}_local.toml.bak' '$d'/peers.toml ; rm -rf '$d'/peers '$d'/ab"
+      grep -qx logs     <<<"$sel" && plan "Remove logs ($d)"                                 "rm -rf '$d'/log '$d'/*.log"
+    done
   fi
 }
 
@@ -189,7 +201,7 @@ summary+="This cannot be undone."
 if confirm "$summary"; then
   result="$(run_plan)"
   info "Done.\n\n$result"
-  echo "$result"
+  if [ -n "$GUI" ]; then echo "$result"; fi   # the dialog is gone once closed; text mode already printed it
 else
   info "Cancelled — nothing was removed."
 fi

@@ -42,11 +42,19 @@ if (-not $NoGui) { Add-Type -AssemblyName System.Windows.Forms, System.Drawing }
 # ---- resolve the real paths ----------------------------------------------------
 $pf  = ${env:ProgramFiles}
 $pfx = ${env:ProgramFiles(x86)}
-$cfgRoots = @(
-  (Join-Path $env:APPDATA $AppName),                                                    # interactive user
-  "C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\$AppName",                   # LocalService svc
-  "C:\Windows\System32\config\systemprofile\AppData\Roaming\$AppName"                   # SYSTEM svc
-) | Where-Object { $_ }
+# TBFDesk was called RustDesk before the rename, and the client copies a RustDesk-named
+# config into its TBFDesk folder on first start (hbb_common migrate_legacy_app_name). Wiping
+# only the TBFDesk folders therefore let the NEXT install resurrect the old ID, keypair,
+# device key and servers -- so both names are wiped. Only folders that exist are listed.
+$LegacyName = 'RustDesk'
+$cfgRoots = foreach ($n in @($AppName, $LegacyName)) {
+  foreach ($root in @(
+      (Join-Path $env:APPDATA $n),                                                    # interactive user
+      "C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\$n",                   # LocalService svc
+      "C:\Windows\System32\config\systemprofile\AppData\Roaming\$n")) {               # SYSTEM svc
+    if ($root -and (Test-Path $root)) { [pscustomobject]@{ Name = $n; Root = $root } }
+  }
+}
 
 function Component-Client {
   @(
@@ -137,12 +145,14 @@ function Build-Client($sel) {
     Step 'Remove Add/Remove-Programs registry entry' @("HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\$AppName","HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\$AppName")
     Step 'Remove Start-Menu / Desktop / Startup shortcuts' @("$env:ProgramData\Microsoft\Windows\Start Menu\Programs\$AppName","$env:PUBLIC\Desktop\$AppName.lnk","$env:ProgramData\Microsoft\Windows\Start Menu\Programs\Startup\$AppName Tray.lnk")
   }
-  foreach ($root in $cfgRoots) {
-    $cfg = Join-Path $root 'config'
+  foreach ($r in $cfgRoots) {
+    $root = $r.Root; $n = $r.Name; $cfg = Join-Path $root 'config'
     if ($wipeAll) { Step "Wipe entire config ($root): settings, ID, keypair, device key, logs" @($root); continue }
-    if ($sel -contains 'identity') { Step "Remove device ID & keypair ($cfg\$AppName.toml)" @("$cfg\$AppName.toml") }
-    if ($sel -contains 'devkey')   { Step "Remove device key & policy cache ($cfg\${AppName}2.toml)" @("$cfg\${AppName}2.toml") }
-    if ($sel -contains 'settings') { Step "Remove local settings & peer cache" @("$cfg\${AppName}_local.toml","$cfg\peers") }
+    # Every config file has a .bak twin the client falls back to when the file is missing:
+    # removing only the .toml brought the old values straight back.
+    if ($sel -contains 'identity') { Step "Remove device ID & keypair ($cfg\$n.toml)" @("$cfg\$n.toml","$cfg\$n.toml.bak") }
+    if ($sel -contains 'devkey')   { Step "Remove device key & policy cache ($cfg\${n}2.toml)" @("$cfg\${n}2.toml","$cfg\${n}2.toml.bak") }
+    if ($sel -contains 'settings') { Step "Remove local settings & peer cache" @("$cfg\${n}_local.toml","$cfg\${n}_local.toml.bak","$cfg\peers") }
     if ($sel -contains 'logs')     { Step "Remove logs" @("$root\log") }
   }
 }
