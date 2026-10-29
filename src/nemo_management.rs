@@ -521,7 +521,7 @@ static PEER_AUTH_MODES: Lazy<std::sync::RwLock<HashMap<String, String>>> =
 const MAX_PEER_LABELS: usize = 50_000;
 const MAX_HOSTNAME_LEN: usize = 256;
 // Evict one arbitrary entry so a new key can be inserted without unbounded growth.
-fn evict_one_if_full(map: &mut HashMap<String, String>, id: &str) {
+fn evict_one_if_full<V>(map: &mut HashMap<String, V>, id: &str) {
     if map.len() >= MAX_PEER_LABELS && !map.contains_key(id) {
         if let Some(victim) = map.keys().next().cloned() {
             map.remove(&victim);
@@ -643,6 +643,390 @@ fn peer_client_version(id: &str) -> (String, String) {
     match raw.split_once(' ') {
         Some((v, at)) => (v.to_owned(), at.to_owned()),
         None => (String::new(), String::new()),
+    }
+}
+
+// #43: which policy each client has ACTUALLY applied. The peers table used to show only
+// what this server assigns; a client that refused its policy (rollback, stale, bad
+// signature) looked identical to a healthy one. Each poll now records what it HANDED
+// OVER (policy_ref, a content hash inside the signed payload), and the client's next
+// poll reports what it applied or refused -- inside the poll body, which is sealed to
+// the management key whenever one is configured, and signed with its device key. Kept
+// per (peer, role): the background service and the signed-in user's window poll with
+// different tokens and so get different policies. In memory, like the client versions:
+// every client reports every 30 s.
+
+/// Options left out of `policy_ref`: they change on (nearly) every poll without the
+/// operator changing anything, so including them would make "applied == delivered"
+/// unreachable.
+const POLICY_REF_VOLATILE: &[&str] = &[
+    OPTION_NEMO_CONTROL_TICKET,
+    OPTION_NEMO_CONTROL_EPOCH,
+    OPTION_NEMO_UPDATE_VERSION,
+    "nemo-peer-keys",
+    "nemo-ab-version",
+];
+/// Refusal reasons a client may report: fixed templates on the client side, so nothing
+/// the server sent is echoed back. Anything else is shown as "other".
+const POLICY_REFUSAL_CODES: &[&str] = &[
+    "signature",
+    "downgrade",
+    "id-mismatch",
+    "unstamped",
+    "rollback",
+    "stale",
+    "future",
+    "apply-failed",
+];
+const POLICY_REPORT_MAX_BYTES: usize = 4096;
+const POLICY_REPORT_MAX_KEYS: usize = 64;
+/// No report for four missed polls (30 s each) and the last confirmation is shown as stale.
+const POLICY_REPORT_STALE_SECS: u64 = 120;
+
+#[derive(Clone, Default, Debug, PartialEq)]
+struct PolicyDelivered {
+    policy_ref: String,
+    issued_ts: u64,
+    source: String,
+    name: String,
+    user: String,
+    at: u64,
+}
+
+#[derive(Clone, Default, Debug, PartialEq, Deserialize, Serialize)]
+struct PolicyRefusal {
+    #[serde(default)]
+    code: String,
+    #[serde(default)]
+    issued_ts: u64,
+    #[serde(default)]
+    at: u64,
+}
+
+/// What the client sends (JSON text, so the device signature covers exactly its bytes).
+#[derive(Clone, Default, Debug, PartialEq, Deserialize)]
+struct PolicyReport {
+    #[serde(default)]
+    role: String,
+    #[serde(default, rename = "ref")]
+    applied_ref: String,
+    #[serde(default)]
+    applied_at: u64,
+    #[serde(default)]
+    refused: Option<PolicyRefusal>,
+    #[serde(default)]
+    overridden: Vec<String>,
+}
+
+#[derive(Clone, Default, Debug, PartialEq)]
+struct PolicyApplied {
+    applied_ref: String,
+    applied_at: u64,
+    refused: Option<PolicyRefusal>,
+    overridden: Vec<String>,
+    reported_at: u64,
+}
+
+static PEER_POLICY_DELIVERED: Lazy<std::sync::RwLock<HashMap<String, PolicyDelivered>>> =
+    Lazy::new(|| std::sync::RwLock::new(HashMap::new()));
+static PEER_POLICY_APPLIED: Lazy<std::sync::RwLock<HashMap<String, PolicyApplied>>> =
+    Lazy::new(|| std::sync::RwLock::new(HashMap::new()));
+
+fn policy_role_key(id: &str, role: &str) -> String {
+    format!("{id}|{role}")
+}
+
+/// A stable id for the policy content: identical while nothing the operator controls
+/// changes, so "the client applied what we sent" can be checked by equality.
+fn compute_policy_ref(policy: &ManagementPolicy) -> String {
+    let options: std::collections::BTreeMap<&str, &str> = policy
+        .options
+        .iter()
+        .filter(|(k, _)| !POLICY_REF_VOLATILE.contains(&k.as_str()))
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    let canonical = serde_json::json!({ "o": options, "u": policy.allow_user_override });
+    sha256_hex(canonical.to_string().as_bytes())[..16].to_owned()
+}
+
+/// Parse and bound a client's report. `None` = unusable (wrong role, oversized,
+/// malformed); a bad entry inside an otherwise good report is dropped, not trusted.
+fn parse_policy_report(json: &str) -> Option<PolicyReport> {
+    if json.len() > POLICY_REPORT_MAX_BYTES {
+        return None;
+    }
+    let mut r: PolicyReport = serde_json::from_str(json).ok()?;
+    if r.role != "service" && r.role != "ui" {
+        return None;
+    }
+    if r.applied_ref.len() > 64 || !r.applied_ref.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    if let Some(refused) = r.refused.as_mut() {
+        if !POLICY_REFUSAL_CODES.contains(&refused.code.as_str()) {
+            refused.code = "other".to_owned();
+        }
+    }
+    r.overridden.retain(|k| {
+        !k.is_empty()
+            && k.len() <= 64
+            && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+    });
+    r.overridden.truncate(POLICY_REPORT_MAX_KEYS);
+    Some(r)
+}
+
+/// The report's own device signature: attached Ed25519 over
+/// "nemo-policy-report:{id}:{ts}:{sha256hex(report)}", so the exact report bytes are
+/// bound to this machine's key and cannot be moved into another poll body.
+fn verify_policy_report_sig(pub_b64: &str, sig_b64: &str, id: &str, report: &str, now: u64) -> bool {
+    let (Ok(pk_bytes), Ok(sig_bytes)) =
+        (base64::decode(pub_b64.trim()), base64::decode(sig_b64.trim()))
+    else {
+        return false;
+    };
+    let Some(pk) = sign::PublicKey::from_slice(&pk_bytes) else {
+        return false;
+    };
+    let Ok(msg) = sign::verify(&sig_bytes, &pk) else {
+        return false;
+    };
+    let msg = String::from_utf8_lossy(&msg);
+    let parts: Vec<&str> = msg.splitn(4, ':').collect();
+    if parts.len() != 4 || parts[0] != "nemo-policy-report" || parts[1] != id {
+        return false;
+    }
+    let Ok(ts) = parts[2].parse::<u64>() else {
+        return false;
+    };
+    // Same freshness window as the poll's own device signature.
+    if now.saturating_sub(ts) > 300 || ts.saturating_sub(now) > 60 {
+        return false;
+    }
+    parts[3] == sha256_hex(report.as_bytes())
+}
+
+fn record_peer_policy_applied(id: &str, report: &PolicyReport, now: u64) {
+    let key = policy_role_key(id, &report.role);
+    let mut map = PEER_POLICY_APPLIED.write().unwrap();
+    evict_one_if_full(&mut map, &key);
+    map.insert(
+        key,
+        PolicyApplied {
+            applied_ref: report.applied_ref.clone(),
+            applied_at: report.applied_at,
+            refused: report.refused.clone(),
+            overridden: report.overridden.clone(),
+            reported_at: now,
+        },
+    );
+}
+
+fn record_peer_policy_delivered(id: &str, role: &str, delivered: PolicyDelivered) {
+    let key = policy_role_key(id, role);
+    let mut map = PEER_POLICY_DELIVERED.write().unwrap();
+    evict_one_if_full(&mut map, &key);
+    map.insert(key, delivered);
+}
+
+/// in_sync | pending | refused | stale | not_reported. Pure, so every edge is testable.
+fn policy_state(
+    delivered: Option<&PolicyDelivered>,
+    applied: Option<&PolicyApplied>,
+    now: u64,
+) -> &'static str {
+    let Some(a) = applied else {
+        return "not_reported";
+    };
+    if now.saturating_sub(a.reported_at) > POLICY_REPORT_STALE_SECS {
+        return "stale";
+    }
+    if let Some(r) = &a.refused {
+        if r.at >= a.applied_at {
+            return "refused";
+        }
+    }
+    match delivered {
+        Some(d) if !a.applied_ref.is_empty() && a.applied_ref == d.policy_ref => "in_sync",
+        _ => "pending",
+    }
+}
+
+#[derive(Serialize, Default, Debug)]
+struct PolicyRoleView {
+    state: String,
+    source: String,
+    name: String,
+    user: String,
+    delivered_ref: String,
+    applied_ref: String,
+    issued_ts: u64,
+    delivered_at: u64,
+    confirmed_at: u64,
+    refused_code: String,
+    refused_issued_ts: u64,
+    refused_at: u64,
+    overridden: Vec<String>,
+}
+
+#[derive(Serialize, Default, Debug)]
+struct PolicyAppliedView {
+    /// The background service: the policy that governs incoming sessions.
+    service: PolicyRoleView,
+    /// The signed-in user's window, when it has reported.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ui: Option<PolicyRoleView>,
+}
+
+fn policy_role_view(id: &str, role: &str, now: u64) -> PolicyRoleView {
+    let key = policy_role_key(id, role);
+    let delivered = PEER_POLICY_DELIVERED.read().unwrap().get(&key).cloned();
+    let applied = PEER_POLICY_APPLIED.read().unwrap().get(&key).cloned();
+    let state = policy_state(delivered.as_ref(), applied.as_ref(), now).to_owned();
+    let d = delivered.unwrap_or_default();
+    let a = applied.unwrap_or_default();
+    let r = a.refused.clone().unwrap_or_default();
+    PolicyRoleView {
+        state,
+        source: d.source,
+        name: d.name,
+        user: d.user,
+        delivered_ref: d.policy_ref,
+        applied_ref: a.applied_ref,
+        issued_ts: d.issued_ts,
+        delivered_at: d.at,
+        confirmed_at: a.reported_at,
+        refused_code: r.code,
+        refused_issued_ts: r.issued_ts,
+        refused_at: r.at,
+        overridden: a.overridden,
+    }
+}
+
+fn peer_policy_applied_view(id: &str) -> PolicyAppliedView {
+    let now = now_epoch_secs();
+    let ui_reported = PEER_POLICY_APPLIED
+        .read()
+        .unwrap()
+        .contains_key(&policy_role_key(id, "ui"));
+    PolicyAppliedView {
+        service: policy_role_view(id, "service", now),
+        ui: ui_reported.then(|| policy_role_view(id, "ui", now)),
+    }
+}
+
+#[cfg(test)]
+mod policy_applied_tests {
+    use super::*;
+
+    fn policy(opts: &[(&str, &str)], allow_user_override: bool) -> ManagementPolicy {
+        ManagementPolicy {
+            allow_user_override,
+            options: opts.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+        }
+    }
+
+    #[test]
+    fn policy_ref_is_stable_and_ignores_volatile_options() {
+        let a = policy(&[("enable-audio", "N"), ("direct-server", "Y")], false);
+        let b = policy(&[("direct-server", "Y"), ("enable-audio", "N")], false);
+        assert_eq!(compute_policy_ref(&a), compute_policy_ref(&b), "key order must not matter");
+        assert_eq!(compute_policy_ref(&a).len(), 16);
+        let mut volatile = b.clone();
+        for k in POLICY_REF_VOLATILE {
+            volatile.options.insert(k.to_string(), "changes-every-poll".to_owned());
+        }
+        assert_eq!(compute_policy_ref(&a), compute_policy_ref(&volatile), "volatile keys are excluded");
+        let changed = policy(&[("enable-audio", "Y"), ("direct-server", "Y")], false);
+        assert_ne!(compute_policy_ref(&a), compute_policy_ref(&changed), "a real change changes the ref");
+        let overridable = policy(&[("enable-audio", "N"), ("direct-server", "Y")], true);
+        assert_ne!(compute_policy_ref(&a), compute_policy_ref(&overridable), "allow_user_override is part of it");
+    }
+
+    #[test]
+    fn parse_policy_report_bounds_everything_it_keeps() {
+        let ok = parse_policy_report(r#"{"role":"service","ref":"0123456789abcdef","applied_at":5,
+            "refused":{"code":"made-up","issued_ts":9,"at":7},
+            "overridden":["enable-audio","<script>","x y","ok.key_1"]}"#)
+        .expect("valid report");
+        assert_eq!(ok.role, "service");
+        assert_eq!(ok.applied_ref, "0123456789abcdef");
+        assert_eq!(ok.refused.as_ref().unwrap().code, "other", "unknown codes are not echoed");
+        assert_eq!(ok.overridden, vec!["enable-audio", "ok.key_1"], "bad key names are dropped");
+        assert!(parse_policy_report(r#"{"role":"admin","ref":""}"#).is_none(), "unknown role");
+        assert!(parse_policy_report(r#"{"role":"ui","ref":"zz<b>"}"#).is_none(), "non-hex ref");
+        assert!(parse_policy_report("not json").is_none());
+        let big = format!(r#"{{"role":"ui","ref":"","overridden":["{}"]}}"#, "a".repeat(POLICY_REPORT_MAX_BYTES));
+        assert!(parse_policy_report(&big).is_none(), "oversized report");
+        let many: Vec<String> = (0..200).map(|i| format!("\"k{i}\"")).collect();
+        let r = parse_policy_report(&format!(r#"{{"role":"ui","ref":"","overridden":[{}]}}"#, many.join(","))).unwrap();
+        assert_eq!(r.overridden.len(), POLICY_REPORT_MAX_KEYS);
+    }
+
+    fn signed_report(sk: &sign::SecretKey, domain: &str, id: &str, ts: u64, report: &str) -> String {
+        let msg = format!("{domain}:{id}:{ts}:{}", sha256_hex(report.as_bytes()));
+        base64::encode(sign::sign(msg.as_bytes(), sk))
+    }
+
+    #[test]
+    fn policy_report_signature_binds_bytes_peer_and_time() {
+        let (pk, sk) = sign::gen_keypair();
+        let pk_b64 = base64::encode(pk.as_ref());
+        let now = 1_800_000_000;
+        let report = r#"{"role":"service","ref":"0123456789abcdef"}"#;
+        let good = signed_report(&sk, "nemo-policy-report", "123", now, report);
+        assert!(verify_policy_report_sig(&pk_b64, &good, "123", report, now));
+        assert!(!verify_policy_report_sig(&pk_b64, &good, "123", &report.replace("0123", "ffff"), now), "tampered bytes");
+        assert!(!verify_policy_report_sig(&pk_b64, &good, "999", report, now), "another peer");
+        let wrong_domain = signed_report(&sk, "nemo-poll", "123", now, report);
+        assert!(!verify_policy_report_sig(&pk_b64, &wrong_domain, "123", report, now), "poll signature reused");
+        let stale = signed_report(&sk, "nemo-policy-report", "123", now - 301, report);
+        assert!(!verify_policy_report_sig(&pk_b64, &stale, "123", report, now), "stale");
+        let future = signed_report(&sk, "nemo-policy-report", "123", now + 61, report);
+        assert!(!verify_policy_report_sig(&pk_b64, &future, "123", report, now), "from the future");
+        let (other_pk, _) = sign::gen_keypair();
+        assert!(!verify_policy_report_sig(&base64::encode(other_pk.as_ref()), &good, "123", report, now), "other key");
+        assert!(!verify_policy_report_sig(&pk_b64, "!!not-base64", "123", report, now));
+    }
+
+    #[test]
+    fn policy_state_covers_every_transition() {
+        let now = 10_000;
+        let delivered = PolicyDelivered { policy_ref: "aa".into(), issued_ts: now, ..Default::default() };
+        let applied = |r: &str, at: u64, refused: Option<u64>, reported: u64| PolicyApplied {
+            applied_ref: r.into(),
+            applied_at: at,
+            refused: refused.map(|t| PolicyRefusal { code: "rollback".into(), issued_ts: 1, at: t }),
+            overridden: vec![],
+            reported_at: reported,
+        };
+        assert_eq!(policy_state(Some(&delivered), None, now), "not_reported");
+        assert_eq!(policy_state(Some(&delivered), Some(&applied("aa", 1, None, now)), now), "in_sync");
+        assert_eq!(policy_state(Some(&delivered), Some(&applied("bb", 1, None, now)), now), "pending");
+        assert_eq!(policy_state(Some(&delivered), Some(&applied("", 0, None, now)), now), "pending", "nothing applied yet");
+        assert_eq!(policy_state(None, Some(&applied("aa", 1, None, now)), now), "pending", "server restarted");
+        assert_eq!(policy_state(Some(&delivered), Some(&applied("aa", 5, Some(6), now)), now), "refused");
+        assert_eq!(policy_state(Some(&delivered), Some(&applied("aa", 7, Some(6), now)), now), "in_sync", "recovered after a refusal");
+        let old = now - POLICY_REPORT_STALE_SECS - 1;
+        assert_eq!(policy_state(Some(&delivered), Some(&applied("aa", 1, None, old)), now), "stale");
+    }
+
+    #[test]
+    fn report_and_delivery_are_kept_per_role() {
+        let id = "policy-role-test-peer";
+        let report = |role: &str, r: &str| PolicyReport { role: role.into(), applied_ref: r.into(), ..Default::default() };
+        let now = now_epoch_secs();
+        record_peer_policy_applied(id, &report("service", "aa"), now);
+        record_peer_policy_delivered(id, "service", PolicyDelivered { policy_ref: "aa".into(), ..Default::default() });
+        let v = peer_policy_applied_view(id);
+        assert_eq!(v.service.state, "in_sync");
+        assert!(v.ui.is_none(), "no window report yet");
+        record_peer_policy_applied(id, &report("ui", "bb"), now);
+        record_peer_policy_delivered(id, "ui", PolicyDelivered { policy_ref: "cc".into(), user: "alice".into(), ..Default::default() });
+        let v = peer_policy_applied_view(id);
+        assert_eq!(v.service.state, "in_sync", "the window's report must not touch the service row");
+        let ui = v.ui.expect("window row");
+        assert_eq!((ui.state.as_str(), ui.user.as_str()), ("pending", "alice"));
     }
 }
 
@@ -853,6 +1237,13 @@ struct ClientPolicyRequest {
     /// clients older than 1.4.15.
     #[serde(default)]
     client_version: Option<String>,
+    /// #43: what this client did with the last policy it was handed (JSON text, see
+    /// PolicyReport). Absent on clients older than 1.4.18. Trusted only with a valid
+    /// `applied_policy_sig` from a poll that passed device-key verification.
+    #[serde(default)]
+    applied_policy: Option<String>,
+    #[serde(default)]
+    applied_policy_sig: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -870,6 +1261,10 @@ struct ClientPolicyPayload {
     /// forged or stripped by a MITM. 0 = nothing to revoke.
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     terminate_sessions_before: u64,
+    /// #43: content id of `policy` (compute_policy_ref). Inside the signed payload, so the
+    /// client echoes back an authenticated handle; older clients ignore it.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    policy_ref: String,
     policy: ManagementPolicy,
 }
 
@@ -961,6 +1356,9 @@ struct PeerResponse {
     // The client build this machine reported on its last poll (1.4.15+), and when.
     client_version: String,
     client_version_at: String,
+    // #43: the policy this machine (and its signed-in user's window) actually applied,
+    // compared with what this server last handed over.
+    policy_applied: PolicyAppliedView,
 }
 
 #[derive(Serialize)]
@@ -6656,6 +7054,40 @@ async fn client_policy(
     // Learn this peer's hostname from its own poll so the address book can show
     // it -- only after the device-key gate, or anyone knowing id+uuid could rename it.
     record_peer_hostname(&request.id, request.hostname.as_deref().unwrap_or(""));
+    // #43: the client's report on the policy it last applied (or refused). Accepted only
+    // from a poll that proved its device key, and only with the report's own signature
+    // over its exact bytes -- otherwise anyone knowing id+uuid could paint a peer green.
+    let report_role: Option<String> = if device_key_ok {
+        match (
+            request.applied_policy.as_deref(),
+            request.applied_policy_sig.as_deref(),
+            request.device_key_pub.as_deref(),
+        ) {
+            (Some(report_json), Some(sig), Some(pub_b64))
+                if verify_policy_report_sig(pub_b64, sig, &request.id, report_json, now_epoch_secs()) =>
+            {
+                match parse_policy_report(report_json) {
+                    Some(report) => {
+                        record_peer_policy_applied(&request.id, &report, now_epoch_secs());
+                        Some(report.role)
+                    }
+                    None => {
+                        log::debug!("policy report from {} ignored: malformed or out of bounds", request.id);
+                        None
+                    }
+                }
+            }
+            (Some(_), _, _) => {
+                log::debug!("policy report from {} ignored: signature missing or invalid", request.id);
+                None
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+    // #43: which policy this poll serves, for the dashboard: (source, name, user).
+    let mut policy_source: (&'static str, String, String) = ("global", String::new(), String::new());
     if let Some(version) = request.policy_version.as_deref() {
         log::trace!("Client {} requested management policy after {}", request.id, version);
     }
@@ -6687,6 +7119,8 @@ async fn client_policy(
             // A logged-in user's policy REPLACES the device policy: start from the
             // infrastructure globals and apply the user's settings only.
             let up = integration::user_policy(&session.username);
+            let (source, name) = integration::user_policy_label(&session.username);
+            policy_source = (source, name, session.username.clone());
             policy.allow_user_override = policy.allow_user_override || up.allow_user_override;
             policy.options.extend(up.options);
             policy
@@ -6700,6 +7134,11 @@ async fn client_policy(
             // connectable. If login is required, also flag the client to block
             // *outgoing* use until a user logs in (harmless on a pure host).
             let peer_policy = management_policy_from_peer(&peer.management_policy);
+            policy_source = match integration::device_policy_name(&peer.id) {
+                Some(name) => ("device", name, String::new()),
+                None if !peer_policy.options.is_empty() => ("device-inline", String::new(), String::new()),
+                None => ("global", String::new(), String::new()),
+            };
             policy.allow_user_override = policy.allow_user_override || peer_policy.allow_user_override;
             policy.options.extend(peer_policy.options);
             // A named policy assigned to this device wins over its inline policy.
@@ -6877,11 +7316,31 @@ async fn client_policy(
             );
         }
     }
+    // #43: over the FINAL policy (after stripping and the blocked-peer adjustments), so
+    // the ref names exactly what goes out; recorded for the role that reported, which is
+    // the poller this response goes back to.
+    let issued_ts = now_epoch_secs();
+    let policy_ref = compute_policy_ref(&policy);
+    if let Some(role) = report_role.as_deref() {
+        record_peer_policy_delivered(
+            &peer.id,
+            role,
+            PolicyDelivered {
+                policy_ref: policy_ref.clone(),
+                issued_ts,
+                source: policy_source.0.to_owned(),
+                name: policy_source.1.clone(),
+                user: policy_source.2.clone(),
+                at: issued_ts,
+            },
+        );
+    }
     let payload = ClientPolicyPayload {
         id: peer.id.clone(),
         issued_at: now_iso(),
-        issued_ts: now_epoch_secs(),
+        issued_ts,
         terminate_sessions_before: peer_terminate_before(&peer.id),
+        policy_ref,
         policy,
     };
     let payload_bytes = serde_json::to_vec(&payload).map_err(server_error)?;
@@ -7453,6 +7912,7 @@ async fn peer_response(pm: &PeerMap, peer: RegisteredPeer) -> PeerResponse {
         endpoints_delivered_at: delivered.1,
         client_version,
         client_version_at,
+        policy_applied: peer_policy_applied_view(&peer.id),
         stats: peer_stats(&peer.id).await,
     }
 }
@@ -9455,6 +9915,8 @@ mod tests {
             sealed_token: None,
             sealed: None,
             client_version: None,
+            applied_policy: None,
+            applied_policy_sig: None,
         };
         assert!(validate_client_policy_request(&peer, &ok).is_ok());
         // Empty id.
@@ -9469,6 +9931,8 @@ mod tests {
             sealed_token: None,
             sealed: None,
             client_version: None,
+            applied_policy: None,
+            applied_policy_sig: None,
         };
         assert_eq!(
             validate_client_policy_request(&peer, &no_id).unwrap_err().0,
@@ -9486,6 +9950,8 @@ mod tests {
             sealed_token: None,
             sealed: None,
             client_version: None,
+            applied_policy: None,
+            applied_policy_sig: None,
         };
         assert_eq!(
             validate_client_policy_request(&peer, &bad_b64).unwrap_err().0,
@@ -9503,6 +9969,8 @@ mod tests {
             sealed_token: None,
             sealed: None,
             client_version: None,
+            applied_policy: None,
+            applied_policy_sig: None,
         };
         assert_eq!(
             validate_client_policy_request(&peer, &mismatch).unwrap_err().0,

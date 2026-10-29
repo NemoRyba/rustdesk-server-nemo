@@ -2269,6 +2269,75 @@
       const at = (peer.client_version_at || "").replace("T", " ").slice(0, 19);
       return `<span style="${color}" title="${escapeAttr("Reported " + at)}">${escapeHtml(v)}</span>`;
     }
+    // #43: the policy a client has ACTUALLY applied, as it reported on its last poll,
+    // compared with what this server handed over. `data-policy-state` is a stable hook
+    // for the automated GUI tests.
+    const POLICY_STATES = {
+      in_sync: { text: "✓ applied", color: "#1a7a34", tip: "The client confirmed it applied the policy this server handed over." },
+      pending: { text: "… pending", color: "#b26a00", tip: "Handed over, not yet confirmed by the client (it reports on its next poll, at most 30 s)." },
+      refused: { text: "✗ refused", color: "#b42318", tip: "The client REFUSED the policy and keeps running its previous one." },
+      stale: { text: "stale", color: "#667085", tip: "No report from this client for over 2 minutes (offline?). Shown: its last confirmation." },
+      not_reported: { text: "—", color: "", tip: "No report: client older than 1.4.18, no device key, or no poll since the server started." },
+    };
+    const POLICY_REFUSALS = {
+      signature: "the signature / seal check failed",
+      downgrade: "an unsealed response after sealed ones (possible downgrade attack)",
+      "id-mismatch": "it was issued for a different ID",
+      unstamped: "it carried no timestamp",
+      rollback: "it is older than a policy already applied (rollback / replay)",
+      stale: "it is too old (replay protection)",
+      future: "its timestamp is in the future (clock skew on the client?)",
+      "apply-failed": "it could not be applied",
+      other: "another reason",
+    };
+    function ageText(epoch) {
+      if (!epoch) return "never";
+      const s = Math.max(0, Math.round(Date.now() / 1000 - epoch));
+      return s < 90 ? `${s} s ago` : s < 5400 ? `${Math.round(s / 60)} min ago` : `${Math.round(s / 3600)} h ago`;
+    }
+    function policySourceText(v) {
+      const user = v.user ? `user ${v.user}: ` : "";
+      switch (v.source) {
+        case "device": return `device policy “${v.name}”`;
+        case "device-inline": return "this device's own settings";
+        case "user": return `${user}policy “${v.name}”`;
+        case "default": return `${user}default policy “${v.name}”`;
+        case "user-inline": return `${user}own settings`;
+        case "admin": return `${user}admin policy`;
+        case "global": return `${user}global defaults only`;
+        default: return "";
+      }
+    }
+    function policyStateBadge(v) {
+      const st = POLICY_STATES[v && v.state] || POLICY_STATES.not_reported;
+      let tip = st.tip;
+      if (v && v.state === "refused") tip += ` Reason: ${POLICY_REFUSALS[v.refused_code] || POLICY_REFUSALS.other}.`;
+      if (v && v.confirmed_at) tip += ` Last report: ${ageText(v.confirmed_at)}.`;
+      return `<span class="pol-state" data-policy-state="${escapeAttr((v && v.state) || "not_reported")}" style="${st.color ? "color:" + st.color + ";font-weight:600" : "opacity:0.45"}" title="${escapeAttr(tip)}">${escapeHtml(st.text)}</span>`;
+    }
+    function policyCell(peer) {
+      const name = (integ.devicePolicies || {})[peer.id];
+      const assigned = name ? escapeHtml(name) : '<span style="opacity:0.4">—</span>';
+      const svc = peer.policy_applied && peer.policy_applied.service;
+      return svc && svc.state !== "not_reported" ? `${assigned} ${policyStateBadge(svc)}` : assigned;
+    }
+    function policyRoleBlock(label, v) {
+      if (!v) return "";
+      const lines = [`<b>${escapeHtml(label)}</b> ${policyStateBadge(v)}`];
+      const src = policySourceText(v);
+      if (src) lines.push(`serves ${escapeHtml(src)}`);
+      if (v.state === "refused") lines.push(`<span style="color:#b42318">refused because ${escapeHtml(POLICY_REFUSALS[v.refused_code] || POLICY_REFUSALS.other)} · ${escapeHtml(ageText(v.refused_at))}</span>`);
+      if (v.delivered_ref || v.applied_ref) lines.push(`<span class="mono" style="font-size:11px;opacity:0.7">handed over ${escapeHtml(v.delivered_ref || "—")} · applied ${escapeHtml(v.applied_ref || "—")} · reported ${escapeHtml(ageText(v.confirmed_at))}</span>`);
+      if ((v.overridden || []).length) lines.push(`<span title="Options this user changed locally (allowed by the policy). Names only, never values.">overridden on the client: <span class="mono">${(v.overridden || []).map(escapeHtml).join(", ")}</span></span>`);
+      return `<div style="margin-bottom:4px">${lines.join("<br>")}</div>`;
+    }
+    function policyDetail(peer) {
+      const pa = peer.policy_applied || {};
+      if (!pa.service || (pa.service.state === "not_reported" && !pa.ui)) {
+        return `<span style="opacity:0.55">${escapeHtml(POLICY_STATES.not_reported.tip)}</span>`;
+      }
+      return policyRoleBlock("This machine (service)", pa.service) + policyRoleBlock("Signed-in user's window", pa.ui);
+    }
     // "Who runs what": counts over the peers the dashboard has loaded.
     function renderRollout() {
       const el = $("updRollout");
@@ -2679,7 +2748,7 @@
           <td>${badge(peer.online ? "online" : "offline")}</td>
           <td>${badge(peer.policy)}</td>
           <td>${peerKeyAuthCell(peer)}</td>
-          <td>${((integ.devicePolicies || {})[peer.id]) ? escapeHtml(integ.devicePolicies[peer.id]) : '<span style="opacity:0.4">—</span>'}</td>
+          <td>${policyCell(peer)}</td>
           <td class="mono">${directAccessCell(peer)}</td>
           <td class="mono">${escapeHtml(peer.registered_ip || "")}</td>
           <td class="mono">${escapeHtml(peer.public_addr || "")}</td>
@@ -2866,6 +2935,7 @@
         <dl class="kv">
           <dt title="Which key this client used to authenticate its last policy poll: its own provisioned device key, or only the shared server key. A pending key claim is shown instead, because that is why the machine is refused.">Key auth</dt><dd>${peerKeyAuthCell(peer)}</dd>
           <dt title="Whether a device key is bound to this machine. Read from the pinned key registry, so it survives a server restart.">Device key</dt><dd>${peer.provisioned ? escapeHtml(peer.device_key_label || peer.device_key_id || "bound") : '<span style="opacity:0.55">none &mdash; not provisioned</span>'}</dd>
+          <dt title="The policy this machine actually applied, as the client reported it on its last poll (inside its sealed, device-signed poll), compared with what this server handed over. Requires client 1.4.18+.">Applied policy</dt><dd id="detailPolicyApplied">${policyDetail(peer)}</dd>
           ${peer.pending_claim_key_id ? `<dt title="This machine proved an unbound device key and asks to be bound to it. It is refused until you confirm. The ID is self-reported: the signature proves possession of the key, only you can attest the machine.">Key claim</dt><dd>
             <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;">
               <span>${peer.pending_claim_denied ? "denied" : "waiting for your confirmation"} &middot; ${escapeHtml(peer.pending_claim_key_label || peer.pending_claim_key_id)} &middot; ${peer.pending_claim_attempts || 0} tries via ${escapeHtml(peer.pending_claim_via || "")}</span>

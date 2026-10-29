@@ -81,6 +81,19 @@ git revert <nemo-management-api-commit>
   process supervisor (the container image health-checks hbbs/hbbr with `s6-svstat`).
 - `GET /nemo/api/peers?limit=100&offset=0`
 - `GET /nemo/api/peers/{id}`
+
+  Each peer row carries `policy_applied` (#43, server 1.1.16 + client 1.4.18): what the client
+  **actually applied**, compared with what this server last handed over, per poller:
+  `{"service": {...}, "ui": {...}}` (`ui` only once the signed-in user's window has reported).
+  Each has `state` — `in_sync` · `pending` (handed over, not yet confirmed) · `refused` ·
+  `stale` (no report for 2 min) · `not_reported` (older client / no device key) — plus `source`
+  (`device` / `device-inline` / `user` / `default` / `user-inline` / `admin` / `global`), `name`,
+  `user`, `delivered_ref` / `applied_ref` (content ids), `issued_ts`, `delivered_at`,
+  `confirmed_at`, `refused_code` (`signature`, `downgrade`, `id-mismatch`, `unstamped`,
+  `rollback`, `stale`, `future`, `apply-failed`, `other`), `refused_at` and `overridden` (option
+  NAMES the user changed locally, never values). The report travels inside the client's poll body
+  — sealed to the management key whenever one is configured — with its own device-key signature
+  over `nemo-policy-report:{id}:{ts}:{sha256(report)}`; reports without a valid one are ignored.
 - `POST /nemo/api/peers/{id}/block`
 - `POST /nemo/api/peers/{id}/allow`
 - `POST /nemo/api/peers/{id}/reset-policy`

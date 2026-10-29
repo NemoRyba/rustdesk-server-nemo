@@ -959,6 +959,37 @@ pub fn user_policy(username: &str) -> UserManagedPolicy {
     }
 }
 
+/// #43: which policy `user_policy(username)` resolves to, as `(source, name)` for the
+/// dashboard -- the same branches in the same order, so the label always names the
+/// policy that was actually served. `source` is one of "admin", "user" (an assigned
+/// named policy), "default" (the default policy for users without one of their own),
+/// "user-inline" (the user's own inline settings) or "global" (nothing beyond the
+/// infrastructure defaults).
+pub fn user_policy_label(username: &str) -> (&'static str, String) {
+    let key = normalize_lookup_username(username);
+    let cfg = CONFIG.lock().unwrap();
+    let Some(p) = cfg.permissions.get(&key) else {
+        return ("global", String::new());
+    };
+    if p.is_admin {
+        return ("admin", String::new());
+    }
+    if let Some(name) = p.policy_name.as_deref().filter(|n| !n.is_empty()) {
+        if cfg.policies.contains_key(name) {
+            return ("user", name.to_owned());
+        }
+    }
+    if p.policy.options.is_empty() {
+        if let Some(dn) = cfg.default_policy_name.as_deref().filter(|n| !n.is_empty()) {
+            if cfg.policies.contains_key(dn) {
+                return ("default", dn.to_owned());
+            }
+        }
+        return ("global", String::new());
+    }
+    ("user-inline", String::new())
+}
+
 /// The admin's default policy name for users without their own policy.
 pub fn default_policy_name() -> Option<String> {
     CONFIG.lock().unwrap().default_policy_name.clone()
@@ -1590,6 +1621,16 @@ pub fn device_policy(peer_id: &str) -> Option<UserManagedPolicy> {
     cfg.device_policies
         .get(peer_id)
         .and_then(|name| cfg.policies.get(name).cloned())
+}
+
+/// #43: the name of the named policy `device_policy(peer_id)` resolves to -- only when
+/// that policy still exists, exactly as `device_policy` decides.
+pub fn device_policy_name(peer_id: &str) -> Option<String> {
+    let cfg = CONFIG.lock().unwrap();
+    cfg.device_policies
+        .get(peer_id)
+        .filter(|name| cfg.policies.contains_key(name.as_str()))
+        .cloned()
 }
 
 /// All named policies (name -> policy), for the dashboard editor.
@@ -3296,6 +3337,57 @@ mod tests {
         let mut cfg = CONFIG.lock().unwrap();
         cfg.permissions.remove("__testuser");
         cfg.device_policies.remove("__testpeer");
+    }
+
+    // #43: the dashboard label must name the policy user_policy()/device_policy()
+    // actually serve, in every branch -- otherwise the peers panel would claim one
+    // policy while the client runs another.
+    #[test]
+    fn policy_labels_match_the_policy_actually_served() {
+        {
+            let mut cfg = CONFIG.lock().unwrap();
+            let mut opts = HashMap::new();
+            opts.insert("view_only".to_owned(), "Y".to_owned());
+            cfg.policies.insert("__lbl_named".to_owned(), UserManagedPolicy { allow_user_override: false, options: opts.clone() });
+            cfg.policies.insert("__lbl_default".to_owned(), UserManagedPolicy { allow_user_override: false, options: opts });
+            let mut named = UserPermission::default();
+            named.policy_name = Some("__lbl_named".to_owned());
+            cfg.permissions.insert("__lbl_named_user".to_owned(), named);
+            let mut inline = UserPermission::default();
+            inline.policy.options.insert("view_only".to_owned(), "N".to_owned());
+            cfg.permissions.insert("__lbl_inline_user".to_owned(), inline);
+            cfg.permissions.insert("__lbl_plain_user".to_owned(), UserPermission::default());
+            let mut admin = UserPermission::default();
+            admin.is_admin = true;
+            cfg.permissions.insert("__lbl_admin".to_owned(), admin);
+            cfg.device_policies.insert("__lbl_peer".to_owned(), "__lbl_named".to_owned());
+            cfg.device_policies.insert("__lbl_dangling_peer".to_owned(), "__lbl_missing".to_owned());
+        }
+        assert_eq!(user_policy_label("__lbl_named_user"), ("user", "__lbl_named".to_owned()));
+        assert_eq!(user_policy_label("__lbl_inline_user").0, "user-inline");
+        assert_eq!(user_policy_label("__lbl_admin").0, "admin");
+        assert_eq!(user_policy_label("__lbl_nobody").0, "global");
+        // A user without a policy of their own: the default policy when one is set.
+        let saved_default = CONFIG.lock().unwrap().default_policy_name.clone();
+        CONFIG.lock().unwrap().default_policy_name = Some("__lbl_default".to_owned());
+        assert_eq!(user_policy_label("__lbl_plain_user"), ("default", "__lbl_default".to_owned()));
+        CONFIG.lock().unwrap().default_policy_name = None;
+        assert_eq!(user_policy_label("__lbl_plain_user").0, "global");
+        // Device: the assigned name only while that policy exists -- like device_policy().
+        assert_eq!(device_policy_name("__lbl_peer").as_deref(), Some("__lbl_named"));
+        assert!(device_policy("__lbl_dangling_peer").is_none());
+        assert!(device_policy_name("__lbl_dangling_peer").is_none());
+        // Cleanup.
+        let mut cfg = CONFIG.lock().unwrap();
+        cfg.default_policy_name = saved_default;
+        for k in ["__lbl_named", "__lbl_default"] {
+            cfg.policies.remove(k);
+        }
+        for u in ["__lbl_named_user", "__lbl_inline_user", "__lbl_plain_user", "__lbl_admin"] {
+            cfg.permissions.remove(u);
+        }
+        cfg.device_policies.remove("__lbl_peer");
+        cfg.device_policies.remove("__lbl_dangling_peer");
     }
 
     // An admin gets the admin policy as DEFAULTS ONLY: allow_user_override is
