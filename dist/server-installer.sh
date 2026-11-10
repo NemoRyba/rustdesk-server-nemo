@@ -133,11 +133,19 @@ backup() {
 }
 
 services_ok() {
-  local i u
-  for i in $(seq 30); do
-    local all=1
-    for u in $UNITS; do systemctl is-active --quiet "$u" || all=0; done
-    [ $all = 1 ] && return 0; sleep 1
+  # both units active with the SAME main process for 6 s in a row: a crashing binary under
+  # Restart=always is "active" for a moment between restarts, which proves nothing
+  local i u pids last="" stable=0
+  for i in $(seq 45); do
+    pids=""
+    for u in $UNITS; do
+      systemctl is-active --quiet "$u" || { pids="down"; break; }
+      pids="$pids $(systemctl show -p MainPID --value "$u")"
+    done
+    if [ "$pids" != down ] && [ "$pids" = "$last" ]; then stable=$((stable + 1)); else stable=0; fi
+    last="$pids"
+    [ $stable -ge 6 ] && return 0
+    sleep 1
   done
   return 1
 }
@@ -150,6 +158,7 @@ do_update() {
   before="$(snapshot)"
   bk="$(backup)" || { msg "Backup failed -- nothing was changed."; exit 1; }
   local was_enabled=0; systemctl is-enabled --quiet rustdesk-hbbs-nemo 2>/dev/null && was_enabled=1
+  local t0; t0=$(date +%s)
   ( cd "$REL" && PATH="$SHIM:$PATH" PREFIX="$PREFIX" DATADIR="$DATADIR" RESTART=1 ./install.sh ) > "$WORK/install.log" 2>&1
   local rc=$?
   if [ $was_enabled = 1 ] && ! services_ok; then
@@ -165,8 +174,15 @@ Service log: journalctl -u rustdesk-hbbs-nemo -n 50"
     exit 1
   fi
   after="$(snapshot)"
-  local running; running="$(sha256sum /proc/$(pgrep -x hbbs | head -1)/exe 2>/dev/null | cut -c1-16)"
+  local pid; pid=$(pgrep -x hbbs | head -1)
+  local running; running="$(sha256sum /proc/$pid/exe 2>/dev/null | cut -c1-16)"
   local shipped; shipped="$(sha256sum "$REL/bin/hbbs" | cut -c1-16)"
+  if [ -z "$running" ] && [ -n "$pid" ]; then
+    # /proc/<pid>/exe not readable (hardened /proc, containers): the installed binary is
+    # the shipped one AND the running process was started after this update began
+    local started; started=$(date -d "$(ps -o lstart= -p "$pid")" +%s 2>/dev/null || echo 0)
+    [ "$(sha256sum "$PREFIX/hbbs" | cut -c1-16)" = "$shipped" ] && [ "$started" -ge "$t0" ] && running="$shipped"
+  fi
   local same="YES"; [ "$before" = "$after" ] || same="NO -- compare: before [$before] after [$after]"
   local live="not running (was not enabled)"; [ $was_enabled = 1 ] && { [ "$running" = "$shipped" ] && live="yes, the new hbbs is running" || live="NO (running $running, shipped $shipped)"; }
   report="Updated $APP ${OLDVER:-?} -> $VER.
