@@ -4532,6 +4532,9 @@ const UPDATE_PLATFORMS: &[&str] = &[
     "linux-deb",
     "linux-rpm",
     "linux-arch",
+    "linux-deb-flutter",
+    "linux-rpm-flutter",
+    "linux-arch-flutter",
 ];
 
 /// The packer (client libs/portable/generate.py) embeds `tbfdesk_ui = "flutter"` in the
@@ -4859,21 +4862,38 @@ fn hosted_installer_name(version: &str, platform: &str, body: &[u8]) -> Result<S
             "a Flutter Windows installer (tbfdesk-flutter-<version>-x64-install.exe; a Sciter installer goes to \"Windows (x64) Sciter\")",
         ),
         "linux-deb" => (
-            body.starts_with(b"!<arch>\ndebian-binary"),
+            body.starts_with(b"!<arch>\ndebian-binary") && !installer_is_flutter(body),
             format!("tbfdesk-{version}-amd64.deb"),
-            "a Debian/Ubuntu package (.deb)",
+            "a Sciter Debian/Ubuntu package (.deb; the Flutter one goes to \"Debian/Ubuntu Flutter\")",
+        ),
+        "linux-deb-flutter" => (
+            body.starts_with(b"!<arch>\ndebian-binary") && installer_is_flutter(body),
+            format!("tbfdesk-flutter-{version}-amd64.deb"),
+            "a Flutter Debian/Ubuntu package (tbfdesk-flutter-<version>-amd64.deb)",
         ),
         "linux-rpm" => (
-            body.starts_with(&[0xED, 0xAB, 0xEE, 0xDB]),
+            body.starts_with(&[0xED, 0xAB, 0xEE, 0xDB]) && !installer_is_flutter(body),
             format!("tbfdesk-{version}-x86_64.rpm"),
             "an RPM package (.rpm)",
         ),
-        "linux-arch" => {
+        "linux-rpm-flutter" => (
+            body.starts_with(&[0xED, 0xAB, 0xEE, 0xDB]) && installer_is_flutter(body),
+            format!("tbfdesk-flutter-{version}-x86_64.rpm"),
+            "a Flutter RPM package (.rpm)",
+        ),
+        "linux-arch" | "linux-arch-flutter" => {
             let zst = body.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]);
             let xz = body.starts_with(&[0xFD, b'7', b'z', b'X', b'Z', 0x00]);
+            // compressed: the UI marker cannot be read from the bytes; the channel is the
+            // operator's choice (the file name says it)
+            let fl = platform == "linux-arch-flutter";
             (
                 zst || xz,
-                format!("tbfdesk-{version}-x86_64.pkg.tar.{}", if xz { "xz" } else { "zst" }),
+                format!(
+                    "tbfdesk-{}{version}-x86_64.pkg.tar.{}",
+                    if fl { "flutter-" } else { "" },
+                    if xz { "xz" } else { "zst" }
+                ),
                 "an Arch package (.pkg.tar.zst)",
             )
         }
@@ -9044,6 +9064,27 @@ mod tests {
             },
         );
         assert!(validate_update_manifest(&m).is_ok());
+    }
+
+    #[test]
+    fn linux_packages_go_only_to_their_own_ui_channel() {
+        let mut deb = b"!<arch>\ndebian-binary   ".to_vec();
+        deb.resize(128 * 1024, 0);
+        let mut fdeb = deb.clone();
+        fdeb.extend_from_slice(b"_tbfdesk_ui/    0           0     0     644     23        `\ntbfdesk_ui = \"flutter\"\n");
+        assert_eq!(hosted_installer_name("1.4.20", "linux-deb", &deb).unwrap(), "tbfdesk-1.4.20-amd64.deb");
+        assert_eq!(
+            hosted_installer_name("1.4.20", "linux-deb-flutter", &fdeb).unwrap(),
+            "tbfdesk-flutter-1.4.20-amd64.deb"
+        );
+        assert!(hosted_installer_name("1.4.20", "linux-deb", &fdeb).is_err());
+        assert!(hosted_installer_name("1.4.20", "linux-deb-flutter", &deb).is_err());
+        let mut zst = vec![0x28, 0xB5, 0x2F, 0xFD];
+        zst.resize(128 * 1024, 0);
+        assert_eq!(
+            hosted_installer_name("1.4.20", "linux-arch-flutter", &zst).unwrap(),
+            "tbfdesk-flutter-1.4.20-x86_64.pkg.tar.zst"
+        );
     }
 
     #[test]
