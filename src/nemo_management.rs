@@ -622,7 +622,7 @@ fn peer_endpoints_delivered(id: &str) -> (usize, String) {
 static PEER_CLIENT_VERSIONS: Lazy<std::sync::RwLock<HashMap<String, String>>> =
     Lazy::new(|| std::sync::RwLock::new(HashMap::new()));
 
-fn record_peer_client_version(id: &str, version: &str) {
+fn record_peer_client_version(id: &str, version: &str, ui: &str) {
     let version = version.trim();
     if id.is_empty()
         || version.is_empty()
@@ -631,18 +631,27 @@ fn record_peer_client_version(id: &str, version: &str) {
     {
         return;
     }
+    // Only the two known UIs; anything else is stored as "not reported".
+    let ui = match ui.trim() {
+        "flutter" => "flutter",
+        "sciter" => "sciter",
+        _ => "-",
+    };
     let mut map = PEER_CLIENT_VERSIONS.write().unwrap();
     evict_one_if_full(&mut map, id);
-    map.insert(id.to_owned(), format!("{} {}", version, now_iso()));
+    map.insert(id.to_owned(), format!("{} {} {}", version, ui, now_iso()));
 }
 
-/// `(version, when reported)`, or empty strings if this id has not reported one since
-/// the server started (older clients never do).
-fn peer_client_version(id: &str) -> (String, String) {
+/// `(version, ui, when reported)`, or empty strings if this id has not reported one since
+/// the server started (older clients never do). ui "" = not reported (Sciter).
+fn peer_client_version(id: &str) -> (String, String, String) {
     let raw = PEER_CLIENT_VERSIONS.read().unwrap().get(id).cloned().unwrap_or_default();
-    match raw.split_once(' ') {
-        Some((v, at)) => (v.to_owned(), at.to_owned()),
-        None => (String::new(), String::new()),
+    let mut it = raw.splitn(3, ' ');
+    match (it.next(), it.next(), it.next()) {
+        (Some(v), Some(ui), Some(at)) if !v.is_empty() => {
+            (v.to_owned(), if ui == "-" { String::new() } else { ui.to_owned() }, at.to_owned())
+        }
+        _ => (String::new(), String::new(), String::new()),
     }
 }
 
@@ -1237,6 +1246,10 @@ struct ClientPolicyRequest {
     /// clients older than 1.4.15.
     #[serde(default)]
     client_version: Option<String>,
+    /// "flutter" or "sciter": the client's UI, and so its update channel. Absent on
+    /// clients before 1.4.19 (all Sciter).
+    #[serde(default)]
+    client_ui: Option<String>,
     /// #43: what this client did with the last policy it was handed (JSON text, see
     /// PolicyReport). Absent on clients older than 1.4.18. Trusted only with a valid
     /// `applied_policy_sig` from a poll that passed device-key verification.
@@ -1356,6 +1369,8 @@ struct PeerResponse {
     // The client build this machine reported on its last poll (1.4.15+), and when.
     client_version: String,
     client_version_at: String,
+    // Its UI: "flutter" / "sciter" ("" = not reported: a client before 1.4.19, Sciter).
+    client_ui: String,
     // #43: the policy this machine (and its signed-in user's window) actually applied,
     // compared with what this server last handed over.
     policy_applied: PolicyAppliedView,
@@ -4506,9 +4521,26 @@ struct UpdateArtifact {
 }
 
 /// The platform keys an installer can be published for. "windows-x64" is the top level
-/// of the manifest; the others go into `platforms`.
+/// of the manifest (the Sciter installer: every Windows client before the Flutter port
+/// looks there); the others go into `platforms`. "windows-x64-flutter" is the Flutter
+/// installer -- one update channel per UI, so an update never switches a machine's UI.
 const UPDATE_PLATFORM_WINDOWS: &str = "windows-x64";
-const UPDATE_PLATFORMS: &[&str] = &[UPDATE_PLATFORM_WINDOWS, "linux-deb", "linux-rpm", "linux-arch"];
+const UPDATE_PLATFORM_WINDOWS_FLUTTER: &str = "windows-x64-flutter";
+const UPDATE_PLATFORMS: &[&str] = &[
+    UPDATE_PLATFORM_WINDOWS,
+    UPDATE_PLATFORM_WINDOWS_FLUTTER,
+    "linux-deb",
+    "linux-rpm",
+    "linux-arch",
+];
+
+/// The packer (client libs/portable/generate.py) embeds `tbfdesk_ui = "flutter"` in the
+/// installer exe, uncompressed, when it packs a Flutter build. Installers without the
+/// marker are Sciter (all of them before the Flutter port).
+fn installer_is_flutter(body: &[u8]) -> bool {
+    const MARK: &[u8] = b"tbfdesk_ui = \"flutter\"";
+    body.windows(MARK.len()).any(|w| w == MARK)
+}
 
 #[derive(Serialize)]
 struct SignedUpdateArtifact {
@@ -4814,10 +4846,17 @@ fn valid_upload_version(v: &str) -> bool {
 /// package (by its magic bytes). Err = a message for the operator.
 fn hosted_installer_name(version: &str, platform: &str, body: &[u8]) -> Result<String, String> {
     let (ok, name, what) = match platform {
+        // The UI is checked from the installer itself: one wrong upload on the Sciter
+        // channel would otherwise switch every Sciter machine to Flutter (or back).
         "windows-x64" => (
-            body.starts_with(b"MZ"),
+            body.starts_with(b"MZ") && !installer_is_flutter(body),
             format!("tbfdesk-{version}-x64-install.exe"),
-            "a Windows installer (tbfdesk-<version>-x64-install.exe)",
+            "a Sciter Windows installer (tbfdesk-<version>-x64-install.exe; a Flutter installer goes to \"Windows (x64) Flutter\")",
+        ),
+        "windows-x64-flutter" => (
+            body.starts_with(b"MZ") && installer_is_flutter(body),
+            format!("tbfdesk-flutter-{version}-x64-install.exe"),
+            "a Flutter Windows installer (tbfdesk-flutter-<version>-x64-install.exe; a Sciter installer goes to \"Windows (x64) Sciter\")",
         ),
         "linux-deb" => (
             body.starts_with(b"!<arch>\ndebian-binary"),
@@ -7228,7 +7267,7 @@ async fn client_policy(
     // published, so a client with automatic updates checks now instead of at its next
     // daily check. The manifest itself (signed) is still fetched and verified.
     if let Some(v) = request.client_version.as_deref() {
-        record_peer_client_version(&peer.id, v);
+        record_peer_client_version(&peer.id, v, request.client_ui.as_deref().unwrap_or(""));
     }
     if let Ok(Some(m)) = read_update_manifest(std::path::Path::new(&update_manifest_path())) {
         policy
@@ -7864,7 +7903,7 @@ async fn peer_response(pm: &PeerMap, peer: RegisteredPeer) -> PeerResponse {
     let device_key = integration::device_key_for_peer(&peer.id);
     let pending = integration::pending_claim_for_peer(&peer.id);
     let delivered = peer_endpoints_delivered(&peer.id);
-    let (client_version, client_version_at) = peer_client_version(&peer.id);
+    let (client_version, client_ui, client_version_at) = peer_client_version(&peer.id);
     PeerResponse {
         id: peer.id.clone(),
         hostname: peer_hostname(&peer.id),
@@ -7912,6 +7951,7 @@ async fn peer_response(pm: &PeerMap, peer: RegisteredPeer) -> PeerResponse {
         endpoints_delivered_at: delivered.1,
         client_version,
         client_version_at,
+        client_ui,
         policy_applied: peer_policy_applied_view(&peer.id),
         stats: peer_stats(&peer.id).await,
     }
@@ -8976,6 +9016,49 @@ mod tests {
     }
 
     #[test]
+    fn windows_installers_go_only_to_their_own_ui_channel() {
+        let mut sciter = b"MZ".to_vec();
+        sciter.resize(128 * 1024, 0);
+        sciter.extend_from_slice(b"timestamp = 1\n");
+        let mut flutter = sciter.clone();
+        flutter.extend_from_slice(b"tbfdesk_ui = \"flutter\"\n");
+        assert_eq!(
+            hosted_installer_name("1.4.19", "windows-x64", &sciter).unwrap(),
+            "tbfdesk-1.4.19-x64-install.exe"
+        );
+        assert_eq!(
+            hosted_installer_name("1.4.19", "windows-x64-flutter", &flutter).unwrap(),
+            "tbfdesk-flutter-1.4.19-x64-install.exe"
+        );
+        assert!(hosted_installer_name("1.4.19", "windows-x64", &flutter).is_err(),
+            "a Flutter installer on the Sciter channel would switch every Sciter machine");
+        assert!(hosted_installer_name("1.4.19", "windows-x64-flutter", &sciter).is_err(),
+            "a Sciter installer (no marker, every installer before the port) is not Flutter");
+        // the Flutter installer lives in `platforms` and is signed like the others
+        let mut m = UpdateManifest { version: "1.4.19".into(), ..Default::default() };
+        m.platforms.insert(
+            "windows-x64-flutter".into(),
+            UpdateArtifact {
+                url: "https://h.example/nemo/api/update/file/tbfdesk-flutter-1.4.19-x64-install.exe".into(),
+                sha256: "a".repeat(64),
+            },
+        );
+        assert!(validate_update_manifest(&m).is_ok());
+    }
+
+    #[test]
+    fn peer_client_version_keeps_the_ui() {
+        record_peer_client_version("ui-test-1", "1.4.19", "flutter");
+        let (v, ui, at) = peer_client_version("ui-test-1");
+        assert_eq!((v.as_str(), ui.as_str()), ("1.4.19", "flutter"));
+        assert!(!at.is_empty());
+        record_peer_client_version("ui-test-2", "1.4.18", "");
+        assert_eq!(peer_client_version("ui-test-2").1, "", "older clients: not reported");
+        record_peer_client_version("ui-test-3", "1.4.19", "evil value");
+        assert_eq!(peer_client_version("ui-test-3").1, "");
+    }
+
+    #[test]
     fn update_manifest_validation_canonicalises_and_refuses_bad_fields() {
         let ok_url = "https://tbf.example.com/dl/x.exe";
         let ok_sha = "AB".repeat(32);
@@ -9915,6 +9998,7 @@ mod tests {
             sealed_token: None,
             sealed: None,
             client_version: None,
+            client_ui: None,
             applied_policy: None,
             applied_policy_sig: None,
         };
@@ -9931,6 +10015,7 @@ mod tests {
             sealed_token: None,
             sealed: None,
             client_version: None,
+            client_ui: None,
             applied_policy: None,
             applied_policy_sig: None,
         };
@@ -9950,6 +10035,7 @@ mod tests {
             sealed_token: None,
             sealed: None,
             client_version: None,
+            client_ui: None,
             applied_policy: None,
             applied_policy_sig: None,
         };
@@ -9969,6 +10055,7 @@ mod tests {
             sealed_token: None,
             sealed: None,
             client_version: None,
+            client_ui: None,
             applied_policy: None,
             applied_policy_sig: None,
         };

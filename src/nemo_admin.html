@@ -1128,12 +1128,13 @@
         <div class="col-grid" style="padding:14px 16px;">
           <div class="span-all" style="font-size:12px;opacity:0.75;line-height:1.4;max-width:900px;">This server is the <b>only</b> update source clients accept; the stock RustDesk updater is disabled on every client. <b>The server signs the manifest (version, file, SHA-256) with its management key</b> each time a client asks for it; the client verifies that signature against its pinned management public key, then the file hash, and only then installs. Every client is told about a newly published version on its next settings poll (about 30 s).</div>
           <div class="span-all" style="font-weight:600;margin-top:4px;">Upload the installer</div>
-          <div class="span-all" style="font-size:12px;opacity:0.75;line-height:1.4;max-width:900px;">Choose the Windows installer <code>tbfdesk-&lt;version&gt;-x64-install.exe</code> or a Linux package (<code>.deb</code>, <code>.rpm</code>, <code>.pkg.tar.zst</code>); upload one file per platform with the same version to complete a release. A newer version starts a new release. The server stores each file, computes its SHA-256 and publishes it in one step. Clients with <b>Automatic client updates</b> on (ACL &amp; Policy) install it by themselves, never during an active session. Each client downloads it from the server address <i>it</i> uses, so machines inside the company network and outside on the internet both get it.</div>
+          <div class="span-all" style="font-size:12px;opacity:0.75;line-height:1.4;max-width:900px;">Choose a Windows installer &mdash; Sciter <code>tbfdesk-&lt;version&gt;-x64-install.exe</code> or Flutter <code>tbfdesk-flutter-&lt;version&gt;-x64-install.exe</code>; each UI has its own update channel, so an update never switches a machine to the other UI (the server checks which UI the file contains) &mdash; or a Linux package (<code>.deb</code>, <code>.rpm</code>, <code>.pkg.tar.zst</code>); upload one file per platform with the same version to complete a release. A newer version starts a new release. The server stores each file, computes its SHA-256 and publishes it in one step. Clients with <b>Automatic client updates</b> on (ACL &amp; Policy) install it by themselves, never during an active session. Each client downloads it from the server address <i>it</i> uses, so machines inside the company network and outside on the internet both get it.</div>
           <div class="span-all" style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
             <input id="updFile" type="file" accept=".exe">
             <input id="updUpVersion" type="text" placeholder="version, e.g. 1.4.16" autocomplete="off" style="width:150px;">
             <select id="updPlatform" title="Which clients install this file">
-              <option value="windows-x64">Windows (x64)</option>
+              <option value="windows-x64">Windows (x64) Sciter</option>
+              <option value="windows-x64-flutter">Windows (x64) Flutter</option>
               <option value="linux-deb">Linux: Debian / Ubuntu (.deb)</option>
               <option value="linux-rpm">Linux: Fedora / RHEL / SUSE (.rpm)</option>
               <option value="linux-arch">Linux: Arch (.pkg.tar.zst)</option>
@@ -2212,10 +2213,10 @@
       const f = $("updFile").files[0];
       if (!f) return;
       const n = f.name.toLowerCase();
-      const platform = n.endsWith(".exe") ? "windows-x64" : n.endsWith(".deb") ? "linux-deb"
+      const platform = n.endsWith(".exe") ? (n.includes("flutter") ? "windows-x64-flutter" : "windows-x64") : n.endsWith(".deb") ? "linux-deb"
         : n.endsWith(".rpm") ? "linux-rpm" : /\.pkg\.tar\.(zst|xz)$/.test(n) ? "linux-arch" : "";
       if (platform) $("updPlatform").value = platform;
-      const m = /^(?:tbfdesk|rustdesk)[-_]([0-9][0-9A-Za-z.]*?)(?:[-_](?:x64|amd64|x86_64|0|1)|\.x86_64|-install|\.exe|\.deb|\.rpm)/i.exec(f.name);
+      const m = /^(?:tbfdesk|rustdesk)[-_](?:flutter[-_])?([0-9][0-9A-Za-z.]*?)(?:[-_](?:x64|amd64|x86_64|0|1)|\.x86_64|-install|\.exe|\.deb|\.rpm)/i.exec(f.name);
       if (m) $("updUpVersion").value = m[1];
     });
     $("updUpload").addEventListener("click", () => {
@@ -2267,7 +2268,14 @@
       const pub = state.publishedVersion;
       const color = !pub ? "" : (cmpVersion(v, pub) >= 0 ? "color:#1a7a34" : "color:#b26a00");
       const at = (peer.client_version_at || "").replace("T", " ").slice(0, 19);
-      return `<span style="${color}" title="${escapeAttr("Reported " + at)}">${escapeHtml(v)}</span>`;
+      return `<span style="${color}" title="${escapeAttr("Reported " + at)}">${escapeHtml(v)}</span> ${uiBadge(peer.client_ui)}`;
+    }
+    // Flutter / Sciter: which UI (and so which update channel) the machine runs. No report
+    // = a client before 1.4.19, all of which are Sciter.
+    function uiLabel(ui) { return ui === "flutter" ? "Flutter" : "Sciter"; }
+    function uiBadge(ui) {
+      const f = ui === "flutter";
+      return `<span data-client-ui="${f ? "flutter" : "sciter"}" style="font-size:11px;padding:0 4px;border-radius:3px;${f ? "background:#e3f0ff;color:#1456a0" : "background:#eee;color:#555"}">${uiLabel(ui)}</span>`;
     }
     // #43: the policy a client has ACTUALLY applied, as it reported on its last poll,
     // compared with what this server handed over. `data-policy-state` is a stable hook
@@ -2347,7 +2355,7 @@
       const counts = {};
       let unknown = 0;
       for (const p of peers) {
-        if (p.client_version) counts[p.client_version] = (counts[p.client_version] || 0) + 1;
+        if (p.client_version) { const k = p.client_version + " " + uiLabel(p.client_ui); counts[k] = (counts[k] || 0) + 1; }
         else unknown++;
       }
       const versions = Object.keys(counts).sort((a, b) => cmpVersion(b, a));
@@ -2370,8 +2378,8 @@
         if (document.activeElement !== $("updVersion")) $("updVersion").value = m.version || "";
         if (document.activeElement !== $("updUrl")) $("updUrl").value = m.url || "";
         if (document.activeElement !== $("updSha256")) $("updSha256").value = m.sha256 || "";
-        const names = { "linux-deb": "Debian/Ubuntu", "linux-rpm": "RPM", "linux-arch": "Arch" };
-        const covered = (m.url ? ["Windows"] : []).concat(Object.keys(m.platforms || {}).map((k) => names[k] || k));
+        const names = { "windows-x64-flutter": "Windows Flutter", "linux-deb": "Debian/Ubuntu", "linux-rpm": "RPM", "linux-arch": "Arch" };
+        const covered = (m.url ? ["Windows Sciter"] : []).concat(Object.keys(m.platforms || {}).map((k) => names[k] || k));
         setMsg("updMsg", "Published: version " + (m.version || "?") + " for " + (covered.join(", ") || "no platform"));
         state.publishedVersion = m.version || "";
         renderRollout();
