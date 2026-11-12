@@ -2030,6 +2030,50 @@
       setTimeout(() => URL.revokeObjectURL(url), 10000);
     }
 
+    // Per-computer enrollment scripts: drop the .tbfsetup file and one of these in a folder
+    // on the target, with a TBFDesk installer, and run the script. The device key stays in
+    // the sidecar file, never on a command line. CRLF for the .cmd so Windows reads it.
+    function nemoInstallCmd(setupFile) {
+      return [
+        "@echo off",
+        "REM TBFDesk enrollment. Put this .cmd next to \"" + setupFile + "\" and a TBFDesk",
+        "REM installer (tbfdesk-...-x64-install.exe) on the target computer, then run it.",
+        "setlocal",
+        "set \"HERE=%~dp0\"",
+        "set \"SETUP=%HERE%" + setupFile + "\"",
+        "if not exist \"%SETUP%\" ( echo Missing setup file next to this script. & pause & exit /b 1 )",
+        "set \"INST=\"",
+        "for %%I in (\"%HERE%tbfdesk*install.exe\") do set \"INST=%%~fI\"",
+        "if not defined INST ( echo Put a TBFDesk installer .exe in this folder. & pause & exit /b 1 )",
+        "echo Installing and enrolling this computer...",
+        "\"%INST%\" --silent-install --import-setup \"%SETUP%\"",
+        "echo Done. This computer is now provisioned for TBFDesk.",
+        "pause",
+        "",
+      ].join("\r\n");
+    }
+    function nemoInstallSh(setupFile) {
+      return [
+        "#!/usr/bin/env bash",
+        "# TBFDesk enrollment. Put this next to \"" + setupFile + "\" and (if not already",
+        "# installed) a TBFDesk package (.deb or .run) on the target computer, then run it.",
+        "set -e",
+        "HERE=\"$(cd \"$(dirname \"$0\")\" && pwd)\"",
+        "SETUP=\"$HERE/" + setupFile + "\"",
+        "[ -f \"$SETUP\" ] || { echo \"Missing setup file next to this script.\"; exit 1; }",
+        "if ! command -v tbfdesk >/dev/null 2>&1; then",
+        "  run=$(ls \"$HERE\"/tbfdesk*-install.run 2>/dev/null | head -1)",
+        "  deb=$(ls \"$HERE\"/tbfdesk*.deb 2>/dev/null | head -1)",
+        "  if [ -n \"$run\" ]; then sudo bash \"$run\" --yes",
+        "  elif [ -n \"$deb\" ]; then sudo apt-get install -y \"$deb\"",
+        "  else echo \"Install a TBFDesk package first (put a .deb or .run here).\"; exit 1; fi",
+        "fi",
+        "sudo tbfdesk --import-setup \"$SETUP\"",
+        "echo \"Done. This computer is now provisioned for TBFDesk.\"",
+        "",
+      ].join("\n");
+    }
+
     async function copyText(scope) {
       const st = setupState[scope] || {};
       try {
@@ -2128,10 +2172,19 @@
             <b>${escapeHtml(title)}</b> &mdash; ${escapeHtml(note)}
             <div style="margin-top:3px;opacity:0.8;">ID server <span class="mono">${escapeHtml(srv.id_server || "")}</span> &middot; relay <span class="mono">${escapeHtml(srv.relay_server || "(server's own)")}</span> &middot; api <span class="mono">${escapeHtml(srv.api_server || "")}</span>${srv.api_cert_fingerprint ? ' &middot; certificate pinned' : ''}</div>
             <textarea id="genSetup-${p.scope}" readonly style="width:100%;height:52px;font-family:monospace;font-size:11px;margin-top:4px;">${escapeHtml(p.setup_string)}</textarea>
-            <div style="display:flex;gap:8px;align-items:center;margin-top:4px;">
+            <div style="display:flex;gap:8px;align-items:center;margin-top:4px;flex-wrap:wrap;">
               <button data-gen-copy="${p.scope}">Copy</button>
               <button data-gen-download="${p.scope}" data-filename="${escapeAttr(p.filename || "")}">Download file</button>
               <span id="genSetupMsg-${p.scope}" style="font-size:12px;opacity:0.8;"></span>
+            </div>
+            <div style="margin-top:6px;font-size:12px;line-height:1.5;">
+              <b>Install on that computer without typing anything:</b> download the file above, then run on the target &mdash;
+              <div class="mono" style="background:#eef6ea;border-radius:4px;padding:4px 6px;margin-top:3px;word-break:break-all;">tbfdesk-&lt;version&gt;-x64-install.exe --silent-install --import-setup ${escapeHtml(p.filename || "<file>")}</div>
+              <div style="opacity:0.8;margin-top:2px;">Linux: install the package, then <span class="mono">tbfdesk --import-setup ${escapeHtml(p.filename || "<file>")}</span>. Or just download a ready script and run it next to the file above:</div>
+              <div style="display:flex;gap:8px;margin-top:3px;flex-wrap:wrap;">
+                <button data-gen-install="cmd" data-scope="${p.scope}" data-filename="${escapeAttr(p.filename || "")}">Download install.cmd (Windows)</button>
+                <button data-gen-install="sh" data-scope="${p.scope}" data-filename="${escapeAttr(p.filename || "")}">Download install.sh (Linux)</button>
+              </div>
             </div>
           </div>`;
         };
@@ -2163,6 +2216,13 @@
           const scope = btn.dataset.genDownload;
           downloadText(btn.dataset.filename || ("tbfdesk-setup-" + scope + "-with-key.tbfsetup"), strings[scope].setup_string);
           setMsg("genSetupMsg-" + scope, "Downloaded", true);
+        }));
+        box.querySelectorAll("[data-gen-install]").forEach((btn) => btn.addEventListener("click", () => {
+          const scope = btn.dataset.scope;
+          const fn = (strings[scope] && strings[scope].filename) || btn.dataset.filename || ("tbfdesk-setup-" + scope + "-with-key.tbfsetup");
+          if (btn.dataset.genInstall === "cmd") downloadText("install.cmd", nemoInstallCmd(fn));
+          else downloadText("install.sh", nemoInstallSh(fn));
+          setMsg("genSetupMsg-" + scope, "Script downloaded — keep it with " + fn, true);
         }));
         $("deviceKeyLabel").value = "";
         $("deviceKeyPeerId").value = "";
