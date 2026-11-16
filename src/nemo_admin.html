@@ -2030,6 +2030,63 @@
       setTimeout(() => URL.revokeObjectURL(url), 10000);
     }
 
+    // Friendly labels for the one-file installer platform picker.
+    const ONEFILE_NAMES = {
+      "windows-x64": "Windows x64 — Sciter",
+      "windows-x64-flutter": "Windows x64 — Flutter",
+      "linux-deb": "Debian/Ubuntu (.deb) — Sciter",
+      "linux-deb-flutter": "Debian/Ubuntu (.deb) — Flutter",
+      "linux-rpm": "RPM — Sciter",
+      "linux-rpm-flutter": "RPM — Flutter",
+      "linux-arch": "Arch (.pkg.tar.zst) — Sciter",
+      "linux-arch-flutter": "Arch (.pkg.tar.zst) — Flutter",
+    };
+
+    // Fill a one-file platform <select> with exactly the installer channels that are
+    // uploaded (Windows Sciter is the manifest's top-level url; the rest are platforms).
+    async function fillOneFileSelect(sel) {
+      if (!sel) return;
+      try {
+        const res = await fetch("/nemo/api/update/latest", { headers: headers() });
+        if (res.status === 404) { sel.innerHTML = '<option value="">no installer uploaded yet</option>'; return; }
+        if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+        const m = await res.json();
+        const ids = (m.url ? ["windows-x64"] : []).concat(Object.keys(m.platforms || {}));
+        if (!ids.length) { sel.innerHTML = '<option value="">no installer uploaded yet</option>'; return; }
+        sel.innerHTML = ids.map((id) => `<option value="${escapeAttr(id)}">${escapeHtml(ONEFILE_NAMES[id] || id)}</option>`).join("");
+      } catch (e) { sel.innerHTML = '<option value="">could not list installers</option>'; }
+    }
+
+    // POST the (with-key) setup string + chosen platform; stream back the one-file
+    // installer and save it. The server builds it in memory and keeps nothing.
+    async function downloadOneFile(setupString, filename, platform, msgId) {
+      if (!platform) { setMsg(msgId, "Pick a platform first (upload its installer if the list is empty)", false); return; }
+      try {
+        setMsg(msgId, "Building one-file installer…", true);
+        const res = await fetch("/nemo/api/one-file-installer", {
+          method: "POST",
+          headers: { ...headers(), "Content-Type": "application/json" },
+          body: JSON.stringify({ setup_string: setupString, filename: filename || "", platform }),
+        });
+        if (!res.ok) {
+          let message = `${res.status} ${res.statusText}`;
+          try { const j = await res.json(); if (j.error) message = j.error; } catch (_) {}
+          throw new Error(message);
+        }
+        const blob = await res.blob();
+        let name = platform.startsWith("windows") ? "tbfdesk-oneclick-install.exe" : "tbfdesk-oneclick-install.run";
+        const cd = res.headers.get("Content-Disposition") || "";
+        const mm = /filename="?([^"]+)"?/.exec(cd);
+        if (mm) name = mm[1];
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url; a.download = name;
+        document.body.appendChild(a); a.click(); a.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 15000);
+        setMsg(msgId, "Downloaded " + name + " — move it like a password", true);
+      } catch (e) { setMsg(msgId, e.message, false); }
+    }
+
     // Per-computer enrollment scripts: drop the .tbfsetup file and one of these in a folder
     // on the target, with a TBFDesk installer, and run the script. The device key stays in
     // the sidecar file, never on a command line. CRLF for the .cmd so Windows reads it.
@@ -2186,6 +2243,15 @@
                 <button data-gen-install="sh" data-scope="${p.scope}" data-filename="${escapeAttr(p.filename || "")}">Download install.sh (Linux)</button>
               </div>
             </div>
+            <div style="margin-top:6px;font-size:12px;line-height:1.5;border-top:1px dashed #cde3c8;padding-top:6px;">
+              <b>Or get it as one file</b> &mdash; a single self-provisioning installer that already contains the installer <i>and</i> this setup string, so the technician runs just one file:
+              <div style="display:flex;gap:8px;margin-top:3px;flex-wrap:wrap;align-items:center;">
+                <select id="oneFilePlat-${p.scope}" style="font-size:12px;padding:2px;"><option value="">— loading uploaded installers —</option></select>
+                <button data-onefile="${p.scope}">Download one-file installer</button>
+                <span id="oneFileMsg-${p.scope}" style="font-size:12px;opacity:0.8;"></span>
+              </div>
+              <div style="opacity:0.72;margin-top:2px;">Windows: double-click it (one UAC prompt installs + provisions). Linux: <span class="mono">sudo sh &lt;file&gt;</span>. The chosen platform's installer must be uploaded under <b>Software update</b> (this tab, further down) first. <b>This file carries the device key &mdash; move it like a password.</b></div>
+            </div>
           </div>`;
         };
         box.style.display = "block";
@@ -2224,6 +2290,16 @@
           else downloadText("install.sh", nemoInstallSh(fn));
           setMsg("genSetupMsg-" + scope, "Script downloaded — keep it with " + fn, true);
         }));
+        // One-file installer: fill each scope's platform picker with the uploaded
+        // installers, and wire its download button (kept separate from the buttons above,
+        // which are unchanged).
+        box.querySelectorAll("[data-onefile]").forEach((btn) => btn.addEventListener("click", () => {
+          const scope = btn.dataset.onefile;
+          const sel = $("oneFilePlat-" + scope);
+          const p = strings[scope] || {};
+          downloadOneFile(p.setup_string, p.filename, sel ? sel.value : "", "oneFileMsg-" + scope);
+        }));
+        [r.setup_internal, r.setup_external].forEach((p) => { if (p && p.setup_string) fillOneFileSelect($("oneFilePlat-" + p.scope)); });
         $("deviceKeyLabel").value = "";
         $("deviceKeyPeerId").value = "";
         loadDeviceKeys();

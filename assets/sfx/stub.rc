@@ -1,0 +1,4 @@
+#include <winuser.h>
+/* RT_MANIFEST (24) at CREATEPROCESS_MANIFEST_RESOURCE_ID (1) = the EXE's own manifest,
+ * so the stub runs elevated (requireAdministrator) on a double-click. */
+1 24 "stub.manifest"

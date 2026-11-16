@@ -2343,6 +2343,7 @@ pub(crate) async fn spawn_hbbs_api(
         .route("/nemo/api/security/unblock", post(post_security_unblock))
         .route("/nemo/api/update", post(put_update_manifest))
         .route("/nemo/api/update/delete", post(delete_update_manifest))
+        .route("/nemo/api/one-file-installer", post(post_one_file_installer))
         .route(UPDATE_UPLOAD_ROUTE, post(upload_update_installer))
         .route_layer(axum::middleware::from_fn(require_auth_mw));
 
@@ -2649,6 +2650,7 @@ async fn admin_gui(
 // --------------------------------------------------------------------------
 
 use crate::nemo_integration as integration;
+use crate::nemo_onefile;
 
 fn bearer_token(headers: &HeaderMap) -> Option<String> {
     headers
@@ -4804,6 +4806,173 @@ async fn delete_update_manifest(
         log::info!("Nemo update manifest withdrawn");
     }
     Ok(Json(serde_json::json!({ "removed": removed })))
+}
+
+// ---- One-file installer: installer + per-device setup string in one download ----
+//
+// An ADDITION to the separate installer + `.tbfsetup` + `install.cmd`/`install.sh`
+// workflow (which is untouched). The browser POSTs the setup string it just received
+// from "Generate device key" (the private device key is never persisted server-side, so
+// it cannot be rebuilt here) plus the target platform; the server staples it to the
+// uploaded installer for that platform and streams one self-provisioning file. It stores
+// nothing, logs no body, and marks the response no-store. The resulting file carries the
+// device key inside it — same posture as the legacy `host=,key=` custom client — so the
+// dashboard tells the operator to move it like a password.
+
+#[derive(serde_derive::Deserialize)]
+struct OneFileInstallerRequest {
+    /// The `tbfdesk-setup-v1:` string, ideally the one that includes the device key.
+    #[serde(default)]
+    setup_string: String,
+    /// The `.tbfsetup` name the dashboard generated (for the file inside the bundle).
+    #[serde(default)]
+    filename: String,
+    /// One of UPDATE_PLATFORMS — which uploaded installer to bundle.
+    #[serde(default)]
+    platform: String,
+}
+
+async fn post_one_file_installer(
+    Extension(state): Extension<HbbsApiState>,
+    headers: HeaderMap,
+    Json(req): Json<OneFileInstallerRequest>,
+) -> Result<impl axum::response::IntoResponse, ApiFailure> {
+    require_auth(&headers, &state.token)?;
+
+    let setup = req.setup_string.trim();
+    if !setup.starts_with("tbfdesk-setup-v1:") {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "not a TBFDesk setup string (expected a tbfdesk-setup-v1: value)",
+        ));
+    }
+    if setup.len() > 64 * 1024 {
+        return Err(api_error(StatusCode::BAD_REQUEST, "setup string too large"));
+    }
+    if !UPDATE_PLATFORMS.contains(&req.platform.as_str()) {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            &format!("unknown platform (one of {})", UPDATE_PLATFORMS.join(", ")),
+        ));
+    }
+
+    // Resolve the uploaded installer for this platform from the published manifest; the
+    // url's basename is the stored file under the update dir.
+    let manifest = read_update_manifest(&std::path::PathBuf::from(update_manifest_path()))
+        .ok()
+        .flatten()
+        .ok_or_else(|| {
+            api_error(
+                StatusCode::BAD_REQUEST,
+                "no installer has been uploaded yet — upload one under \
+                 \"Settings → Software update → Upload the installer\" first",
+            )
+        })?;
+    // The Sciter Windows installer (windows-x64) is the manifest's TOP-LEVEL url; the
+    // validator even refuses it inside `platforms`. Every other channel is in `platforms`.
+    let url = if req.platform == UPDATE_PLATFORM_WINDOWS {
+        manifest.url.clone()
+    } else {
+        manifest
+            .platforms
+            .get(&req.platform)
+            .map(|a| a.url.clone())
+            .unwrap_or_default()
+    };
+    if url.is_empty() {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            &format!(
+                "no installer uploaded for {} yet — upload that one first",
+                req.platform
+            ),
+        ));
+    }
+    let fname = url.rsplit('/').next().unwrap_or("").to_owned();
+    if fname.is_empty() || fname.contains("..") || fname.contains('/') || fname.contains('\\') {
+        return Err(api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "bad installer reference in the manifest",
+        ));
+    }
+    let installer_path = std::path::Path::new(&update_files_dir()).join(&fname);
+    let installer = std::fs::read(&installer_path).map_err(|_| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            "the uploaded installer is missing on disk; re-upload it",
+        )
+    })?;
+
+    let setup_name = one_file_setup_name(&req.filename);
+    let (bytes, out_name, ctype): (Vec<u8>, String, &'static str) =
+        if req.platform.starts_with("windows") {
+            (
+                nemo_onefile::build_windows(&installer, setup, &setup_name),
+                one_file_out_name(&req.filename, &req.platform, &manifest.version, "exe"),
+                "application/vnd.microsoft.portable-executable",
+            )
+        } else {
+            let pkg = if req.platform.starts_with("linux-deb") {
+                nemo_onefile::LinuxPkg::Deb
+            } else if req.platform.starts_with("linux-rpm") {
+                nemo_onefile::LinuxPkg::Rpm
+            } else {
+                nemo_onefile::LinuxPkg::Arch
+            };
+            (
+                nemo_onefile::build_linux(&installer, &fname, pkg, setup, &setup_name),
+                one_file_out_name(&req.filename, &req.platform, &manifest.version, "run"),
+                "application/x-shellscript",
+            )
+        };
+
+    log::info!(
+        "one-file installer built: platform={} version={} size={} bytes",
+        req.platform,
+        manifest.version,
+        bytes.len()
+    );
+    Ok((
+        StatusCode::OK,
+        [
+            (axum::http::header::CONTENT_TYPE, ctype.to_owned()),
+            (axum::http::header::CACHE_CONTROL, "no-store".to_owned()),
+            (
+                axum::http::header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{}\"", out_name),
+            ),
+        ],
+        bytes,
+    ))
+}
+
+/// The `.tbfsetup` name embedded inside the one-file installer: the dashboard's generated
+/// name when it is sane, else a default.
+fn one_file_setup_name(filename: &str) -> String {
+    let n = nemo_onefile::sanitize_name(filename);
+    if n.ends_with(".tbfsetup") {
+        n
+    } else {
+        "client.tbfsetup".to_owned()
+    }
+}
+
+/// Download name of the one-file installer. Derived from the `.tbfsetup` name so each device
+/// and each side (LAN/WAN) gets a distinct file, e.g.
+/// `tbfdesk-reception-pc-setup-lan-oneclick-install.exe`; falls back to platform+version.
+fn one_file_out_name(filename: &str, platform: &str, version: &str, ext: &str) -> String {
+    let stem = filename
+        .strip_suffix(".tbfsetup")
+        .unwrap_or(filename)
+        .replace("-with-key", "");
+    let slug = nemo_onefile::sanitize_name(&stem);
+    if slug.is_empty() || slug == "client" || slug == "client.tbfsetup" {
+        let ui = if platform.ends_with("-flutter") { "flutter-" } else { "" };
+        let ver = if version.is_empty() { String::new() } else { format!("{}-", version) };
+        format!("tbfdesk-{ui}{ver}oneclick-install.{ext}")
+    } else {
+        format!("{slug}-oneclick-install.{ext}")
+    }
 }
 
 // ---- Hosted installers: upload in the dashboard, served by this server ----

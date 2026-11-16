@@ -6,5 +6,7 @@ mod database;
 mod nemo_management;
 #[cfg(feature = "nemo-management-api")]
 mod nemo_integration;
+#[cfg(feature = "nemo-management-api")]
+mod nemo_onefile;
 mod peer;
 mod version;
