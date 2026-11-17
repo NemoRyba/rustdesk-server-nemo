@@ -196,7 +196,9 @@ Service log: journalctl -u rustdesk-hbbs-nemo -n 50"
     # /proc/<pid>/exe not readable (hardened /proc, containers): the installed binary is
     # the shipped one AND the running process was started after this update began
     local started; started=$(date -d "$(ps -o lstart= -p "$pid")" +%s 2>/dev/null || echo 0)
-    [ "$(sha256sum "$PREFIX/hbbs" | cut -c1-16)" = "$shipped" ] && [ "$started" -ge "$t0" ] && running="$shipped"
+    # ps derives the start time from the whole-second boot time, so it can read up to 1 s
+    # early: a process restarted right after t0 showed t0-1 and the report said "NO".
+    [ "$(sha256sum "$PREFIX/hbbs" | cut -c1-16)" = "$shipped" ] && [ "$started" -ge "$((t0 - 1))" ] && running="$shipped"
   fi
   local same="YES"; [ "$before" = "$after" ] || same="NO -- compare: before [$before] after [$after]"
   local live="not running (was not enabled)"; [ $was_enabled = 1 ] && { [ "$running" = "$shipped" ] && live="yes, the new hbbs is running" || live="NO (running $running, shipped $shipped)"; }
@@ -234,11 +236,29 @@ Continue with the reset?" || { msg "Cancelled -- nothing was changed."; exit 0; 
   fi
   say "Installing $APP $VER ..."
   ( cd "$REL" && PATH="$SHIM:$PATH" PREFIX="$PREFIX" DATADIR="$DATADIR" ./install.sh ) > "$WORK/install.log" 2>&1
+  # A fresh install (or the confirmed reset above) has no identity key, and the unit runs
+  # `hbbs -k _` WITHOUT --generate-key on purpose (a lost key must not silently become a
+  # new identity). So hbbs refused to start and crash-looped until the operator minted the
+  # key by hand. Here nothing can be invalidated yet: mint it once, as the service user,
+  # on a throwaway port, just long enough to write the key.
+  local idnote=""
+  if [ ! -f "$DATADIR/id_ed25519" ]; then
+    say "Creating this server's identity key (first install) ..."
+    ( cd "$DATADIR" && runuser -u rustdesk -- timeout 8 "$PREFIX/hbbs" -k _ --generate-key Y -p 21899 ) >/dev/null 2>&1
+    if [ -f "$DATADIR/id_ed25519" ]; then
+      idnote="Server identity key created: $DATADIR/id_ed25519 -- back it up; clients pin it."
+    else
+      idnote="WARNING: could not create the identity key. Create it once with:
+  cd $DATADIR && sudo -u rustdesk $PREFIX/hbbs -k _ --generate-key Y   (Ctrl+C after a few seconds)"
+    fi
+    say "${idnote%%$'\n'*}"
+  fi
   say "Installation finished."
   msg "$APP $VER installed.
 
 $(tail -6 "$WORK/install.log")
-${bk:+
+${idnote:+
+$idnote}${bk:+
 Backup of the previous server: $bk}"
 }
 
