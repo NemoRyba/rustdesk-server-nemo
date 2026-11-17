@@ -782,7 +782,7 @@
             <button id="connRefresh">Refresh</button>
           </div>
         </div>
-        <div style="padding:6px 16px 0;font-size:12px;opacity:0.7;line-height:1.4;">Connections the server has negotiated or been told about, most recent first, by path. <b>Direct</b> is the fast path: direct-local / direct-punch were negotiated here; <b>direct-endpoint</b> sessions bypass this server entirely and are reported by the connecting client (<b>direct-failed</b> = it tried the published endpoint and could not reach it — the log has the reason). <b>Relay</b> is the fallback. The server observes connection setup, not live byte flow. History is kept by <b>count</b> (Settings → Connection history size), with no time cutoff.</div>
+        <div style="padding:6px 16px 0;font-size:12px;opacity:0.7;line-height:1.4;">Connections the server has negotiated or been told about, most recent first, by path. <b>Direct</b> is the fast path: direct-local / direct-punch were negotiated here; <b>direct-endpoint</b> sessions bypass this server entirely and are reported by the connecting client (<b>direct-failed</b> = it tried the published endpoint and could not reach it; the reason the client gave is shown under it). <b>Relay</b> is the fallback. The server observes connection setup, not live byte flow. History is kept by <b>count</b> (Settings → Connection history size), with no time cutoff.</div>
         <div class="table-wrap">
           <table>
             <thead>
@@ -4302,7 +4302,7 @@ uci commit fwknopd; /etc/init.d/fwknopd restart`;
           <tr>
             <td>${c.source_id ? `<code>${escapeHtml(c.source_id)}</code>` : '<span style="opacity:0.5">unknown</span>'}${peerHostAlias(c.source_id)}<div style="font-size:11px;opacity:0.6">${escapeHtml(c.source_addr)}</div></td>
             <td><code>${escapeHtml(c.target_id)}</code>${peerHostAlias(c.target_id)}<div style="font-size:11px;opacity:0.6">${escapeHtml(c.target_addr)}</div></td>
-            <td>${pathBadge(c.path)}</td>
+            <td>${pathBadge(c.path)}${c.detail ? `<div style="font-size:11px;opacity:0.75;max-width:32em;white-space:normal" title="${escapeAttr(c.detail)}">${escapeHtml(c.detail)}</div>` : ""}</td>
             <td>${c.relay_server ? escapeHtml(c.relay_server) : '<span style="opacity:0.4">—</span>'}</td>
             <td>${escapeHtml(c.nat_type || "")}</td>
             <td>${formatSeen(c.age_ms)}</td>
