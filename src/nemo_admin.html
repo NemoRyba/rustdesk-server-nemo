@@ -1067,7 +1067,7 @@
             <input id="gpKnockSourceIp" type="text" placeholder="0.0.0.0 (use the packet's source IP)">
           </div>
           <div class="fld">
-            <label for="gpDirectTimeout" title="Whole-attempt budget for a direct connection: knock delay + TCP connect + handshake. When it runs out the client falls back to hole punching / relay. Default 2500ms — deliberately short, so a broken port forward costs little.">Direct attempt budget, ms (nemo-direct-timeout-ms)</label>
+            <label for="gpDirectTimeout" title="Whole-attempt budget for a direct connection: knock delay + TCP connect + handshake. When it runs out the client falls back to hole punching / relay. Default 2500ms — deliberately short, so a broken port forward costs little. &quot;Connect directly&quot; (no relay) has no fallback: after a timeout, or a refusal right after a knock, it makes one more attempt with twice this budget (at least 6000 ms, at most 20000 ms, never less than this) before it fails with the reason.">Direct attempt budget, ms (nemo-direct-timeout-ms)</label>
             <input id="gpDirectTimeout" type="text" inputmode="numeric" placeholder="2500">
           </div>
           <div class="span-all" style="display:flex;gap:10px;align-items:center;">
