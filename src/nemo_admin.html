@@ -1024,6 +1024,28 @@
             </span>
           </label>
           <hr class="span-all" style="border:0;border-top:1px solid rgba(0,0,0,0.08);margin:6px 0 2px;">
+          <div class="span-all" style="font-weight:600;">How every machine admits incoming sessions</div>
+          <div class="span-all" style="font-size:12px;opacity:0.75;line-height:1.5;">
+            Machine settings: they always apply locked, whatever <b>Allow clients to change these</b> says, and a
+            signed-in user's own policy never changes them. A policy assigned to a device overrides them for that
+            machine (<b>On</b> / <b>Off</b> under ACL &amp; Policy &rarr; Policies). Needs client 1.4.25 or newer on the
+            machine; an older client ignores both and keeps accepting its passwords.
+          </div>
+          <label class="span-all" style="display:flex;gap:10px;align-items:flex-start;cursor:pointer;">
+            <input id="gpLdapLoginSufficient" type="checkbox" style="margin-top:3px;">
+            <span>
+              <span style="font-weight:600;">Signed-in users need no password</span>
+              <span style="display:block;font-size:12px;opacity:0.75;margin-top:3px;line-height:1.4;">A technician signed in to TBFDesk (LDAP) whom the ACL allows on a machine connects to it without the machine's password; everyone else still needs it. Approval mode "Click only" still asks the person at the machine, and 2FA still applies.</span>
+            </span>
+          </label>
+          <label class="span-all" style="display:flex;gap:10px;align-items:flex-start;cursor:pointer;">
+            <input id="gpDisableLocalPassword" type="checkbox" style="margin-top:3px;">
+            <span>
+              <span style="font-weight:600;color:#d4380d;">Disable the machines' own passwords</span>
+              <span style="display:block;font-size:12px;opacity:0.75;margin-top:3px;line-height:1.4;">No machine accepts its one-time or permanent password any more. A signed-in technician whom the ACL allows on a machine connects without one; anyone else is put to the person at the machine (Accept) where the Approval mode offers that, and refused with "Password login is disabled by policy &hellip; sign in" where it is "Password only".</span>
+            </span>
+          </label>
+          <hr class="span-all" style="border:0;border-top:1px solid rgba(0,0,0,0.08);margin:6px 0 2px;">
           <div class="span-all" style="font-weight:600;">Port knocking (Single Packet Authorization)</div>
           <div class="span-all" style="font-size:12px;opacity:0.75;line-height:1.5;">
             A direct endpoint means a port forwarded to the internet. With this on, a client sends one
@@ -3548,7 +3570,7 @@ uci commit fwknopd; /etc/init.d/fwknopd restart`;
       const grid = $("adminPolicyGrid");
       if (!grid) return;
       const opts = (integ.adminPolicy && integ.adminPolicy.options) || {};
-      grid.innerHTML = userPolicyOptions.map((o) => policyControlScoped(o, opts[o[0]] || "")).join("");
+      grid.innerHTML = userScopedPolicyOptions.map((o) => policyControlScoped(o, opts[o[0]] || "")).join("");
     }
     function collectAdminPolicy() {
       const options = {};
@@ -3663,6 +3685,8 @@ uci commit fwknopd; /etc/init.d/fwknopd restart`;
       $("gpInsecureTls").checked = opts["allow-insecure-tls-fallback"] === "Y";
       $("gpAllowUserOverride").checked = !!(integ.globalPolicy || {}).allow_user_override;
       $("gpKnockEnabled").checked = opts["nemo-knock-enabled"] === "Y";
+      $("gpLdapLoginSufficient").checked = opts["nemo-ldap-login-sufficient"] === "Y";
+      $("gpDisableLocalPassword").checked = opts["nemo-disable-local-password"] === "Y";
       $("gpKnockPort").value = opts["nemo-knock-port"] || "";
       $("gpKnockDelay").value = opts["nemo-knock-delay-ms"] || "";
       $("gpKnockSourceIp").value = opts["nemo-knock-source-ip"] || "";
@@ -3684,6 +3708,11 @@ uci commit fwknopd; /etc/init.d/fwknopd restart`;
       else delete opts["allow-insecure-tls-fallback"];
       if ($("gpKnockEnabled").checked) opts["nemo-knock-enabled"] = "Y";
       else delete opts["nemo-knock-enabled"];
+      // Machine settings (MACHINE_SCOPED_POLICY_KEYS): On = "Y"; off = absent, so a device
+      // policy decides alone.
+      for (const [id, key] of [["gpLdapLoginSufficient", "nemo-ldap-login-sufficient"], ["gpDisableLocalPassword", "nemo-disable-local-password"]]) {
+        if ($(id).checked) opts[key] = "Y"; else delete opts[key];
+      }
       for (const [id, key] of [
         ["gpKnockPort", "nemo-knock-port"],
         ["gpKnockDelay", "nemo-knock-delay-ms"],
@@ -3857,6 +3886,10 @@ uci commit fwknopd; /etc/init.d/fwknopd restart`;
       ["enable-privacy-mode", "Privacy mode", "bool", null, "Allow blanking the remote monitor so bystanders can't watch (needs supported graphics hardware)."],
       ["image_quality", "Image quality", "select", [["","Local","Use the client default."],["best","Best","Sharpest image, higher bandwidth/latency."],["balanced","Balanced","Middle ground between sharpness and speed."],["low","Reaction time","Lowest latency for fast interaction (recommended for control)."]], "Trade-off between picture sharpness and responsiveness of the stream."],
       ["nemo-permanent-password", "Incoming access password", "password", null, "Sets a fixed password the client requires for incoming connections. Leave blank to keep the client's own password."],
+      ["verification-method", "Verification method", "select", [["", "Local", "Use the client default (both passwords)."], ["use-temporary-password", "One-time password", "Incoming connections need the one-time password shown on the remote screen."], ["use-permanent-password", "Permanent password", "Incoming connections need the fixed password (e.g. the Incoming access password above)."], ["use-both-passwords", "Both passwords", "Either the one-time or the permanent password is accepted."]], "Which of the machine's own passwords an incoming connection may use."],
+      ["approve-mode", "Approval mode", "select", [["", "Local", "Use the client default (password or click)."], ["password-click", "Password or click", "Either the password, or the person at the machine clicks Accept."], ["click", "Click only", "The person at the machine must click Accept for every session; no password."], ["password", "Password only", "The password alone; nobody at the machine has to click. With 'Disable the machine's password' on: signed-in users only, everyone else is refused."]], "How an incoming connection is admitted. Together with 'Disable the machine's password': 'Password only' lets in signed-in users only; 'Password or click' and 'Click only' still let the person at the machine accept a session."],
+      ["nemo-ldap-login-sufficient", "Signed-in users need no password", "select", [["", "Not set", "Off, unless the Global client defaults turn it on."], ["Y", "On", "A controller signed in as a user who may control THIS machine (ACL & Policy) connects without the machine's password."], ["N", "Off", "The machine's password is needed as usual, even if the Global client defaults turn this on."]], "On: a technician signed in to TBFDesk (LDAP) whom the ACL allows on this machine connects without the machine's password; everyone else still needs it. Approval mode 'Click only' still asks the person at the machine, and 2FA still applies. Only signed-in users count (turn on 'Require login' to make everyone sign in). Machine setting: it counts in the Global client defaults and in a policy assigned to the DEVICE, never in a signed-in user's own policy. Needs client 1.4.25 or newer on the machine; an older one ignores it."],
+      ["nemo-disable-local-password", "Disable the machine's password", "select", [["", "Not set", "Off, unless the Global client defaults turn it on."], ["Y", "On", "The machine accepts none of its own passwords; signed-in users who may control it connect without one."], ["N", "Off", "The one-time and permanent passwords work as usual, even if the Global client defaults disable them."]], "On: the machine accepts none of its own passwords — not the one-time password, not a permanent one, not the Incoming access password above. A technician signed in to TBFDesk whom the ACL allows on this machine connects without one (this switch alone is enough). Anyone else is put to the person at the machine (Accept) when the Approval mode offers that, and refused with 'Password login is disabled by policy … sign in' when it is 'Password only'. Machine setting: it counts in the Global client defaults and in a policy assigned to the DEVICE, never in a signed-in user's own policy. Needs client 1.4.25 or newer on the machine; an older one ignores it and keeps accepting its passwords."],
       // The LISTENING side of a direct connection. Setting a peer's "Reachable at"
       // already switches its direct-access server on, but that server listens on 21118
       // unless this says otherwise — and the endpoint's port is the ROUTER's external
@@ -3866,6 +3899,13 @@ uci commit fwknopd; /etc/init.d/fwknopd restart`;
       // GUI whenever the machine could not use 21118 (e.g. something else holds it).
       ["direct-access-port", "Direct access port (listening side)", "text", null, "The port this machine's direct-access server listens on. Blank = 21118. This is the port INSIDE the network; the port in 'Reachable at' is the router's external one, which a port forward may translate."],
     ];
+    // Settings of the machine ITSELF -- how it admits incoming sessions (server
+    // MACHINE_SCOPED_POLICY_KEYS). They count only in the Global client defaults and in a
+    // policy assigned to a DEVICE: a signed-in user's own policy never carries them to the
+    // machine the user signs in on. So the per-user and the admin editors leave them out
+    // instead of offering a switch the server would ignore.
+    const MACHINE_SCOPED_POLICY_KEYS = new Set(["nemo-ldap-login-sufficient", "nemo-disable-local-password"]);
+    const userScopedPolicyOptions = userPolicyOptions.filter((o) => !MACHINE_SCOPED_POLICY_KEYS.has(o[0]));
 
     // A policy control WITHOUT a global id (multiple named-policy blocks render at
     // once, so ids would collide). Read back by data-policy-key within each block.
@@ -4023,7 +4063,7 @@ uci commit fwknopd; /etc/init.d/fwknopd restart`;
         </tr>`;
         if (isOpen) {
           const opts = (u.policy && u.policy.options) || {};
-          const controls = userPolicyOptions.map((o) => policyControl(o, opts[o[0]] || "")).join("");
+          const controls = userScopedPolicyOptions.map((o) => policyControl(o, opts[o[0]] || "")).join("");
           row += `<tr class="policy-editor-row"><td colspan="7" style="background:#fafafa;padding:6px 14px 12px;">
             <div id="userPolicyPanel" data-user="${escapeHtml(name)}">
               <div style="font-size:12px;opacity:0.7;margin-bottom:8px;">Session permissions for <code>${escapeHtml(name)}</code> — blank = client default. Applied (replacing the device policy) when this user is logged in.</div>
