@@ -183,6 +183,55 @@ const OPTION_NEMO_OUTBOUND_TARGETS: &str = "nemo-outbound-targets";
 // Direct connections. The endpoint map is assembled per-controller from PEER_ENDPOINTS;
 // the knock keys are operator-set (global or per-device policy) and are secrets.
 const OPTION_NEMO_DIRECT_ENDPOINTS: &str = "nemo-direct-endpoints";
+const OPTION_NEMO_LDAP_LOGIN_SUFFICIENT: &str = "nemo-ldap-login-sufficient";
+const OPTION_NEMO_DISABLE_LOCAL_PASSWORD: &str = "nemo-disable-local-password";
+/// Settings of the machine ITSELF -- how it admits incoming sessions. A signed-in user's
+/// policy REPLACES the device policy for everything else, but must not carry these away:
+/// someone signing in on a machine would otherwise lift "disable local password" there,
+/// or grant "LDAP login sufficient". They always come from the global + device policy.
+const MACHINE_SCOPED_POLICY_KEYS: &[&str] = &[
+    OPTION_NEMO_LDAP_LOGIN_SUFFICIENT,
+    OPTION_NEMO_DISABLE_LOCAL_PASSWORD,
+];
+
+/// The machine-scoped keys as THIS machine sets them: the global policy, then its inline
+/// (per-peer) policy, then a named policy assigned to the device, later winning -- the
+/// same order the no-user path of `client_policy` applies, so they are what the machine
+/// would get with nobody signed in. Only MACHINE_SCOPED_POLICY_KEYS are returned.
+fn machine_scoped_options(
+    global: &HashMap<String, String>,
+    peer_inline: &HashMap<String, String>,
+    device_named: Option<&HashMap<String, String>>,
+) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    for layer in [Some(global), Some(peer_inline), device_named].into_iter().flatten() {
+        for key in MACHINE_SCOPED_POLICY_KEYS {
+            if let Some(v) = layer.get(*key) {
+                out.insert((*key).to_owned(), v.clone());
+            }
+        }
+    }
+    out
+}
+
+/// Overlay the machine-scoped keys from the device's own effective options
+/// (`machine_scoped_options`) onto the delivered policy: present -> that value, absent ->
+/// removed (whatever a user's policy said).
+fn overlay_machine_scoped(
+    delivered: &mut HashMap<String, String>,
+    device: &HashMap<String, String>,
+) {
+    for key in MACHINE_SCOPED_POLICY_KEYS {
+        match device.get(*key) {
+            Some(v) => {
+                delivered.insert((*key).to_owned(), v.clone());
+            }
+            None => {
+                delivered.remove(*key);
+            }
+        }
+    }
+}
 const OPTION_NEMO_KNOCK_KEY: &str = "nemo-knock-key";
 const OPTION_NEMO_KNOCK_HMAC_KEY: &str = "nemo-knock-hmac-key";
 // Per-peer SPA keys: `id,rijndael_b64,hmac_b64;...`, assembled per-controller from
@@ -217,6 +266,11 @@ const CLIENT_MANAGEMENT_POLICY_KEYS: &[&str] = &[
     // Lock the TARGET's desktop when a remote-control session to it ends, whatever the
     // controller's own "Lock after session end" toggle says (client nemo_control).
     "nemo-lock-after-session-end",
+    // How the TARGET admits a session (client nemo_control, 1.4.25+): a signed-in user's
+    // valid control ticket replaces the local password / the machine accepts none of its
+    // own passwords. Machine-scoped: see MACHINE_SCOPED_POLICY_KEYS.
+    OPTION_NEMO_LDAP_LOGIN_SUFFICIENT,
+    OPTION_NEMO_DISABLE_LOCAL_PASSWORD,
     // Direct connections + the optional SPA knock (see nemo_direct.rs on the client).
     // Named here so an operator can set them in the Global or a named device policy; the
     // endpoint map is normally assembled per-controller by direct_endpoint_map, but a
@@ -7512,6 +7566,13 @@ async fn client_policy(
             ok
         });
     let require_login = integration::require_login();
+    // This machine's own settings for the machine-scoped keys (global + per-peer + named
+    // device policy), which a signed-in user's policy must not replace.
+    let device_options = machine_scoped_options(
+        &global_policy().options,
+        &management_policy_from_peer(&peer.management_policy).options,
+        integration::device_policy(&peer.id).as_ref().map(|dp| &dp.options),
+    );
 
     match user {
         Some(session) => {
@@ -7547,6 +7608,7 @@ async fn client_policy(
             }
         }
     }
+    overlay_machine_scoped(&mut policy.options, &device_options);
     // Always report the current require-login state, on BOTH the logged-in and
     // no-user paths, so the client's login gate is reliable. The client only gates
     // when NOT signed in, so sending Y to a signed-in client is harmless; but if we
@@ -8696,6 +8758,86 @@ mod tests {
 
     fn opts(pairs: &[(&str, &str)]) -> HashMap<String, String> {
         pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    #[test]
+    fn a_user_signed_in_on_a_machine_cannot_change_how_it_admits_sessions() {
+        // Device policy: no local password, signed-in users sufficient.
+        let device = opts(&[
+            ("nemo-disable-local-password", "Y"),
+            ("nemo-ldap-login-sufficient", "Y"),
+            ("enable-clipboard", "N"),
+        ]);
+        // What a signed-in user's policy produced: tries to re-enable the local password,
+        // says nothing about LDAP, and carries its own session settings.
+        let mut delivered = opts(&[
+            ("nemo-disable-local-password", "N"),
+            ("enable-clipboard", "Y"),
+        ]);
+        overlay_machine_scoped(&mut delivered, &device);
+        assert_eq!(delivered["nemo-disable-local-password"], "Y");
+        assert_eq!(delivered["nemo-ldap-login-sufficient"], "Y");
+        assert_eq!(delivered["enable-clipboard"], "Y", "the user's session settings stay");
+        // A user's policy cannot GRANT them either when the device does not have them.
+        let mut delivered = opts(&[("nemo-ldap-login-sufficient", "Y")]);
+        overlay_machine_scoped(&mut delivered, &HashMap::new());
+        assert!(!delivered.contains_key("nemo-ldap-login-sufficient"));
+        assert!(is_management_policy_key("nemo-ldap-login-sufficient"));
+        assert!(is_management_policy_key("nemo-disable-local-password"));
+    }
+
+    #[test]
+    fn the_machine_scoped_keys_come_from_global_then_inline_then_the_device_policy() {
+        let global = opts(&[
+            ("nemo-disable-local-password", "Y"),
+            ("nemo-ldap-login-sufficient", "Y"),
+            ("api-server", "https://x"),
+        ]);
+        // Nothing on the device: the global defaults hold, and only machine keys come back.
+        let m = machine_scoped_options(&global, &HashMap::new(), None);
+        assert_eq!(m, opts(&[("nemo-disable-local-password", "Y"), ("nemo-ldap-login-sufficient", "Y")]));
+        // The inline policy overrides the global one...
+        let inline = opts(&[("nemo-ldap-login-sufficient", "N")]);
+        let m = machine_scoped_options(&global, &inline, None);
+        assert_eq!(m["nemo-ldap-login-sufficient"], "N");
+        assert_eq!(m["nemo-disable-local-password"], "Y");
+        // ...and a named policy assigned to the device overrides both ("N" switches a
+        // global "Y" off for this one machine).
+        let named = opts(&[("nemo-disable-local-password", "N"), ("enable-clipboard", "N")]);
+        let m = machine_scoped_options(&global, &inline, Some(&named));
+        assert_eq!(m["nemo-disable-local-password"], "N");
+        assert_eq!(m["nemo-ldap-login-sufficient"], "N");
+        assert!(!m.contains_key("enable-clipboard"), "only machine-scoped keys");
+        // Nothing anywhere: nothing set, so the client keeps its passwords.
+        assert!(machine_scoped_options(&HashMap::new(), &HashMap::new(), None).is_empty());
+    }
+
+    #[test]
+    fn a_signed_in_users_policy_neither_lifts_nor_grants_the_machine_policies() {
+        // The signed-in path of client_policy: the user's policy REPLACES the device
+        // policy (globals + user options), then the machine-scoped keys are put back from
+        // the device's own settings.
+        let global = opts(&[("api-server", "https://x")]);
+        let device_named = opts(&[("nemo-disable-local-password", "Y")]);
+        let user_policy = opts(&[
+            ("nemo-disable-local-password", "N"),  // tries to lift it on this machine
+            ("nemo-ldap-login-sufficient", "Y"),   // tries to grant itself the bypass
+            ("enable-file-transfer", "N"),
+        ]);
+        let mut delivered = global.clone();
+        delivered.extend(user_policy.clone());
+        let device = machine_scoped_options(&global, &HashMap::new(), Some(&device_named));
+        overlay_machine_scoped(&mut delivered, &device);
+        assert_eq!(delivered["nemo-disable-local-password"], "Y");
+        assert!(!delivered.contains_key("nemo-ldap-login-sufficient"));
+        assert_eq!(delivered["enable-file-transfer"], "N", "the user's session settings stay");
+        assert_eq!(delivered["api-server"], "https://x");
+        // The same user on a machine that sets neither: both are simply absent.
+        let mut delivered = global.clone();
+        delivered.extend(user_policy);
+        overlay_machine_scoped(&mut delivered, &machine_scoped_options(&global, &HashMap::new(), None));
+        assert!(!delivered.contains_key("nemo-disable-local-password"));
+        assert!(!delivered.contains_key("nemo-ldap-login-sufficient"));
     }
 
     #[test]
