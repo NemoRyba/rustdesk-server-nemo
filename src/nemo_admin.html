@@ -4002,7 +4002,7 @@ uci commit fwknopd; /etc/init.d/fwknopd restart`;
           const opts = (u.policy && u.policy.options) || {};
           const controls = userPolicyOptions.map((o) => policyControl(o, opts[o[0]] || "")).join("");
           row += `<tr class="policy-editor-row"><td colspan="7" style="background:#fafafa;padding:6px 14px 12px;">
-            <div id="userPolicyPanel">
+            <div id="userPolicyPanel" data-user="${escapeHtml(name)}">
               <div style="font-size:12px;opacity:0.7;margin-bottom:8px;">Session permissions for <code>${escapeHtml(name)}</code> — blank = client default. Applied (replacing the device policy) when this user is logged in.</div>
               <div class="user-policy-grid">${controls}</div>
             </div></td></tr>`;
@@ -4319,6 +4319,22 @@ uci commit fwknopd; /etc/init.d/fwknopd restart`;
     // read back. Covers fields rendered later (policy editors) via a observer.
     const PW_EYE_SHOW = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7-11-7-11-7z"/><circle cx="12" cy="12" r="3"/></svg>';
     const PW_EYE_HIDE = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20C5 20 1 12 1 12a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/></svg>';
+    const PW_MASK = '<managed-secret>';
+    // Where a password field's stored value lives, for /nemo/api/secrets/reveal. null =
+    // not a stored server-side secret (e.g. the API token, the LDAP test password).
+    function pwSecretContext(input) {
+      if (input.id === 'ldapBindPw') return { scope: 'ldap', name: '', key: '' };
+      if (input.id === 'gpKnockKey') return { scope: 'global', name: '', key: 'nemo-knock-key' };
+      if (input.id === 'gpKnockHmacKey') return { scope: 'global', name: '', key: 'nemo-knock-hmac-key' };
+      const key = input.dataset.policyKey || '';
+      if (!key) return null;
+      if (input.closest('#adminPolicyGrid')) return { scope: 'admin', name: '', key };
+      const def = input.closest('.policy-def[data-policy-name]');
+      if (def) return { scope: 'policy', name: def.dataset.policyName, key };
+      const up = input.closest('#userPolicyPanel[data-user]');
+      if (up) return { scope: 'user', name: up.dataset.user, key };
+      return null;
+    }
     function decoratePwInput(input) {
       if (!input || input.dataset.pwEye || input.type !== 'password') return;
       input.dataset.pwEye = '1';
@@ -4352,8 +4368,23 @@ uci commit fwknopd; /etc/init.d/fwknopd restart`;
       btn.title = 'Show / hide';
       btn.setAttribute('aria-label', 'Show value');
       btn.innerHTML = PW_EYE_SHOW;
-      btn.addEventListener('click', function () {
+      btn.addEventListener('click', async function () {
         const reveal = input.type === 'password';
+        // A stored secret arrives masked. Showing it fetches that one value through the
+        // audited reveal route (the server writes a "secret-revealed" Log entry).
+        const ctx = reveal ? pwSecretContext(input) : null;
+        if (ctx && (input.value === PW_MASK || (ctx.scope === 'ldap' && !input.value))) {
+          btn.disabled = true;
+          try {
+            const res = await api('/nemo/api/secrets/reveal', { method: 'POST', body: JSON.stringify(ctx) });
+            input.value = res.value;
+            btn.title = 'Show / hide (this reveal was written to the Log)';
+          } catch (e) {
+            btn.title = 'Could not load the stored value: ' + e.message;
+          } finally {
+            btn.disabled = false;
+          }
+        }
         input.type = reveal ? 'text' : 'password';
         btn.classList.toggle('on', reveal);
         btn.innerHTML = reveal ? PW_EYE_HIDE : PW_EYE_SHOW;

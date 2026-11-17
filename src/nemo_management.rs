@@ -2344,6 +2344,7 @@ pub(crate) async fn spawn_hbbs_api(
         .route("/nemo/api/update", post(put_update_manifest))
         .route("/nemo/api/update/delete", post(delete_update_manifest))
         .route("/nemo/api/one-file-installer", post(post_one_file_installer))
+        .route("/nemo/api/secrets/reveal", post(reveal_secret))
         .route(UPDATE_UPLOAD_ROUTE, post(upload_update_installer))
         .route_layer(axum::middleware::from_fn(require_auth_mw));
 
@@ -3612,6 +3613,8 @@ async fn set_ldap_user(
     );
     let controllers = integration::peer_ids_for_device_keys(&evicted_keys);
     terminate_sessions_from_controllers(&controllers, "user access changed").await;
+    let mut perm = perm;
+    mask_secret_options(&mut perm.policy.options);
     Ok(Json(serde_json::json!({
         "success": true,
         "username": username,
@@ -3667,12 +3670,12 @@ async fn get_permissions(
         });
     }
     Ok(Json(PermissionsResponse {
-        permissions: integration::permissions_snapshot(),
+        permissions: masked_permissions(integration::permissions_snapshot()),
         permissions_version: integration::permissions_version(),
         default_targets: integration::default_targets(),
         require_login: integration::require_login(),
         default_policy_name: integration::default_policy_name(),
-        admin_policy: integration::admin_policy(),
+        admin_policy: mask_user_policy(integration::admin_policy()),
         peers: briefs,
     }))
 }
@@ -3689,15 +3692,30 @@ struct PermissionsPutResponse {
 async fn put_permissions(
     Extension(state): Extension<HbbsApiState>,
     headers: HeaderMap,
-    Json(update): Json<integration::PermissionsUpdate>,
+    Json(mut update): Json<integration::PermissionsUpdate>,
 ) -> ApiResult<PermissionsPutResponse> {
     require_auth(&headers, &state.token)?;
+    // The dashboard was shown masks; put the stored secrets back per user / for the
+    // admin policy before the update replaces them.
+    if let Some(permissions) = update.permissions.as_mut() {
+        let current = integration::permissions_snapshot();
+        for (user, perm) in permissions.iter_mut() {
+            restore_secret_options(
+                &mut perm.policy.options,
+                current.get(user).map(|p| &p.policy.options),
+            );
+        }
+    }
+    if let Some(admin) = update.admin_policy.as_mut() {
+        let current = integration::admin_policy();
+        restore_secret_options(&mut admin.options, Some(&current.options));
+    }
     match integration::update_permissions(update) {
         Ok((permissions, permissions_version, evicted_keys)) => {
             let controllers = integration::peer_ids_for_device_keys(&evicted_keys);
             terminate_sessions_from_controllers(&controllers, "permissions changed").await;
             Ok(Json(PermissionsPutResponse {
-                permissions,
+                permissions: masked_permissions(permissions),
                 permissions_version,
             }))
         }
@@ -5573,7 +5591,7 @@ struct DevicePolicyUpdate {
 
 fn policies_response() -> PoliciesResponse {
     PoliciesResponse {
-        policies: integration::list_policies(),
+        policies: masked_named_policies(),
         device_policies: integration::list_device_policies(),
     }
 }
@@ -5591,9 +5609,14 @@ async fn get_policies(
 async fn put_policies(
     Extension(state): Extension<HbbsApiState>,
     headers: HeaderMap,
-    Json(update): Json<PoliciesUpdate>,
+    Json(mut update): Json<PoliciesUpdate>,
 ) -> ApiResult<PoliciesResponse> {
     require_auth(&headers, &state.token)?;
+    // The dashboard was shown masks; put each policy's stored secrets back by name.
+    let current = integration::list_policies();
+    for (name, policy) in update.policies.iter_mut() {
+        restore_secret_options(&mut policy.options, current.get(name).map(|p| &p.options));
+    }
     integration::set_policies(update.policies);
     Ok(Json(policies_response()))
 }
@@ -5670,6 +5693,101 @@ async fn put_global_policy(
     *GLOBAL_POLICY.write().unwrap() = policy.clone();
     save_global_policy(&policy);
     Ok(Json(mask_secret_policy(policy)))
+}
+
+// ---- Audited reveal of one stored secret ----
+//
+// Every dashboard response masks stored secrets. The operator can still read one back on
+// purpose (the eye button on a masked field): this route returns exactly one value, never
+// caches, and writes a "secret-revealed" event to the Log -- which secret, where it is
+// stored, from which address; never the value itself. It is deliberately NOT under an
+// is_authz_path prefix: reading a secret changes nobody's authorization, so it must not
+// move the control-ticket epoch.
+
+#[derive(Deserialize)]
+struct RevealSecretRequest {
+    /// "global" | "peer" | "policy" | "user" | "admin" | "ldap"
+    scope: String,
+    /// Peer id (peer), policy name (policy), username (user); unused otherwise.
+    #[serde(default)]
+    name: String,
+    /// The policy option key; unused for "ldap" (the bind password).
+    #[serde(default)]
+    key: String,
+}
+
+#[derive(Serialize)]
+struct RevealSecretResponse {
+    value: String,
+}
+
+/// What the reveal is about, for the Log line. None = not a revealable secret.
+fn reveal_secret_label(scope: &str, name: &str, key: &str) -> Option<String> {
+    if scope == "ldap" {
+        return Some("LDAP bind password".to_owned());
+    }
+    if !SECRET_POLICY_KEYS.contains(&key) {
+        return None;
+    }
+    match scope {
+        "global" => Some(format!("{key} (global policy)")),
+        "peer" => Some(format!("{key} (policy of peer {name})")),
+        "policy" => Some(format!("{key} (named policy '{name}')")),
+        "user" => Some(format!("{key} (policy of user '{name}')")),
+        "admin" => Some(format!("{key} (admin policy)")),
+        _ => None,
+    }
+}
+
+async fn reveal_secret(
+    Extension(state): Extension<HbbsApiState>,
+    headers: HeaderMap,
+    peer_addr: Option<ConnectInfo<SocketAddr>>,
+    Json(req): Json<RevealSecretRequest>,
+) -> Result<impl axum::response::IntoResponse, ApiFailure> {
+    require_auth(&headers, &state.token)?;
+    let (scope, name, key) = (req.scope.trim(), req.name.trim(), req.key.trim());
+    let Some(label) = reveal_secret_label(scope, name, key) else {
+        return Err(api_error(StatusCode::BAD_REQUEST, "not a stored secret"));
+    };
+    let value = match scope {
+        "global" => global_policy().options.get(key).cloned(),
+        "peer" => state
+            .pm
+            .get_registered(name)
+            .await
+            .map_err(server_error)?
+            .and_then(|p| management_policy_from_peer(&p.management_policy).options.get(key).cloned()),
+        "policy" => integration::list_policies().get(name).and_then(|p| p.options.get(key).cloned()),
+        "user" => integration::permissions_snapshot()
+            .get(name)
+            .and_then(|u| u.policy.options.get(key).cloned()),
+        "admin" => integration::admin_policy().options.get(key).cloned(),
+        _ => Some(integration::ldap_config().bind_password),
+    }
+    .filter(|v| !v.is_empty() && v != MANAGED_SECRET_MASK);
+    let Some(value) = value else {
+        return Err(api_error(StatusCode::NOT_FOUND, "nothing stored there"));
+    };
+    let remote = peer_addr.map(|ConnectInfo(addr)| addr);
+    log::warn!(
+        "secret revealed in the dashboard: {} from {}",
+        label,
+        remote.map(|a| a.ip().to_string()).unwrap_or_else(|| "?".to_owned())
+    );
+    let mut store = STATS.write().await;
+    record_event_locked(
+        &mut store,
+        "secret-revealed",
+        if scope == "peer" { Some(name) } else { None },
+        remote,
+        format!("operator revealed the stored {label} in the dashboard"),
+    );
+    drop(store);
+    Ok((
+        [(axum::http::header::CACHE_CONTROL, "no-store")],
+        Json(RevealSecretResponse { value }),
+    ))
 }
 
 // ---- Live connections (see + cut) ----
@@ -8198,15 +8316,72 @@ const SECRET_POLICY_KEYS: &[&str] = &[
 ];
 const MANAGED_SECRET_MASK: &str = "<managed-secret>";
 
-fn mask_secret_policy(mut policy: ManagementPolicy) -> ManagementPolicy {
+/// Replace every non-empty secret in a policy's options with the mask. Every dashboard
+/// response that carries policy options goes through this (global, per-peer, named,
+/// per-user, admin); the stored value is only ever handed out by `reveal_secret`, which
+/// writes an audit event.
+fn mask_secret_options(options: &mut HashMap<String, String>) {
     for key in SECRET_POLICY_KEYS {
-        if let Some(v) = policy.options.get_mut(*key) {
+        if let Some(v) = options.get_mut(*key) {
             if !v.is_empty() {
                 *v = MANAGED_SECRET_MASK.to_owned();
             }
         }
     }
+}
+
+/// The dashboard sends back the mask for any secret it did not change. Put the stored
+/// value back for each of those, or drop the key when nothing is stored under it (a new
+/// or renamed policy) -- never store the literal mask, which would become the fleet's
+/// actual password / knock key.
+fn restore_secret_options(
+    options: &mut HashMap<String, String>,
+    current: Option<&HashMap<String, String>>,
+) {
+    for key in SECRET_POLICY_KEYS {
+        let is_mask = options
+            .get(*key)
+            .map(|v| v == MANAGED_SECRET_MASK)
+            .unwrap_or(false);
+        if is_mask {
+            match current.and_then(|c| c.get(*key)) {
+                Some(v) => {
+                    options.insert((*key).to_owned(), v.clone());
+                }
+                None => {
+                    options.remove(*key);
+                }
+            }
+        }
+    }
+}
+
+fn mask_secret_policy(mut policy: ManagementPolicy) -> ManagementPolicy {
+    mask_secret_options(&mut policy.options);
     policy
+}
+
+fn mask_user_policy(mut policy: integration::UserManagedPolicy) -> integration::UserManagedPolicy {
+    mask_secret_options(&mut policy.options);
+    policy
+}
+
+/// Named policies as the dashboard sees them: secrets masked.
+fn masked_named_policies() -> HashMap<String, integration::UserManagedPolicy> {
+    integration::list_policies()
+        .into_iter()
+        .map(|(name, p)| (name, mask_user_policy(p)))
+        .collect()
+}
+
+/// Per-user permissions as the dashboard sees them: each user's inline policy masked.
+fn masked_permissions(
+    mut permissions: HashMap<String, integration::UserPermission>,
+) -> HashMap<String, integration::UserPermission> {
+    for perm in permissions.values_mut() {
+        mask_secret_options(&mut perm.policy.options);
+    }
+    permissions
 }
 
 // A dashboard round-trip sees the masks, not the plaintext; restore the stored
@@ -8222,23 +8397,7 @@ fn restore_masked_secrets_from(
     mut policy: ManagementPolicy,
     current: &ManagementPolicy,
 ) -> ManagementPolicy {
-    for key in SECRET_POLICY_KEYS {
-        let is_mask = policy
-            .options
-            .get(*key)
-            .map(|v| v == MANAGED_SECRET_MASK)
-            .unwrap_or(false);
-        if is_mask {
-            match current.options.get(*key) {
-                Some(v) => {
-                    policy.options.insert((*key).to_owned(), v.clone());
-                }
-                None => {
-                    policy.options.remove(*key);
-                }
-            }
-        }
-    }
+    restore_secret_options(&mut policy.options, Some(&current.options));
     policy
 }
 
@@ -8461,6 +8620,76 @@ mod tests {
     //! single serial test that restores the flag, so the suite stays
     //! deterministic under `cargo test`'s parallel runner.
     use super::*;
+
+    fn opts(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    #[test]
+    fn mask_hides_every_non_empty_secret_and_nothing_else() {
+        let mut o = opts(&[
+            ("nemo-permanent-password", "Pc10-Secret!"),
+            ("default-connect-password", ""),
+            ("nemo-knock-key", "a2V5"),
+            ("approve-mode", "password"),
+        ]);
+        mask_secret_options(&mut o);
+        assert_eq!(o["nemo-permanent-password"], MANAGED_SECRET_MASK);
+        assert_eq!(o["nemo-knock-key"], MANAGED_SECRET_MASK);
+        assert_eq!(o["default-connect-password"], "", "an empty secret stays empty (= not set)");
+        assert_eq!(o["approve-mode"], "password", "non-secret keys are untouched");
+    }
+
+    #[test]
+    fn restore_puts_stored_secrets_back_and_never_stores_the_mask() {
+        let stored = opts(&[("nemo-permanent-password", "Pc10-Secret!"), ("nemo-knock-key", "a2V5")]);
+        // Unchanged in the form (mask sent back) -> the stored value.
+        let mut o = opts(&[("nemo-permanent-password", MANAGED_SECRET_MASK)]);
+        restore_secret_options(&mut o, Some(&stored));
+        assert_eq!(o["nemo-permanent-password"], "Pc10-Secret!");
+        // Changed in the form -> the new value wins.
+        let mut o = opts(&[("nemo-permanent-password", "new-one")]);
+        restore_secret_options(&mut o, Some(&stored));
+        assert_eq!(o["nemo-permanent-password"], "new-one");
+        // A mask with nothing stored under it (new / renamed policy, key never set):
+        // dropped, NEVER kept as the literal mask.
+        let mut o = opts(&[("default-connect-password", MANAGED_SECRET_MASK)]);
+        restore_secret_options(&mut o, Some(&stored));
+        assert!(!o.contains_key("default-connect-password"));
+        let mut o = opts(&[("nemo-permanent-password", MANAGED_SECRET_MASK)]);
+        restore_secret_options(&mut o, None);
+        assert!(!o.contains_key("nemo-permanent-password"));
+    }
+
+    #[test]
+    fn mask_then_restore_round_trips_every_secret_key() {
+        let stored: HashMap<String, String> = SECRET_POLICY_KEYS
+            .iter()
+            .map(|k| (k.to_string(), format!("value-of-{k}")))
+            .collect();
+        let mut shown = stored.clone();
+        mask_secret_options(&mut shown);
+        assert!(shown.values().all(|v| v == MANAGED_SECRET_MASK));
+        restore_secret_options(&mut shown, Some(&stored));
+        assert_eq!(shown, stored);
+    }
+
+    #[test]
+    fn reveal_only_names_stored_secrets_in_known_scopes() {
+        assert!(reveal_secret_label("global", "", "nemo-permanent-password").is_some());
+        assert!(reveal_secret_label("policy", "pc10", "nemo-permanent-password")
+            .unwrap()
+            .contains("'pc10'"));
+        assert!(reveal_secret_label("ldap", "", "").is_some());
+        // Not a secret key: nothing to reveal (the normal responses carry it anyway).
+        assert!(reveal_secret_label("global", "", "approve-mode").is_none());
+        assert!(reveal_secret_label("global", "", "nemo-device-key").is_none());
+        // Unknown scope.
+        assert!(reveal_secret_label("everything", "", "nemo-permanent-password").is_none());
+        // Reading a secret changes nobody's authorization: it must not bump the epoch
+        // (which would invalidate every control ticket in the fleet).
+        assert!(!is_authz_path("/nemo/api/secrets/reveal"));
+    }
 
     #[test]
     fn api_tls_defaults_pin_self_signed_and_close_fallback_for_provided() {
