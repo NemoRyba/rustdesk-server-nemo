@@ -214,6 +214,22 @@ fn machine_scoped_options(
     out
 }
 
+/// The server's statement of who signed in on this poll. It is a client policy key (so the
+/// client accepts it), which also means an operator could type it into the global, an
+/// inline or a named policy: only the verified session may set it, anything a configured
+/// layer says is dropped.
+const OPTION_NEMO_LOGGED_IN_USER: &str = "nemo-logged-in-user";
+fn set_logged_in_user(options: &mut HashMap<String, String>, session_user: Option<&str>) {
+    match session_user {
+        Some(u) => {
+            options.insert(OPTION_NEMO_LOGGED_IN_USER.to_owned(), u.to_owned());
+        }
+        None => {
+            options.remove(OPTION_NEMO_LOGGED_IN_USER);
+        }
+    }
+}
+
 /// Overlay the machine-scoped keys from the device's own effective options
 /// (`machine_scoped_options`) onto the delivered policy: present -> that value, absent ->
 /// removed (whatever a user's policy said).
@@ -7574,6 +7590,12 @@ async fn client_policy(
         integration::device_policy(&peer.id).as_ref().map(|dp| &dp.options),
     );
 
+    // Who signed in on THIS poll, from the verified session only. It names the user in
+    // the control ticket, which a target may accept INSTEAD of its password (machine
+    // policies ldap-login-sufficient / disable-local-password) -- so it must never come
+    // from a configured policy layer (see set_logged_in_user).
+    let session_user: Option<String> = user.as_ref().map(|s| s.username.clone());
+
     match user {
         Some(session) => {
             // A logged-in user's policy REPLACES the device policy: start from the
@@ -7583,9 +7605,6 @@ async fn client_policy(
             policy_source = (source, name, session.username.clone());
             policy.allow_user_override = policy.allow_user_override || up.allow_user_override;
             policy.options.extend(up.options);
-            policy
-                .options
-                .insert("nemo-logged-in-user".to_owned(), session.username.clone());
         }
         None => {
             // No logged-in user: use the per-device policy so a controlled host
@@ -7608,6 +7627,7 @@ async fn client_policy(
             }
         }
     }
+    set_logged_in_user(&mut policy.options, session_user.as_deref());
     overlay_machine_scoped(&mut policy.options, &device_options);
     // Always report the current require-login state, on BOTH the logged-in and
     // no-user paths, so the client's login gate is reliable. The client only gates
@@ -7707,12 +7727,11 @@ async fn client_policy(
             Ok(peers) => peers.into_iter().map(|p| p.id).collect(),
             Err(_) => Vec::new(),
         };
-        let username = policy.options.get("nemo-logged-in-user").cloned();
         if let Some(ticket) = build_control_ticket(
             &peer.id,
             matches!(peer.status, Some(0)),
             if device_key_ok { request.device_key_pub.as_deref() } else { None },
-            username.as_deref(),
+            session_user.as_deref(),
             require_login,
             &policy.options,
             &blocked,
@@ -8784,6 +8803,21 @@ mod tests {
         assert!(!delivered.contains_key("nemo-ldap-login-sufficient"));
         assert!(is_management_policy_key("nemo-ldap-login-sufficient"));
         assert!(is_management_policy_key("nemo-disable-local-password"));
+    }
+
+    #[test]
+    fn only_the_verified_session_names_the_signed_in_user() {
+        // A configured layer (global / inline / named device policy) that carries the key
+        // must not make a machine nobody signed in on look signed in -- its control ticket
+        // would then name that user, which a target may accept instead of its password.
+        let mut o = opts(&[("nemo-logged-in-user", "alice"), ("enable-clipboard", "N")]);
+        set_logged_in_user(&mut o, None);
+        assert!(!o.contains_key("nemo-logged-in-user"));
+        assert_eq!(o["enable-clipboard"], "N");
+        // The verified session wins over whatever a user's policy says.
+        let mut o = opts(&[("nemo-logged-in-user", "mallory")]);
+        set_logged_in_user(&mut o, Some("alice"));
+        assert_eq!(o["nemo-logged-in-user"], "alice");
     }
 
     #[test]
