@@ -599,6 +599,18 @@
     .integration-form input[type="password"],
     .view input[type="text"],
     .view input[type="password"] { padding: 6px 8px; border: 1px solid #d0d0d0; border-radius: 4px; font: inherit; }
+    /* Reveal/hide eye on every password field (consistent across browsers; the
+       native control only Edge draws is hidden so there is never a double eye). */
+    input[type="password"]::-ms-reveal, input[type="password"]::-ms-clear { display: none; }
+    .pw-wrap { position: relative; }
+    .pw-wrap > input.pw-has-eye { padding-right: 32px !important; box-sizing: border-box; }
+    .pw-eye { position: absolute; top: 50%; right: 3px; transform: translateY(-50%);
+      width: 26px; height: 26px; padding: 0; margin: 0; border: none; background: transparent;
+      cursor: pointer; color: #888; border-radius: 4px; display: inline-flex;
+      align-items: center; justify-content: center; line-height: 0; }
+    .pw-eye:hover { color: #222; background: rgba(0,0,0,0.07); }
+    .pw-eye.on { color: #1a6fdb; }
+    .pw-eye svg { width: 17px; height: 17px; display: block; pointer-events: none; }
     .integration-form code, code { background: #f0f0f0; padding: 1px 4px; border-radius: 3px; font-size: 12px; }
     /* Snap-grid packing dashboard. A 12-column grid with a 1px row unit and dense
        auto-flow, so panels tuck into gaps: two short panels stack beside one tall
@@ -4301,6 +4313,67 @@ uci commit fwknopd; /etc/init.d/fwknopd restart`;
         state.timer = setInterval(loadAll, 5000);
       }
     }
+
+    // --- password reveal toggles ---------------------------------------------
+    // Give every <input type=password> an eye button so a stored secret can be
+    // read back. Covers fields rendered later (policy editors) via a observer.
+    const PW_EYE_SHOW = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7-11-7-11-7z"/><circle cx="12" cy="12" r="3"/></svg>';
+    const PW_EYE_HIDE = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20C5 20 1 12 1 12a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/></svg>';
+    function decoratePwInput(input) {
+      if (!input || input.dataset.pwEye || input.type !== 'password') return;
+      input.dataset.pwEye = '1';
+      let mode = 'block';
+      try {
+        const p = getComputedStyle(input.parentNode);
+        if (p.display === 'flex' || p.display === 'inline-flex') {
+          mode = p.flexDirection.indexOf('column') === 0 ? 'block' : 'inline';
+        }
+      } catch (e) {}
+      const hasFlex = !!input.style.flex || /flex\s*:/.test(input.getAttribute('style') || '');
+      const wrap = document.createElement('span');
+      wrap.className = 'pw-wrap';
+      if (mode === 'block') {
+        wrap.style.display = 'block';
+      } else if (hasFlex) {
+        wrap.style.display = 'inline-flex';
+        wrap.style.flex = input.style.flex || '1';
+        if (input.style.minWidth) { wrap.style.minWidth = input.style.minWidth; input.style.minWidth = ''; }
+        input.style.flex = '';
+      } else {
+        wrap.style.display = 'inline-block';
+      }
+      input.parentNode.insertBefore(wrap, input);
+      wrap.appendChild(input);
+      input.classList.add('pw-has-eye');
+      if (mode === 'block' || hasFlex) input.style.width = '100%';
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'pw-eye';
+      btn.title = 'Show / hide';
+      btn.setAttribute('aria-label', 'Show value');
+      btn.innerHTML = PW_EYE_SHOW;
+      btn.addEventListener('click', function () {
+        const reveal = input.type === 'password';
+        input.type = reveal ? 'text' : 'password';
+        btn.classList.toggle('on', reveal);
+        btn.innerHTML = reveal ? PW_EYE_HIDE : PW_EYE_SHOW;
+        btn.setAttribute('aria-label', reveal ? 'Hide value' : 'Show value');
+      });
+      wrap.appendChild(btn);
+    }
+    function scanPwInputs(root) {
+      (root || document).querySelectorAll('input[type="password"]:not([data-pw-eye])').forEach(decoratePwInput);
+    }
+    new MutationObserver(function (muts) {
+      for (const m of muts) {
+        for (const n of m.addedNodes) {
+          if (n.nodeType !== 1) continue;
+          if (n.matches && n.matches('input[type="password"]')) decoratePwInput(n);
+          else if (n.querySelectorAll) scanPwInputs(n);
+        }
+      }
+    }).observe(document.body, { childList: true, subtree: true });
+    scanPwInputs(document);
 
     renderBuildInfo(null);
     schedule();
