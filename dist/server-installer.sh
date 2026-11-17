@@ -3,7 +3,9 @@
 # this script with the release tarball appended (dist/pkg-server.sh builds it).
 #
 #   sudo ./tbfdesk-server-@VER@-install.run            dialog (GUI on a desktop, text UI over SSH)
+#   sudo ./tbfdesk-server-@VER@-install.run --text     force the text menu in THIS terminal (no GUI dialog)
 #   sudo ./tbfdesk-server-@VER@-install.run --update   unattended update, configuration KEPT
+#   sudo ./tbfdesk-server-@VER@-install.run --fresh    unattended clean install (new machine)
 #   sudo ./tbfdesk-server-@VER@-install.run --extract DIR   only unpack the release
 #
 # UPDATE (the default, preselected) keeps EVERYTHING the server is: /etc/tbfdesk (token,
@@ -20,6 +22,9 @@ VER="@VER@"
 APP="TBFDesk server"
 BACKUP_ROOT="${BACKUP_ROOT:-/var/backups/tbfdesk}"
 UNITS="rustdesk-hbbs-nemo rustdesk-hbbr-nemo"
+# Progress shown in the terminal (on stderr) so a command-line run is never a blank screen.
+# Harmless when the installer is launched from a GUI with no terminal attached.
+say() { printf '  -> %s\n' "$*" >&2; }
 MODE=""
 for a in "$@"; do
   case "$a" in
@@ -27,21 +32,28 @@ for a in "$@"; do
     --fresh) MODE=fresh ;;
     --extract) MODE=extract ;;
     --text) FORCE_TEXT=1 ;;
-    -h|--help) sed -n '2,21p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,19p' "$0"; exit 0 ;;
   esac
 done
 
 # ---- root -------------------------------------------------------------------------
 if [ "$(id -u)" != 0 ] && [ "$MODE" != extract ]; then
   if command -v pkexec >/dev/null 2>&1 && [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] && [ -z "${SSH_TTY:-}" ]; then
+    printf '%s\n' \
+      "$APP $VER installer: asking for administrator rights." \
+      "A password dialog should open now -- it may be behind this window or on another monitor." \
+      "Approve it to continue.  No dialog? Press Ctrl+C and run:  sudo \"$0\"" >&2
     exec pkexec env DISPLAY="${DISPLAY:-}" WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-}" XAUTHORITY="${XAUTHORITY:-}" bash "$(readlink -f "$0")" "$@"
   fi
+  printf '%s\n' "$APP $VER installer: administrator rights are required -- enter your password below." >&2
   exec sudo -E bash "$(readlink -f "$0")" "$@"
 fi
+[ "$MODE" = extract ] || say "$APP $VER installer -- preparing (running as $(id -un))."
 
 # ---- unpack -----------------------------------------------------------------------
 WORK="$(mktemp -d /tmp/tbfdesk-server-install.XXXXXX)"; trap 'rm -rf "$WORK"' EXIT
 LINE=$(awk '/^__TBFDESK_PAYLOAD_BELOW__$/ { print NR + 1; exit 0; }' "$0")
+[ "$MODE" = extract ] || say "Unpacking the release..."
 tail -n +"$LINE" "$0" | tar xz -C "$WORK" || { echo "$APP $VER: the installer is damaged (payload)" >&2; exit 1; }
 REL="$(ls -d "$WORK"/tbfdesk-server-* | head -1)"
 if [ "$MODE" = extract ]; then
@@ -156,11 +168,14 @@ SHIM="$WORK/shim"; mkdir -p "$SHIM"; printf '#!/bin/sh\nexec "$@"\n' > "$SHIM/su
 do_update() {
   local before after bk report
   before="$(snapshot)"
+  say "Backing up the current server (configuration, keys, database) to $BACKUP_ROOT ..."
   bk="$(backup)" || { msg "Backup failed -- nothing was changed."; exit 1; }
   local was_enabled=0; systemctl is-enabled --quiet rustdesk-hbbs-nemo 2>/dev/null && was_enabled=1
   local t0; t0=$(date +%s)
+  say "Installing $APP $VER (keeping configuration) ..."
   ( cd "$REL" && PATH="$SHIM:$PATH" PREFIX="$PREFIX" DATADIR="$DATADIR" RESTART=1 ./install.sh ) > "$WORK/install.log" 2>&1
   local rc=$?
+  say "Verifying both services start and stay up (up to ~45s) ..."
   if [ $was_enabled = 1 ] && ! services_ok; then
     # roll back the binaries; configuration and data were never touched
     tar --absolute-names -xzf "$bk" "$PREFIX/hbbs" "$PREFIX/hbbr" 2>/dev/null
@@ -198,6 +213,7 @@ Backup of everything before the update:
 
 install.sh reported an error (exit $rc):
 $(tail -5 "$WORK/install.log")"
+  [ $rc = 0 ] && say "Update finished: $APP ${OLDVER:-?} -> $VER." || say "Update finished with errors (see the summary / install log)."
   msg "$report"
   echo "$report" > "$BACKUP_ROOT/last-update-$VER.txt"
 }
@@ -211,11 +227,14 @@ certificate, policies and published updates. Every client then has to be provisi
 again. A backup is written first.
 
 Continue with the reset?" || { msg "Cancelled -- nothing was changed."; exit 0; }
+    say "Backing up, then resetting the previous server ..."
     local bk; bk="$(backup)" || { msg "Backup failed -- nothing was changed."; exit 1; }
     COMPONENTS=svc,bins,keys,db,tls,policy,updates ASSUME_YES=1 DATA_DIR="$DATADIR" NONINTERACTIVE=1 \
       "$REL/uninstall/tbfdesk-uninstall.sh" server > "$WORK/uninstall.log" 2>&1
   fi
+  say "Installing $APP $VER ..."
   ( cd "$REL" && PATH="$SHIM:$PATH" PREFIX="$PREFIX" DATADIR="$DATADIR" ./install.sh ) > "$WORK/install.log" 2>&1
+  say "Installation finished."
   msg "$APP $VER installed.
 
 $(tail -6 "$WORK/install.log")
