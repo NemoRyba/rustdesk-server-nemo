@@ -988,6 +988,15 @@
             </div>
             <span style="display:block;font-size:12px;opacity:0.7;margin-top:3px;line-height:1.4;">How many recent server events (logins, connection setups, policy changes) the server keeps for the <b>Log</b> view. Oldest drop past this count (max 100000).</span>
           </div>
+          <div class="fld" style="max-width:460px;">
+            <label for="clockTolerance" style="font-weight:600;">Allowed clock difference (minutes)</label>
+            <div style="display:flex;gap:8px;align-items:center;margin-top:4px;">
+              <input id="clockTolerance" type="number" min="1" max="60" step="1" style="width:130px;">
+              <button id="clockToleranceSave" class="primary">Save</button>
+              <span id="clockToleranceMsg" style="font-size:12px;opacity:0.8;"></span>
+            </div>
+            <span style="display:block;font-size:12px;opacity:0.7;margin-top:3px;line-height:1.4;">How far a client computer's clock may differ from this server's, <b>either way</b>, before the server refuses its signed requests (policy updates, sign-in) and the client shows "this computer's clock is N min ahead/behind". Default 5 (1–60). Larger is more forgiving of PCs without automatic time; every captured request stays usable only once, so a larger value does not allow replays. Clients 1.4.24+ also judge policies with this value.</span>
+          </div>
         </div>
       </section>
       <section class="panel" data-panel-id="global">
@@ -1795,6 +1804,17 @@
         setMsg("connHistoryMsg", err.message, false);
       }
     });
+    $("clockToleranceSave").addEventListener("click", async () => {
+      const m = parseInt($("clockTolerance").value, 10);
+      if (!Number.isFinite(m) || m < 1 || m > 60) { setMsg("clockToleranceMsg", "enter 1 to 60 minutes", false); return; }
+      try {
+        await api("/nemo/api/policy", { method: "PUT", body: JSON.stringify({ clock_tolerance_secs: m * 60 }) });
+        setMsg("clockToleranceMsg", "Saved", true);
+        await loadAll();
+      } catch (err) {
+        setMsg("clockToleranceMsg", err.message, false);
+      }
+    });
     $("logHistorySave").addEventListener("click", async () => {
       const n = parseInt($("logHistoryLimit").value, 10);
       if (!Number.isFinite(n) || n < 1) { setMsg("logHistoryMsg", "enter a number ≥ 1", false); return; }
@@ -2577,6 +2597,9 @@
         $("companyOnly").checked = !!health.company_only;
         if (health.connection_history_limit != null && document.activeElement !== $("connHistoryLimit")) {
           $("connHistoryLimit").value = health.connection_history_limit;
+        }
+        if (health.clock_tolerance_secs != null && $("clockTolerance") && document.activeElement !== $("clockTolerance")) {
+          $("clockTolerance").value = Math.round(health.clock_tolerance_secs / 60);
         }
         if (health.log_history_limit != null && $("logHistoryLimit") && document.activeElement !== $("logHistoryLimit")) {
           $("logHistoryLimit").value = health.log_history_limit;

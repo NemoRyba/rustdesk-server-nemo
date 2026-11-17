@@ -419,6 +419,12 @@ static CONN_HISTORY_LIMIT: AtomicUsize = AtomicUsize::new(DEFAULT_CONN_HISTORY_L
 // Admin-configurable number of recent server events (logins, connection setups,
 // policy changes) retained for the Log view. Persisted so it survives a restart.
 static LOG_HISTORY_LIMIT: AtomicUsize = AtomicUsize::new(DEFAULT_LOG_HISTORY_LIMIT);
+/// Allowed difference between a client's clock and this server's, in seconds, both ways
+/// (Settings -> "Allowed clock difference"). A signed client request stamped outside it
+/// is refused ("sealed credential expired"), and the value is pushed to the clients so
+/// they judge policies and warn about their own clock with the same limit.
+static CLOCK_TOLERANCE_SECS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(DEFAULT_CLOCK_TOLERANCE_SECS);
 // Transport posture captured when the API starts, so the runtime LDAP-enable
 // guard (put_ldap_config) can refuse to turn LDAP on when credentials would then
 // traverse the network in cleartext.
@@ -1083,6 +1089,13 @@ const DEFAULT_CONN_HISTORY_LIMIT: usize = 420;
 const MAX_CONN_HISTORY_LIMIT: usize = 100_000;
 const DEFAULT_LOG_HISTORY_LIMIT: usize = 500;
 const MAX_LOG_HISTORY_LIMIT: usize = 100_000;
+/// 5 minutes both ways. Until 1.1.19 it was fixed at 300 s behind / 60 s AHEAD, so a PC
+/// whose clock ran just over a minute fast had every policy poll refused.
+const DEFAULT_CLOCK_TOLERANCE_SECS: u64 = 300;
+const MIN_CLOCK_TOLERANCE_SECS: u64 = 60;
+const MAX_CLOCK_TOLERANCE_SECS: u64 = 3600;
+/// Policy key that tells the clients the server's clock tolerance (seconds).
+const OPTION_NEMO_CLOCK_TOLERANCE: &str = "nemo-clock-tolerance-secs";
 
 #[derive(Clone)]
 struct ConnectionRecord {
@@ -1179,6 +1192,8 @@ struct PolicyRequest {
     connection_history_limit: Option<usize>,
     #[serde(default)]
     log_history_limit: Option<usize>,
+    #[serde(default)]
+    clock_tolerance_secs: Option<u64>,
     #[serde(default)]
     require_device_key: Option<bool>,
     #[serde(default)]
@@ -1467,6 +1482,7 @@ struct PolicyResponse {
     allowed_status: i64,
     connection_history_limit: usize,
     log_history_limit: usize,
+    clock_tolerance_secs: u64,
     require_device_key: bool,
     strip_unsealed_secrets: bool,
     // M1-CLAIM: on by default. With it off, an unbound key authenticates nothing and
@@ -1588,6 +1604,28 @@ fn persist_log_history_limit(value: usize) {
 
 fn log_history_limit() -> usize {
     LOG_HISTORY_LIMIT.load(Ordering::SeqCst)
+}
+
+fn clock_tolerance_path() -> String {
+    get_arg_or("nemo-clock-tolerance-file", "nemo_clock_tolerance_secs".to_owned())
+}
+
+fn load_persisted_clock_tolerance() -> Option<u64> {
+    std::fs::read_to_string(clock_tolerance_path())
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .map(|n| n.clamp(MIN_CLOCK_TOLERANCE_SECS, MAX_CLOCK_TOLERANCE_SECS))
+}
+
+fn persist_clock_tolerance(value: u64) {
+    let path = clock_tolerance_path();
+    if let Err(e) = std::fs::write(&path, value.to_string()) {
+        log::error!("failed to persist clock tolerance to {}: {}", path, e);
+    }
+}
+
+fn clock_tolerance_secs() -> u64 {
+    CLOCK_TOLERANCE_SECS.load(Ordering::SeqCst)
 }
 
 // Per-peer session revocation: "terminate any session open on this peer as of this
@@ -2128,6 +2166,9 @@ pub(crate) fn init_from_args() {
     }
     if let Some(limit) = load_persisted_log_history_limit() {
         LOG_HISTORY_LIMIT.store(limit, Ordering::SeqCst);
+    }
+    if let Some(secs) = load_persisted_clock_tolerance() {
+        CLOCK_TOLERANCE_SECS.store(secs, Ordering::SeqCst);
     }
     log::info!(
         "Nemo company-only policy: {}; connection history size: {}",
@@ -2799,8 +2840,6 @@ async fn api_login_key(Extension(state): Extension<HbbsApiState>) -> Json<LoginK
 static SEEN_LOGIN_NONCES: Lazy<std::sync::Mutex<HashMap<String, u64>>> =
     Lazy::new(|| std::sync::Mutex::new(HashMap::new()));
 
-const SEALED_LOGIN_MAX_AGE_SECS: u64 = 300;
-const SEALED_LOGIN_MAX_SKEW_SECS: u64 = 60;
 // C2: hard cap so an unauthenticated attacker flooding fresh nonces cannot grow the map
 // without bound. The retain() below already prunes by time; this bounds memory under a
 // burst by evicting the oldest entry when full (the ts window still caps replay).
@@ -2823,9 +2862,19 @@ fn sealed_login_guard(
     now: u64,
     seen: &mut HashMap<String, u64>,
 ) -> Result<(), String> {
-    if now.saturating_sub(ts) > SEALED_LOGIN_MAX_AGE_SECS
-        || ts.saturating_sub(now) > SEALED_LOGIN_MAX_SKEW_SECS
-    {
+    sealed_guard_within(ts, nonce, now, seen, clock_tolerance_secs())
+}
+
+/// The guard itself, pure: `tolerance` = the allowed client clock difference, both ways
+/// (Settings -> "Allowed clock difference").
+fn sealed_guard_within(
+    ts: u64,
+    nonce: &str,
+    now: u64,
+    seen: &mut HashMap<String, u64>,
+    tolerance: u64,
+) -> Result<(), String> {
+    if now.saturating_sub(ts) > tolerance || ts.saturating_sub(now) > tolerance {
         return Err("sealed credential expired; please retry".to_owned());
     }
     let nonce = nonce.trim();
@@ -2840,8 +2889,12 @@ fn sealed_login_guard(
         log::warn!("sealed login without nonce (older client); replayable within the ts window");
         return Ok(());
     }
-    // Prune expired entries, then insert-or-reject.
-    seen.retain(|_, &mut seen_at| now.saturating_sub(seen_at) <= SEALED_LOGIN_MAX_AGE_SECS);
+    // Prune expired entries, then insert-or-reject. A request stamped up to `tolerance`
+    // AHEAD stays acceptable until ts + tolerance, i.e. up to 2 x tolerance after it
+    // arrived: its nonce must be remembered that long, or a replay fits in the gap (with
+    // the old fixed 300 s behind / 60 s ahead window that gap was 60 s).
+    let keep = tolerance.saturating_mul(2);
+    seen.retain(|_, &mut seen_at| now.saturating_sub(seen_at) <= keep);
     if seen.contains_key(nonce) {
         return Err("sealed credential replayed; please retry".to_owned());
     }
@@ -7507,6 +7560,12 @@ async fn client_policy(
     } else {
         policy.options.remove("nemo-require-login");
     }
+    // The allowed clock difference (Settings), so the client judges a policy's age and
+    // warns about its own clock with the same limit this server refuses requests at.
+    policy.options.insert(
+        OPTION_NEMO_CLOCK_TOLERANCE.to_owned(),
+        clock_tolerance_secs().to_string(),
+    );
     // #3-push: current address-book/access version. The client compares it to the
     // last value it saw and re-fetches its address book when it changes, so ACL
     // edits reach a logged-in client on its next signed poll (no extra channel).
@@ -7958,6 +8017,19 @@ async fn update_policy(
             format!("connection_history_limit={}", limit),
         );
     }
+    if let Some(secs) = request.clock_tolerance_secs {
+        let secs = secs.clamp(MIN_CLOCK_TOLERANCE_SECS, MAX_CLOCK_TOLERANCE_SECS);
+        CLOCK_TOLERANCE_SECS.store(secs, Ordering::SeqCst);
+        persist_clock_tolerance(secs);
+        let mut store = STATS.write().await;
+        record_event_locked(
+            &mut store,
+            "policy-update",
+            None,
+            None,
+            format!("clock_tolerance_secs={} (allowed client clock difference, both ways)", secs),
+        );
+    }
     if let Some(limit) = request.log_history_limit {
         let limit = limit.clamp(1, MAX_LOG_HISTORY_LIMIT);
         LOG_HISTORY_LIMIT.store(limit, Ordering::SeqCst);
@@ -8288,6 +8360,7 @@ fn policy_response(server_public_key: &str) -> PolicyResponse {
         allowed_status: 1,
         connection_history_limit: conn_history_limit(),
         log_history_limit: log_history_limit(),
+        clock_tolerance_secs: clock_tolerance_secs(),
         require_device_key: integration::require_device_key(),
         claim_unbound_device_keys: integration::claim_unbound_device_keys(),
         pending_device_key_claims: integration::pending_device_key_claim_count(),
@@ -9097,15 +9170,40 @@ mod tests {
         assert!(sealed_login_guard(now - 5, "n1", now, &mut seen).is_err());
         // Different nonce passes.
         assert!(sealed_login_guard(now - 5, "n2", now, &mut seen).is_ok());
-        // Too old / too far in the future / the old ts==0 bypass — all rejected.
+        // Too old / too far in the future (default ±300 s) / the old ts==0 bypass.
         assert!(sealed_login_guard(now - 301, "n3", now, &mut seen).is_err());
-        assert!(sealed_login_guard(now + 61, "n4", now, &mut seen).is_err());
+        assert!(sealed_login_guard(now + 301, "n4", now, &mut seen).is_err());
         assert!(sealed_login_guard(0, "n5", now, &mut seen).is_err());
         // Empty nonce (older client): timestamp window only, accepted.
         assert!(sealed_login_guard(now - 10, "", now, &mut seen).is_ok());
-        // A nonce seen long ago is pruned and usable again.
-        let later = now + 400;
+        // A nonce seen long ago (> 2 x tolerance) is pruned and usable again.
+        let later = now + 700;
         assert!(sealed_login_guard(later - 10, "n1", later, &mut seen).is_ok());
+    }
+
+    #[test]
+    fn the_clock_tolerance_is_symmetric_configurable_and_leaves_no_replay_gap() {
+        let now = 1_000_000u64;
+        // A PC 2 minutes fast: refused by the old fixed 60 s, accepted at the 5 min default.
+        assert!(sealed_guard_within(now + 120, "a", now, &mut HashMap::new(), 300).is_ok());
+        assert!(sealed_guard_within(now + 120, "a", now, &mut HashMap::new(), 60).is_err());
+        // Both ways, exactly at the configured limit.
+        assert!(sealed_guard_within(now - 900, "b", now, &mut HashMap::new(), 900).is_ok());
+        assert!(sealed_guard_within(now + 901, "b", now, &mut HashMap::new(), 900).is_err());
+        // Replay gap: a request stamped the full tolerance AHEAD stays valid until
+        // ts + tolerance = arrival + 2 x tolerance. Its nonce must be refused all that time.
+        let mut seen = HashMap::new();
+        let ts = now + 300;
+        assert!(sealed_guard_within(ts, "c", now, &mut seen, 300).is_ok());
+        for replay_at in [now + 301, now + 450, now + 599] {
+            assert!(
+                sealed_guard_within(ts, "c", replay_at, &mut seen, 300).is_err(),
+                "replay accepted at +{}s",
+                replay_at - now
+            );
+        }
+        // ...and once the stamp itself is too old, the window refuses it anyway.
+        assert!(sealed_guard_within(ts, "c", now + 601, &mut seen, 300).is_err());
     }
 
     // S-B/S-DUALKEY step 3: what the server seals to an Ed25519 device key, the
@@ -9174,9 +9272,9 @@ mod tests {
         assert!(parse_sealed_request(body(now - 5, "n1").as_bytes(), now, &mut seen).is_ok());
         // The same nonce inside the window is a replay.
         assert!(parse_sealed_request(body(now - 5, "n1").as_bytes(), now, &mut seen).is_err());
-        // Expired, too far in the future, and the ts==0 bypass.
+        // Expired, too far in the future (default ±300 s), and the ts==0 bypass.
         assert!(parse_sealed_request(body(now - 301, "n2").as_bytes(), now, &mut seen).is_err());
-        assert!(parse_sealed_request(body(now + 61, "n3").as_bytes(), now, &mut seen).is_err());
+        assert!(parse_sealed_request(body(now + 301, "n3").as_bytes(), now, &mut seen).is_err());
         assert!(parse_sealed_request(body(0, "n4").as_bytes(), now, &mut seen).is_err());
         // Unlike a sealed LOGIN, an envelope without a nonce is REFUSED: there is no
         // legacy envelope sender to be lenient to.
