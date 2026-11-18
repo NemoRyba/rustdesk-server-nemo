@@ -3448,11 +3448,18 @@ uci commit fwknopd; /etc/init.d/fwknopd restart`;
       if (inlineMore) inlineMore.addEventListener("toggle", () => { inlinePolicyOpen = inlineMore.open; });
       const inlineSave = $("inlinePolicySave");
       if (inlineSave) inlineSave.addEventListener("click", async () => {
-        // The PUT replaces the whole inline policy. Start from what the server showed
-        // (secrets as the mask, which it restores to the stored value), so keys this
-        // editor does not list -- nemo-alias, anything set through the API -- survive,
-        // and set or remove only the keys rendered here.
-        const options = Object.assign({}, policyOptions);
+        // The 5 s refresh replaces state.peers with NEW objects and, while this panel is
+        // being edited, skips the rebuild -- so by the time Save is clicked, `peer` and
+        // `policyOptions` can belong to an object no longer in state.peers. Work on the
+        // live entry: writing the answer only to the orphan made the rebuild below show
+        // the values from BEFORE this Save under "Saved", and a second Save from that
+        // view quietly undid the first (e.g. took a Deny out again).
+        const livePeer = () => state.peers.find((p) => p.id === peer.id) || peer;
+        // The PUT replaces the whole inline policy. Start from what the server last
+        // showed (secrets as the mask, which it restores to the stored value), so keys
+        // this editor does not list -- nemo-alias, anything set through the API --
+        // survive, and set or remove only the keys rendered here.
+        const options = Object.assign({}, ((livePeer().management_policy || {}).options) || policyOptions);
         $("inlinePolicyPanel").querySelectorAll("[data-policy-key]").forEach((el) => {
           const v = (el.value || "").trim();
           if (v !== "") options[el.dataset.policyKey] = v;
@@ -3465,19 +3472,29 @@ uci commit fwknopd; /etc/init.d/fwknopd restart`;
             body: JSON.stringify({ allow_user_override: override ? override.checked : allowUserOverride, options })
           });
           // The answer carries the masks, never the stored secrets.
-          peer.management_policy = res.policy || { allow_user_override: false, options: {} };
+          let saved = res.policy || { allow_user_override: false, options: {} };
+          // The server drops a key it does not accept or a value over its length limit
+          // (sanitize_management_policy) and still answers 200: name those, not "Saved".
+          const kept = saved.options || {};
+          const notKept = Object.keys(options).filter((k) => !Object.prototype.hasOwnProperty.call(kept, k)).sort();
           // An inline policy without a single option is not stored at all (the row's
           // column goes back to empty), so its override switch is not either -- even
           // though the PUT answer echoes it. Show what is stored.
-          const empty = !Object.keys(peer.management_policy.options || {}).length;
-          const droppedOverride = empty && !!peer.management_policy.allow_user_override;
-          if (empty) peer.management_policy = { allow_user_override: false, options: {} };
+          const empty = !Object.keys(kept).length;
+          const droppedOverride = empty && !!saved.allow_user_override;
+          if (empty) saved = { allow_user_override: false, options: {} };
+          peer.management_policy = saved;
+          livePeer().management_policy = saved;
           // Saved, so nothing is left to protect from the refresh (see saveEndpoint).
           detailDirty = false;
           renderDetail(true);
-          setMsg("inlinePolicyMsg", droppedOverride
-            ? "Cleared — nothing set, so 'Allow … change these locally' is not stored either"
-            : empty ? "Cleared — this device has no inline policy now" : "Saved — the device gets it on its next policy poll", true);
+          if (notKept.length) {
+            setMsg("inlinePolicyMsg", `Saved, but the server did not keep: ${notKept.join(", ")} (a setting it does not accept, or a value that is too long)`, false);
+          } else {
+            setMsg("inlinePolicyMsg", droppedOverride
+              ? "Cleared — nothing set, so 'Allow … change these locally' is not stored either"
+              : empty ? "Cleared — this device has no inline policy now" : "Saved — the device gets it on its next policy poll", true);
+          }
           renderPeers();
         } catch (err) {
           setMsg("inlinePolicyMsg", err.message, false);

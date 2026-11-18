@@ -11509,7 +11509,15 @@ mod tests {
         // Saves through the existing route, starting from the options it was shown, so
         // masked secrets and keys it does not list survive.
         assert!(detail.contains("/management-policy`, {\n            method: \"PUT\""));
-        assert!(detail.contains("const options = Object.assign({}, policyOptions);"));
+        assert!(detail.contains(
+            "const options = Object.assign({}, ((livePeer().management_policy || {}).options) || policyOptions);"
+        ));
+        // ...and it works on the LIVE state.peers entry, not the object the panel was
+        // rendered from: the 5 s refresh replaces those while the panel is being edited,
+        // and writing the answer only to the orphan showed the pre-save values after
+        // Save, so a second Save from that view undid the first.
+        assert!(detail.contains("const livePeer = () => state.peers.find((p) => p.id === peer.id) || peer;"));
+        assert!(detail.contains("livePeer().management_policy = saved;"));
         // The eye button on its secrets goes through the audited reveal of THIS peer.
         assert!(html.contains("if (ip) return { scope: 'peer', name: ip.dataset.peer, key };"));
         assert_eq!(
