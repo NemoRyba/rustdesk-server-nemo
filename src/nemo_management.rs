@@ -11829,4 +11829,116 @@ mod tests {
             let _ = std::fs::remove_file(format!("{}{}", db, suffix));
         }
     }
+
+    /// S-3 end to end for the GLOBAL source, through the real gate and the real
+    /// `global_policy()` call in it (the other end-to-end tests leave the global empty).
+    /// The global is set for this thread only (set_global_policy_for_test), so the
+    /// handler tests running in parallel never see it.
+    #[test]
+    fn the_rendezvous_gate_enforces_the_global_outbound_policy() {
+        run_the_rendezvous_gate_enforces_the_global_outbound_policy();
+    }
+    #[tokio::main(flavor = "current_thread")]
+    async fn run_the_rendezvous_gate_enforces_the_global_outbound_policy() {
+        let db = format!("target/nemo_s3_global_test_{}.sqlite3", std::process::id());
+        let _ = std::fs::create_dir_all("target");
+        for suffix in ["", "-wal", "-shm", "-journal"] {
+            let _ = std::fs::remove_file(format!("{}{}", db, suffix));
+        }
+        let mut pm = PeerMap::new_for_test(&db).await.expect("test db");
+        let ctl = "s3-glob-ctl";
+        let peer = pm.get_or(ctl).await;
+        pm.update_pk(
+            ctl.to_owned(),
+            peer,
+            "203.0.113.31:21116".parse().expect("addr"),
+            hbb_common::bytes::Bytes::from_static(b"s3-glob-uuid"),
+            hbb_common::bytes::Bytes::from_static(b"s3-glob-pk"),
+            "203.0.113.31".to_owned(),
+        )
+        .await;
+        pm.set_peer_status(ctl, Some(1), None).await.expect("allow");
+
+        let dk = "czMtZ2xvYi1kZXZpY2Uta2V5";
+        let named = "__s3_glob_named_on";
+        let (admin, user) = ("__s3_glob_admin", "__s3_glob_user");
+        let (tok_admin, tok_user) = ("__s3_glob_tok_admin", "__s3_glob_tok_user");
+        let session = |username: &str| integration::Session {
+            username: username.to_owned(),
+            display_name: String::new(),
+            email: String::new(),
+            device_key_pub: dk.to_owned(),
+            expires_at: now_secs() + 3600,
+        };
+        let mut p_admin = integration::UserPermission::default();
+        p_admin.enabled = true;
+        p_admin.is_admin = true;
+        integration::put_user_for_test(admin, Some(p_admin));
+        let mut p_user = integration::UserPermission::default();
+        p_user.enabled = true;
+        p_user.allowed_targets = vec!["*".to_owned()];
+        p_user.policy = upol(&[(OUT_EN, "Y"), (OUT_TG, "*")]);
+        integration::put_user_for_test(user, Some(p_user));
+        integration::put_session_for_test(tok_admin, Some(session(admin)));
+        integration::put_session_for_test(tok_user, Some(session(user)));
+
+        async fn gate(pm: &PeerMap, token: Option<&str>, proven_key: Option<&str>, target: &str) -> Option<String> {
+            let source = NemoSource {
+                id: "s3-glob-ctl".to_owned(),
+                uuid: b"s3-glob-uuid".to_vec().into(),
+                token: token.unwrap_or_default().to_owned(),
+                ..Default::default()
+            };
+            controller_policy_rejection_from_field(pm, Some(&source), "", target, Some("s3-glob-ctl"), proven_key)
+                .await
+                .map(|(_, reason)| reason)
+        }
+        let disabled_reason = Some(REASON_OUTBOUND_DISABLED.to_owned());
+        let not_allowed = Some(REASON_TARGET_NOT_ALLOWED.to_owned());
+
+        // Baseline: nothing configured anywhere, allowed.
+        assert_eq!(gate(&pm, None, Some(dk), "ws-1").await, None);
+
+        {
+            // The global client defaults say "outgoing off" -- the headline S-3 case.
+            let _global = set_global_policy_for_test(&[(OUT_EN, "N")]);
+            assert_eq!(gate(&pm, None, Some(dk), "ws-1").await, disabled_reason, "nobody signed in");
+            // An admin is bound by it as well (admin policy over the global, as in the
+            // ticket); the shipped admin policy says nothing about outgoing.
+            assert_eq!(gate(&pm, Some(tok_admin), Some(dk), "ws-1").await, disabled_reason, "admin");
+            // A user whose own policy re-enables outgoing: their policy wins.
+            assert_eq!(gate(&pm, Some(tok_user), Some(dk), "ws-1").await, None, "user re-enables");
+            // ...but only when the token is proven to be this machine's.
+            assert_eq!(gate(&pm, Some(tok_user), Some("b3RoZXIta2V5"), "ws-1").await, disabled_reason);
+            assert_eq!(gate(&pm, Some(tok_user), None, "ws-1").await, disabled_reason);
+            // A named device policy re-enabling outgoing wins over the global.
+            integration::put_policy_for_test(named, Some(upol(&[(OUT_EN, "Y")])));
+            integration::set_device_policy(ctl, Some(named));
+            assert_eq!(gate(&pm, None, Some(dk), "ws-1").await, None, "named re-enables");
+            integration::set_device_policy(ctl, None);
+            integration::put_policy_for_test(named, None);
+        }
+        {
+            // Global target restriction.
+            let _global = set_global_policy_for_test(&[(OUT_TG, "ws-1")]);
+            assert_eq!(gate(&pm, None, Some(dk), "ws-1").await, None);
+            assert_eq!(gate(&pm, None, Some(dk), "ws-2").await, not_allowed);
+            assert_eq!(gate(&pm, Some(tok_admin), Some(dk), "ws-2").await, not_allowed, "admin");
+            // A user policy listing "*" lifts it.
+            assert_eq!(gate(&pm, Some(tok_user), Some(dk), "ws-2").await, None, "user lists *");
+        }
+        // The guard is gone: the (empty) process-wide global applies again.
+        assert_eq!(gate(&pm, None, Some(dk), "ws-2").await, None);
+
+        for u in [admin, user] {
+            integration::put_user_for_test(u, None);
+        }
+        for t in [tok_admin, tok_user] {
+            integration::put_session_for_test(t, None);
+        }
+        drop(pm);
+        for suffix in ["", "-wal", "-shm", "-journal"] {
+            let _ = std::fs::remove_file(format!("{}{}", db, suffix));
+        }
+    }
 }
