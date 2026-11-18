@@ -6595,15 +6595,124 @@ pub(crate) fn nemo_user_rejection_from_field(
     Some((source_id, reason))
 }
 
+const REASON_OUTBOUND_DISABLED: &str = "outgoing connections are disabled by TBF policy";
+const REASON_TARGET_NOT_ALLOWED: &str = "target is not allowed by TBF policy";
+
+/// S-3: a controller's EFFECTIVE options -- the policy `client_policy` delivers to it, as
+/// far as configured layers go, which is what `build_control_ticket` reads
+/// `nemo-outbound-enabled` / `nemo-outbound-targets` from and what the cooperating client
+/// enforces (client.rs check_nemo_outbound_policy):
+///
+/// - the global policy first;
+/// - then, with a verified user signed in (`user` = `integration::user_policy`, i.e. the
+///   admin policy for an admin, else the assigned named / default / inline user policy),
+///   that policy, which REPLACES the device layers;
+/// - otherwise the inline per-peer policy, then the named device policy (wins);
+/// - then the machine-scoped overlay from global + inline + named, whoever is signed in.
+///   (The outbound keys are not machine-scoped today; the overlay is applied anyway so
+///   this follows client_policy should that ever change.)
+///
+/// Built from the same apply_identity_layers / machine_scoped_options /
+/// overlay_machine_scoped calls as client_policy. Not added here: the server-computed keys
+/// client_policy inserts afterwards (none of them is an outbound key), the API TLS
+/// defaults (only TLS keys), and the "blocked -> outbound N" rewrite, which the gate
+/// covers with its own blocked check before it gets here.
+fn effective_controller_options(
+    global: ManagementPolicy,
+    peer_inline: ManagementPolicy,
+    device_named: Option<integration::UserManagedPolicy>,
+    user: Option<integration::UserManagedPolicy>,
+) -> HashMap<String, String> {
+    let device_options = machine_scoped_options(
+        &global.options,
+        &peer_inline.options,
+        device_named.as_ref().map(|dp| &dp.options),
+    );
+    let layers = match user {
+        Some(up) => IdentityLayers::User(up),
+        None => IdentityLayers::Device {
+            inline: peer_inline,
+            named: device_named,
+        },
+    };
+    let mut policy = global;
+    apply_identity_layers(&mut policy, layers);
+    overlay_machine_scoped(&mut policy.options, &device_options);
+    policy.options
+}
+
+/// S-3: the outbound half of the controller gate, as a pure decision.
+///
+/// Refuses when EITHER the controller's inline per-peer policy (`inline`, the only source
+/// this gate read before) OR its effective policy (`effective`, see
+/// effective_controller_options) says so, using the same tests as the ticket and the
+/// client: `nemo-outbound-enabled` exactly "N" disables; a non-empty
+/// `nemo-outbound-targets` without "*" allows only the ids it lists.
+///
+/// The inline check is kept as a floor so nothing this gate refused before is allowed
+/// now. It is stricter than the effective policy only where a later layer RELAXES an
+/// inline restriction: a named device policy that sets the key again (it wins over the
+/// inline policy), or a signed-in user, whose policy replaces the inline one. Such a
+/// controller gets a ticket and an unrestricted client but is still refused here --
+/// exactly as before this change. The inline check runs first, so a controller refused
+/// before keeps the same reason.
+fn outbound_policy_rejection(
+    inline: &HashMap<String, String>,
+    effective: &HashMap<String, String>,
+    target_id: &str,
+) -> Option<&'static str> {
+    for options in [inline, effective] {
+        if options
+            .get(OPTION_NEMO_OUTBOUND_ENABLED)
+            .map(|value| value == "N")
+            .unwrap_or(false)
+        {
+            return Some(REASON_OUTBOUND_DISABLED);
+        }
+        if !target_allowed_by_controller_policy(options.get(OPTION_NEMO_OUTBOUND_TARGETS), target_id) {
+            return Some(REASON_TARGET_NOT_ALLOWED);
+        }
+    }
+    None
+}
+
 /// The four controller gates. `source_uuid` is `None` when the controller proved itself
 /// with its pinned device key at the rendezvous handshake: that Ed25519 proof already
 /// binds the connection to `source_id` and is strictly stronger than the uuid the client
 /// asserts in the marker, so there is nothing left for the uuid to add.
+///
+/// S-3: the outbound gate (the last one) enforces the controller's EFFECTIVE
+/// `nemo-outbound-enabled` / `nemo-outbound-targets` -- global, named device and user
+/// policies included, not only the inline per-peer policy -- see
+/// effective_controller_options and outbound_policy_rejection. Exact semantics:
+///
+/// - It runs only for a registered, identity-checked, unblocked controller. An unknown or
+///   unregistered controller is refused by the registration check above, as before, and
+///   never reaches it; nothing new is decided for one.
+/// - The user is the one `client_policy` would serve (verified_policy_session): the
+///   session behind the token in the controller's source marker (`token`), only while the
+///   user is enabled, and only when this rendezvous connection proved the device key the
+///   session is bound to (`authed_device_pub`). No token -- signed out, or a client that
+///   withholds it on a non-confidential socket (client.rs nemo_source_marker) --, an
+///   expired or unknown token, a disabled user, or a token bound to another key: nobody
+///   is signed in, so the DEVICE layers apply (fail closed: an unproven user never lifts
+///   a device restriction). The user gate below refuses the bad-token cases on its own.
+/// - Admins get no exemption here, as in the ticket: an admin's policy is the admin
+///   policy layered over the global one, so an admin is refused only when that says so
+///   (outbound "N", or targets that exclude this one) -- and then their ticket is withheld
+///   or excludes this target, and their own client refuses too. A named device policy
+///   does NOT restrict a signed-in admin or user (their policy replaces it); the inline
+///   per-peer policy still does, as before (the floor, see outbound_policy_rejection).
+/// - Read live on every request, no cache: every source is in memory (GLOBAL_POLICY, the
+///   integration CONFIG, the session table), this gate already does a database read per
+///   request, and a cache could keep allowing a controller after its policy was tightened.
 async fn controller_policy_rejection(
     pm: &PeerMap,
     source_id: &str,
     source_uuid: Option<&[u8]>,
     target_id: &str,
+    token: Option<&str>,
+    authed_device_pub: Option<&str>,
 ) -> Option<String> {
     let source_id = source_id.trim();
     if source_id.is_empty() {
@@ -6632,19 +6741,16 @@ async fn controller_policy_rejection(
         return Some("controller is blocked by TBF policy".to_owned());
     }
     let policy = management_policy_from_peer(&source.management_policy);
-    if policy
-        .options
-        .get(OPTION_NEMO_OUTBOUND_ENABLED)
-        .map(|value| value == "N")
-        .unwrap_or(false)
-    {
-        return Some("outgoing connections are disabled by TBF policy".to_owned());
-    }
-    if !target_allowed_by_controller_policy(policy.options.get(OPTION_NEMO_OUTBOUND_TARGETS), target_id)
-    {
-        return Some("target is not allowed by TBF policy".to_owned());
-    }
-    None
+    let inline = policy.options.clone();
+    let user = verified_policy_session(token, authed_device_pub)
+        .map(|session| integration::user_policy(&session.username));
+    let effective = effective_controller_options(
+        global_policy(),
+        policy,
+        integration::device_policy(&source.id),
+        user,
+    );
+    outbound_policy_rejection(&inline, &effective, target_id).map(str::to_owned)
 }
 
 /// H44: decide WHO the controller is, before any of the four gates run.
@@ -6693,20 +6799,35 @@ fn resolve_controller_identity(
     }
 }
 
+/// `authed_device_pub` is the device key this rendezvous connection proved
+/// (`AuthedDevice::device_pub_b64`, None = none); S-3 needs it to decide whether the user
+/// token in the source marker may stand for the controller's policy, exactly as the user
+/// gate (`nemo_user_rejection_from_field`) and `client_policy` decide it.
 pub(crate) async fn controller_policy_rejection_from_field(
     pm: &PeerMap,
     proto: Option<&NemoSource>,
     source_field: &str,
     target_id: &str,
     authed_peer_id: Option<&str>,
+    authed_device_pub: Option<&str>,
 ) -> Option<(String, String)> {
     let (source_id, source_uuid) = match resolve_controller_identity(proto, source_field, authed_peer_id)
     {
         Ok(identity) => identity,
         Err(rejection) => return Some(rejection),
     };
-    let reason =
-        controller_policy_rejection(pm, &source_id, source_uuid.as_deref(), target_id).await?;
+    // The signed-in user's token rides in the same marker; it is only a claim until
+    // verified_policy_session has checked it (see controller_policy_rejection).
+    let token = controller_source_any(proto, source_field).and_then(|(_, _, token)| token);
+    let reason = controller_policy_rejection(
+        pm,
+        &source_id,
+        source_uuid.as_deref(),
+        target_id,
+        token.as_deref(),
+        authed_device_pub,
+    )
+    .await?;
     Some((source_id, reason))
 }
 
@@ -11293,5 +11414,351 @@ mod tests {
         assert!(!allowed_for_status(None));
 
         COMPANY_ONLY.store(saved, Ordering::SeqCst);
+    }
+
+    // ---- S-3: the rendezvous outbound gate follows the controller's EFFECTIVE policy ----
+    //
+    // These never touch the GLOBAL_POLICY static (the rendezvous handler tests read it);
+    // the global layer is covered through the pure functions, which take it as a value.
+
+    const OUT_EN: &str = OPTION_NEMO_OUTBOUND_ENABLED;
+    const OUT_TG: &str = OPTION_NEMO_OUTBOUND_TARGETS;
+
+    fn mpol(pairs: &[(&str, &str)]) -> ManagementPolicy {
+        ManagementPolicy { allow_user_override: false, options: opts(pairs) }
+    }
+
+    fn upol(pairs: &[(&str, &str)]) -> integration::UserManagedPolicy {
+        integration::UserManagedPolicy { allow_user_override: false, options: opts(pairs) }
+    }
+
+    fn outbound_of(options: &HashMap<String, String>) -> (Option<&str>, Option<&str>) {
+        (options.get(OUT_EN).map(String::as_str), options.get(OUT_TG).map(String::as_str))
+    }
+
+    #[test]
+    fn effective_outbound_options_follow_the_client_policy_precedence() {
+        // The global client defaults alone.
+        let e = effective_controller_options(mpol(&[(OUT_EN, "N")]), mpol(&[]), None, None);
+        assert_eq!(outbound_of(&e), (Some("N"), None));
+        // Inline per-peer over global.
+        let e = effective_controller_options(mpol(&[(OUT_TG, "a")]), mpol(&[(OUT_TG, "b")]), None, None);
+        assert_eq!(outbound_of(&e).1, Some("b"));
+        // A named device policy over inline (and global).
+        let e = effective_controller_options(
+            mpol(&[(OUT_TG, "a")]),
+            mpol(&[(OUT_TG, "b")]),
+            Some(upol(&[(OUT_TG, "c")])),
+            None,
+        );
+        assert_eq!(outbound_of(&e).1, Some("c"));
+        // A named device policy that says nothing about a key leaves the lower layers.
+        let e = effective_controller_options(
+            mpol(&[(OUT_TG, "a")]),
+            mpol(&[(OUT_EN, "N")]),
+            Some(upol(&[("view_only", "Y")])),
+            None,
+        );
+        assert_eq!(outbound_of(&e), (Some("N"), Some("a")));
+        // A signed-in user REPLACES the device layers (inline and named), not the global.
+        let e = effective_controller_options(
+            mpol(&[(OUT_TG, "a")]),
+            mpol(&[(OUT_EN, "N")]),
+            Some(upol(&[(OUT_EN, "N")])),
+            Some(upol(&[])),
+        );
+        assert_eq!(outbound_of(&e), (None, Some("a")));
+        // ...the user's own values win over the global ones...
+        let e = effective_controller_options(
+            mpol(&[(OUT_EN, "N"), (OUT_TG, "a")]),
+            mpol(&[]),
+            None,
+            Some(upol(&[(OUT_EN, "Y"), (OUT_TG, "d")])),
+        );
+        assert_eq!(outbound_of(&e), (Some("Y"), Some("d")));
+        // ...and the global ones hold for a user whose policy is silent.
+        let e = effective_controller_options(mpol(&[(OUT_EN, "N")]), mpol(&[]), None, Some(upol(&[])));
+        assert_eq!(outbound_of(&e).0, Some("N"));
+        // The machine-scoped overlay runs as in client_policy: the user cannot lift it.
+        let e = effective_controller_options(
+            mpol(&[]),
+            mpol(&[(OPTION_NEMO_DISABLE_LOCAL_PASSWORD, "Y")]),
+            None,
+            Some(upol(&[(OPTION_NEMO_DISABLE_LOCAL_PASSWORD, "N")])),
+        );
+        assert_eq!(e.get(OPTION_NEMO_DISABLE_LOCAL_PASSWORD).map(String::as_str), Some("Y"));
+    }
+
+    #[test]
+    fn the_outbound_gate_refuses_on_the_inline_floor_or_the_effective_policy() {
+        let empty = HashMap::new();
+        assert_eq!(outbound_policy_rejection(&empty, &empty, "t1"), None);
+        // Effective restrictions (global / named device / user) are enforced now.
+        assert_eq!(
+            outbound_policy_rejection(&empty, &opts(&[(OUT_EN, "N")]), "t1"),
+            Some(REASON_OUTBOUND_DISABLED)
+        );
+        assert_eq!(outbound_policy_rejection(&empty, &opts(&[(OUT_TG, "t1;t3")]), "t1"), None);
+        assert_eq!(
+            outbound_policy_rejection(&empty, &opts(&[(OUT_TG, "t1;t3")]), "t2"),
+            Some(REASON_TARGET_NOT_ALLOWED)
+        );
+        // Open values stay open.
+        for open in [
+            &[(OUT_TG, "*")][..],
+            &[(OUT_TG, "  ")][..],
+            &[(OUT_TG, "t1, *")][..],
+            &[(OUT_EN, "Y")][..],
+        ] {
+            assert_eq!(outbound_policy_rejection(&empty, &opts(open), "t2"), None, "{open:?}");
+        }
+        // Only exactly "N" disables: the test build_control_ticket and the client apply.
+        // Named and user policies are stored unsanitized, so " N " can reach here.
+        for not_off in ["n", " N ", "no", ""] {
+            assert_eq!(
+                outbound_policy_rejection(&empty, &opts(&[(OUT_EN, not_off)]), "t2"),
+                None,
+                "{not_off:?}"
+            );
+        }
+        // The inline floor: refused before this change, refused now, with the same
+        // reason, whatever the effective policy says.
+        let inline_off = opts(&[(OUT_EN, "N")]);
+        assert_eq!(
+            outbound_policy_rejection(&inline_off, &opts(&[(OUT_EN, "Y")]), "t1"),
+            Some(REASON_OUTBOUND_DISABLED)
+        );
+        let inline_t1 = opts(&[(OUT_TG, "t1")]);
+        assert_eq!(
+            outbound_policy_rejection(&inline_t1, &opts(&[(OUT_TG, "*")]), "t2"),
+            Some(REASON_TARGET_NOT_ALLOWED)
+        );
+        // The inline reason comes first, so the wording does not change either.
+        assert_eq!(
+            outbound_policy_rejection(&inline_t1, &opts(&[(OUT_EN, "N")]), "t2"),
+            Some(REASON_TARGET_NOT_ALLOWED)
+        );
+        // Both have to allow the target.
+        assert_eq!(
+            outbound_policy_rejection(&inline_t1, &opts(&[(OUT_TG, "t2")]), "t1"),
+            Some(REASON_TARGET_NOT_ALLOWED)
+        );
+    }
+
+    /// The gate and the control ticket read the same effective options, so for every
+    /// source of the setting they agree on every target: what the ticket covers passes the
+    /// rendezvous, what it withholds is refused there. (Built with no user in
+    /// build_control_ticket so the user ACL -- a different gate -- stays out of it; the
+    /// outbound part of the ticket depends on the options alone.)
+    #[test]
+    fn the_outbound_gate_agrees_with_the_control_ticket_for_every_source() {
+        let reg: Vec<String> = ["c", "t1", "t2"].iter().map(|s| s.to_string()).collect();
+        let admin = integration::default_admin_policy();
+        let mut admin_off = admin.clone();
+        admin_off.options.insert(OUT_EN.to_owned(), "N".to_owned());
+        type Case = (
+            &'static str,
+            ManagementPolicy,
+            ManagementPolicy,
+            Option<integration::UserManagedPolicy>,
+            Option<integration::UserManagedPolicy>,
+        );
+        let cases: Vec<Case> = vec![
+            ("nothing anywhere", mpol(&[]), mpol(&[]), None, None),
+            ("global off", mpol(&[(OUT_EN, "N")]), mpol(&[]), None, None),
+            ("global targets", mpol(&[(OUT_TG, "t1")]), mpol(&[]), None, None),
+            ("inline off", mpol(&[]), mpol(&[(OUT_EN, "N")]), None, None),
+            ("inline targets", mpol(&[]), mpol(&[(OUT_TG, "t1")]), None, None),
+            ("named device off", mpol(&[]), mpol(&[]), Some(upol(&[(OUT_EN, "N")])), None),
+            ("named device targets", mpol(&[]), mpol(&[]), Some(upol(&[(OUT_TG, "t2")])), None),
+            ("named re-enables a global off", mpol(&[(OUT_EN, "N")]), mpol(&[]), Some(upol(&[(OUT_EN, "Y")])), None),
+            ("user off", mpol(&[]), mpol(&[]), None, Some(upol(&[(OUT_EN, "N")]))),
+            ("user targets", mpol(&[]), mpol(&[]), None, Some(upol(&[(OUT_TG, "t2")]))),
+            ("user replaces a named off", mpol(&[]), mpol(&[]), Some(upol(&[(OUT_EN, "N")])), Some(upol(&[]))),
+            ("user under a global off", mpol(&[(OUT_EN, "N")]), mpol(&[]), None, Some(upol(&[]))),
+            ("user re-enables a global off", mpol(&[(OUT_EN, "N")]), mpol(&[]), None, Some(upol(&[(OUT_EN, "Y")]))),
+            ("admin under global targets", mpol(&[(OUT_TG, "t1")]), mpol(&[]), Some(upol(&[(OUT_EN, "N")])), Some(admin.clone())),
+            ("admin policy off", mpol(&[]), mpol(&[]), None, Some(admin_off)),
+        ];
+        for (label, global, inline, named, user) in cases {
+            let inline_options = inline.options.clone();
+            let effective = effective_controller_options(global, inline, named, user);
+            let ticket = build_control_ticket("c", false, Some("k"), None, false, &effective, &[], &reg, 10_000);
+            for target in ["t1", "t2"] {
+                let ticket_allows = ticket
+                    .as_ref()
+                    .map(|t| t.targets.iter().any(|x| x == "*" || x == target))
+                    .unwrap_or(false);
+                let gate_allows = outbound_policy_rejection(&inline_options, &effective, target).is_none();
+                assert_eq!(gate_allows, ticket_allows, "{label}: {target}");
+            }
+        }
+    }
+
+    /// The documented exception: the inline floor stays stricter than the ticket where a
+    /// later layer relaxes an inline restriction (pre-S-3 behaviour, kept on purpose).
+    #[test]
+    fn the_inline_floor_stays_stricter_than_the_ticket_where_a_later_layer_relaxes_it() {
+        let reg: Vec<String> = ["c", "t1", "t2"].iter().map(|s| s.to_string()).collect();
+        let inline_off = mpol(&[(OUT_EN, "N")]);
+        for (label, named, user) in [
+            ("signed-in user", None, Some(upol(&[]))),
+            ("signed-in admin", None, Some(integration::default_admin_policy())),
+            ("named device policy re-enables", Some(upol(&[(OUT_EN, "Y")])), None),
+        ] {
+            let effective = effective_controller_options(mpol(&[]), inline_off.clone(), named, user);
+            assert!(
+                build_control_ticket("c", false, Some("k"), None, false, &effective, &[], &reg, 10_000).is_some(),
+                "{label}: the ticket follows the effective policy"
+            );
+            assert_eq!(
+                outbound_policy_rejection(&inline_off.options, &effective, "t1"),
+                Some(REASON_OUTBOUND_DISABLED),
+                "{label}: the rendezvous keeps refusing, as before"
+            );
+        }
+    }
+
+    /// S-3 end to end through the real gate (`controller_policy_rejection_from_field`): a
+    /// temp-DB PeerMap, and only entries keyed by this test's own names in the live
+    /// integration config and session table -- never the global policy.
+    #[test]
+    fn the_rendezvous_gate_enforces_the_named_device_and_user_outbound_policies() {
+        run_the_rendezvous_gate_enforces_the_named_device_and_user_outbound_policies();
+    }
+    #[tokio::main(flavor = "current_thread")]
+    async fn run_the_rendezvous_gate_enforces_the_named_device_and_user_outbound_policies() {
+        let db = format!("target/nemo_s3_gate_test_{}.sqlite3", std::process::id());
+        let _ = std::fs::create_dir_all("target");
+        for suffix in ["", "-wal", "-shm", "-journal"] {
+            let _ = std::fs::remove_file(format!("{}{}", db, suffix));
+        }
+        let mut pm = PeerMap::new_for_test(&db).await.expect("test db");
+        let ctl = "s3-gate-ctl";
+        let peer = pm.get_or(ctl).await;
+        pm.update_pk(
+            ctl.to_owned(),
+            peer,
+            "203.0.113.30:21116".parse().expect("addr"),
+            hbb_common::bytes::Bytes::from_static(b"s3-uuid"),
+            hbb_common::bytes::Bytes::from_static(b"s3-pk"),
+            "203.0.113.30".to_owned(),
+        )
+        .await;
+        pm.set_peer_status(ctl, Some(1), None).await.expect("allow");
+
+        // The device key this controller's rendezvous connection proved.
+        let dk = "czMtZ2F0ZS1kZXZpY2Uta2V5";
+        let named = "__s3_gate_named_off";
+        let (admin, user, disabled) = ("__s3_gate_admin", "__s3_gate_user", "__s3_gate_disabled");
+        let (tok_admin, tok_user, tok_disabled) = ("__s3_tok_admin", "__s3_tok_user", "__s3_tok_disabled");
+        let session = |username: &str| integration::Session {
+            username: username.to_owned(),
+            display_name: String::new(),
+            email: String::new(),
+            device_key_pub: dk.to_owned(),
+            expires_at: now_secs() + 3600,
+        };
+        let mut p_admin = integration::UserPermission::default();
+        p_admin.enabled = true;
+        p_admin.is_admin = true;
+        integration::put_user_for_test(admin, Some(p_admin));
+        let mut p_user = integration::UserPermission::default();
+        p_user.enabled = true;
+        p_user.allowed_targets = vec!["*".to_owned()];
+        p_user.policy = upol(&[(OUT_TG, "ws-1")]);
+        integration::put_user_for_test(user, Some(p_user));
+        let mut p_disabled = integration::UserPermission::default();
+        p_disabled.enabled = false;
+        p_disabled.policy = upol(&[(OUT_EN, "Y")]);
+        integration::put_user_for_test(disabled, Some(p_disabled));
+        integration::put_session_for_test(tok_admin, Some(session(admin)));
+        integration::put_session_for_test(tok_user, Some(session(user)));
+        integration::put_session_for_test(tok_disabled, Some(session(disabled)));
+
+        async fn gate(
+            pm: &PeerMap,
+            id: &str,
+            token: Option<&str>,
+            proven_key: Option<&str>,
+            target: &str,
+        ) -> Option<String> {
+            let source = NemoSource {
+                id: id.to_owned(),
+                uuid: b"s3-uuid".to_vec().into(),
+                token: token.unwrap_or_default().to_owned(),
+                ..Default::default()
+            };
+            controller_policy_rejection_from_field(pm, Some(&source), "", target, Some(id), proven_key)
+                .await
+                .map(|(_, reason)| reason)
+        }
+        let disabled_reason = Some(REASON_OUTBOUND_DISABLED.to_owned());
+
+        // Nothing configured: allowed, as before.
+        assert_eq!(gate(&pm, ctl, None, Some(dk), "ws-1").await, None);
+
+        // A named device policy with outgoing off -- the S-3 hole: the gate used to read
+        // the inline policy only and let this controller through.
+        integration::put_policy_for_test(named, Some(upol(&[(OUT_EN, "N")])));
+        integration::set_device_policy(ctl, Some(named));
+        assert_eq!(integration::device_policy_name(ctl).as_deref(), Some(named));
+        assert_eq!(gate(&pm, ctl, None, Some(dk), "ws-1").await, disabled_reason);
+
+        // A signed-in admin: the admin policy replaces the device policy and, as shipped,
+        // says nothing about outgoing -- so the admin is NOT refused.
+        assert_eq!(gate(&pm, ctl, Some(tok_admin), Some(dk), "ws-1").await, None);
+        // A signed-in user: their own targets apply instead of the device policy.
+        assert_eq!(gate(&pm, ctl, Some(tok_user), Some(dk), "ws-1").await, None);
+        assert_eq!(
+            gate(&pm, ctl, Some(tok_user), Some(dk), "ws-2").await,
+            Some(REASON_TARGET_NOT_ALLOWED.to_owned())
+        );
+        // A token that is not proven to be this machine's counts as nobody signed in
+        // (fail closed): spent on a connection that proved another key, or none.
+        assert_eq!(gate(&pm, ctl, Some(tok_admin), Some("b3RoZXIta2V5"), "ws-1").await, disabled_reason);
+        assert_eq!(gate(&pm, ctl, Some(tok_admin), None, "ws-1").await, disabled_reason);
+        // ...and so do a disabled user and an unknown token.
+        assert_eq!(gate(&pm, ctl, Some(tok_disabled), Some(dk), "ws-1").await, disabled_reason);
+        assert_eq!(gate(&pm, ctl, Some("__s3_no_such_token"), Some(dk), "ws-1").await, disabled_reason);
+
+        // A named device policy restricting the targets (no user).
+        integration::put_policy_for_test(named, Some(upol(&[(OUT_TG, "ws-2")])));
+        assert_eq!(gate(&pm, ctl, None, Some(dk), "ws-2").await, None);
+        assert_eq!(
+            gate(&pm, ctl, None, Some(dk), "ws-1").await,
+            Some(REASON_TARGET_NOT_ALLOWED.to_owned())
+        );
+
+        // The inline floor: an inline "outgoing off" refuses even a signed-in admin, as
+        // it always did.
+        integration::set_device_policy(ctl, None);
+        assert_eq!(gate(&pm, ctl, Some(tok_admin), Some(dk), "ws-1").await, None);
+        pm.set_peer_management_policy(ctl, Some(r#"{"options":{"nemo-outbound-enabled":"N"}}"#))
+            .await
+            .expect("inline policy");
+        assert_eq!(gate(&pm, ctl, Some(tok_admin), Some(dk), "ws-1").await, disabled_reason);
+        assert_eq!(gate(&pm, ctl, None, Some(dk), "ws-1").await, disabled_reason);
+
+        // Unknown controllers are refused by the registration check, unchanged; the
+        // outbound gate is never what decides for them.
+        assert_eq!(
+            gate(&pm, "s3-gate-ghost", Some(tok_admin), Some(dk), "ws-1").await,
+            Some("controller is not registered by TBF policy".to_owned())
+        );
+
+        // Cleanup: only this test's own entries.
+        integration::set_device_policy(ctl, None);
+        integration::put_policy_for_test(named, None);
+        for u in [admin, user, disabled] {
+            integration::put_user_for_test(u, None);
+        }
+        for t in [tok_admin, tok_user, tok_disabled] {
+            integration::put_session_for_test(t, None);
+        }
+        drop(pm);
+        for suffix in ["", "-wal", "-shm", "-journal"] {
+            let _ = std::fs::remove_file(format!("{}{}", db, suffix));
+        }
     }
 }

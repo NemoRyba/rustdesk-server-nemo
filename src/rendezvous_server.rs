@@ -752,6 +752,9 @@ impl RendezvousServer {
                         // client wrote into licence_key. A marker naming anyone else is
                         // refused, and no marker at all no longer means "no gates".
                         authed.map(|who| who.peer_id.as_str()),
+                        // S-3: the key the marker's user token must be bound to before
+                        // that user's policy counts as the controller's.
+                        authed.map(|who| who.device_pub_b64.as_str()),
                     )
                     .await
                     {
@@ -1379,6 +1382,8 @@ impl RendezvousServer {
             // H44: see the RequestRelay arm. The marker in `ph.version` is a hint now,
             // not the identity.
             authed.map(|who| who.peer_id.as_str()),
+            // S-3: see the RequestRelay arm.
+            authed.map(|who| who.device_pub_b64.as_str()),
         )
         .await
         {
@@ -3267,5 +3272,99 @@ mod tests {
             matches!(msg.union, Some(rendezvous_message::Union::FetchLocalAddr(_))),
             "same-intranet peers should get FetchLocalAddr (direct LAN), not relay"
         );
+    }
+
+    /// S-3 through the punch handler: a named device policy's "outgoing off" is enforced
+    /// at the punch now (it used to be read from the inline per-peer policy only), and the
+    /// device key this connection proved is what lets a signed-in user's policy -- here
+    /// an admin's -- replace it. Uses its own controller id and policy/user/session names,
+    /// so the shared TEST_CONTROLLER the other handler tests punch from is untouched.
+    #[test]
+    fn punch_enforces_a_named_device_policy_and_honours_a_proven_user() {
+        run_punch_enforces_a_named_device_policy_and_honours_a_proven_user();
+    }
+    #[tokio::main(flavor = "current_thread")]
+    async fn run_punch_enforces_a_named_device_policy_and_honours_a_proven_user() {
+        use crate::nemo_integration as integration;
+        let ctl = "s3-punch-ctl";
+        let device_pub = "czMtcHVuY2gtZGV2aWNlLWtleQ==";
+        let (policy, admin, token) = ("__s3_punch_named_off", "__s3_punch_admin", "__s3_punch_tok");
+        let db = temp_db();
+        let mut pm = PeerMap::new_for_test(&db.0).await.unwrap();
+        register(&pm, "ws-01", "198.51.100.9:41000", Some(1), true).await;
+        let peer = pm.get_or(ctl).await;
+        pm.update_pk(
+            ctl.to_owned(),
+            peer,
+            "203.0.113.8:55000".parse().unwrap(),
+            Bytes::from_static(b"s3-punch-uuid"),
+            Bytes::from_static(b"s3-punch-pk"),
+            "203.0.113.8".to_owned(),
+        )
+        .await;
+        pm.set_peer_status(ctl, Some(1), None).await.expect("allow controller");
+        let mut off = HashMap::new();
+        off.insert("nemo-outbound-enabled".to_owned(), "N".to_owned());
+        integration::put_policy_for_test(
+            policy,
+            Some(integration::UserManagedPolicy { allow_user_override: false, options: off }),
+        );
+        integration::set_device_policy(ctl, Some(policy));
+        let mut perm = integration::UserPermission::default();
+        perm.enabled = true;
+        perm.is_admin = true;
+        integration::put_user_for_test(admin, Some(perm));
+        integration::put_session_for_test(
+            token,
+            Some(integration::Session {
+                username: admin.to_owned(),
+                display_name: String::new(),
+                email: String::new(),
+                device_key_pub: device_pub.to_owned(),
+                expires_at: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs()
+                    + 3600,
+            }),
+        );
+        let authed = AuthedDevice {
+            device_pub_b64: device_pub.to_owned(),
+            peer_id: ctl.to_owned(),
+        };
+        let punch = |with_token: bool| {
+            let mut ph = punch_request("ws-01");
+            ph.nemo_source = MessageField::some(hbb_common::rendezvous_proto::NemoSource {
+                id: ctl.to_owned(),
+                uuid: b"s3-punch-uuid".to_vec().into(),
+                token: if with_token { token.to_owned() } else { String::new() },
+                ..Default::default()
+            });
+            ph
+        };
+        let mut rs = test_server(pm, "192.168.0.0/16");
+
+        // Nobody signed in: the named device policy applies and refuses.
+        let (msg, forwarded) = rs
+            .handle_punch_hole_request("203.0.113.8:55000".parse().unwrap(), punch(false), "", false, Some(&authed))
+            .await
+            .unwrap();
+        assert!(forwarded.is_none());
+        let (failure, reason) = failure_of(&msg).expect("punch hole response");
+        assert_eq!(failure, punch_hole_response::Failure::OFFLINE);
+        assert_eq!(reason, "outgoing connections are disabled by TBF policy");
+
+        // The admin signed in on this machine, token bound to the key this connection
+        // proved: the admin policy replaces the device policy, the punch goes through.
+        let (msg, forwarded) = rs
+            .handle_punch_hole_request("203.0.113.8:55000".parse().unwrap(), punch(true), "", false, Some(&authed))
+            .await
+            .unwrap();
+        assert!(forwarded.is_some(), "refused: {:?}", failure_of(&msg));
+
+        integration::set_device_policy(ctl, None);
+        integration::put_policy_for_test(policy, None);
+        integration::put_user_for_test(admin, None);
+        integration::put_session_for_test(token, None);
     }
 }
