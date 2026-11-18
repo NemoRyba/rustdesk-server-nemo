@@ -11714,6 +11714,24 @@ mod tests {
             gate(&pm, ctl, Some(tok_user), Some(dk), "ws-2").await,
             Some(REASON_TARGET_NOT_ALLOWED.to_owned())
         );
+        // A user with an ASSIGNED named policy: that policy is theirs (user_policy).
+        let (named_user, user_named, tok_named_user) =
+            ("__s3_gate_named_user", "__s3_gate_user_named", "__s3_tok_named_user");
+        integration::put_policy_for_test(user_named, Some(upol(&[(OUT_TG, "ws-2")])));
+        let mut p_named_user = integration::UserPermission::default();
+        p_named_user.enabled = true;
+        p_named_user.allowed_targets = vec!["*".to_owned()];
+        p_named_user.policy_name = Some(user_named.to_owned());
+        integration::put_user_for_test(named_user, Some(p_named_user));
+        integration::put_session_for_test(tok_named_user, Some(session(named_user)));
+        assert_eq!(gate(&pm, ctl, Some(tok_named_user), Some(dk), "ws-2").await, None);
+        assert_eq!(
+            gate(&pm, ctl, Some(tok_named_user), Some(dk), "ws-1").await,
+            Some(REASON_TARGET_NOT_ALLOWED.to_owned())
+        );
+        integration::put_session_for_test(tok_named_user, None);
+        integration::put_user_for_test(named_user, None);
+        integration::put_policy_for_test(user_named, None);
         // A token that is not proven to be this machine's counts as nobody signed in
         // (fail closed): spent on a connection that proved another key, or none.
         assert_eq!(gate(&pm, ctl, Some(tok_admin), Some("b3RoZXIta2V5"), "ws-1").await, disabled_reason);
