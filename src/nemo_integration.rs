@@ -1115,6 +1115,52 @@ pub(crate) fn unpin_device_key_for_test(public_key: &str) {
         .device_keys
         .retain(|k| k.public_key != public_key);
 }
+/// Test-only: add (Some) or remove (None) ONE named policy in the in-memory config.
+/// Unlike `set_policies` it leaves every other test's policies alone, and it never writes
+/// to disk. Removing it also drops device assignments to it, as `set_policies` would.
+#[cfg(test)]
+pub(crate) fn put_policy_for_test(name: &str, policy: Option<UserManagedPolicy>) {
+    let mut cfg = CONFIG.lock().unwrap();
+    match policy {
+        Some(p) => {
+            cfg.policies.insert(name.to_owned(), p);
+        }
+        None => {
+            cfg.policies.remove(name);
+            cfg.device_policies.retain(|_, n| n != name);
+        }
+    }
+}
+/// Test-only: add (Some) or remove (None) ONE user entry in the in-memory config,
+/// without bumping versions, evicting sessions or writing to disk.
+#[cfg(test)]
+pub(crate) fn put_user_for_test(username: &str, permission: Option<UserPermission>) {
+    let key = normalize_lookup_username(username);
+    let mut cfg = CONFIG.lock().unwrap();
+    match permission {
+        Some(p) => {
+            cfg.permissions.insert(key, p);
+        }
+        None => {
+            cfg.permissions.remove(&key);
+        }
+    }
+}
+/// Test-only: add (Some) or remove (None) ONE live session. `create_session` /
+/// `remove_session` persist the session table to nemo_sessions.json in the working
+/// directory; this never does.
+#[cfg(test)]
+pub(crate) fn put_session_for_test(token: &str, session: Option<Session>) {
+    let mut sessions = SESSIONS.lock().unwrap();
+    match session {
+        Some(s) => {
+            sessions.insert(token.to_owned(), s);
+        }
+        None => {
+            sessions.remove(token);
+        }
+    }
+}
 
 /// M1: the peer id a pinned key is bound to. None = key not pinned at all;
 /// Some("") = pinned but unbound (legacy key, authenticates any id).
