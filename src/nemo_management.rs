@@ -6305,6 +6305,24 @@ pub(crate) fn controller_source_id(proto: Option<&NemoSource>, source_field: &st
         .unwrap_or_default()
 }
 
+/// S-2 review: the controller a connection row is filed under. The PROVEN id wins, the
+/// asserted marker is the fallback for a connection with no device proof -- the same
+/// order the RequestRelay arm uses for its relay rows. When both are present they
+/// already agree: the gate refuses a marker that names anyone else
+/// (`resolve_controller_identity`), so this only changes a proven controller that sent
+/// no marker, which used to be filed under "".
+fn connection_source_id(
+    proto: Option<&NemoSource>,
+    source_field: &str,
+    authed_peer_id: Option<&str>,
+) -> String {
+    authed_peer_id
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| controller_source_id(proto, source_field))
+}
+
 pub(crate) fn control_permissions_for(
     proto: Option<&NemoSource>,
     source_field: &str,
@@ -7050,20 +7068,25 @@ pub(crate) async fn record_connection_negotiation(
     forced_relay: bool,
     same_intranet: bool,
     relay_server: &str,
+    // S-2 review: the id this rendezvous connection PROVED with its device key, the one
+    // the controller gates ran on (`resolve_controller_identity`).
+    authed_peer_id: Option<&str>,
 ) {
+    // The controller this row is filed under. Block, device-key delete and the user
+    // evictions find a controller's sessions by this id, so it must be the id the gates
+    // admitted, not only the marker: a controller that proved its key and sent no
+    // marker used to be filed under "" and could not be found by any of them.
+    let source_id = connection_source_id(proto, source_field, authed_peer_id);
     // Verbose audit line: the server sees connection SETUP (punch/relay) even for
     // direct sessions, so this records who connected to which machine, over what
     // path — visible in the server log regardless of whether the session is direct.
     // H1: log ONLY the parsed source id, never the raw `source_field` — it carries the
     // logged-in user's session token (`nemo-source-v1:<id>:<uuid>:<token>`), and printing
     // it would leak a live bearer credential into the server log.
-    let source_id = controller_source_any(proto, source_field)
-        .map(|(sid, _, _)| sid)
-        .unwrap_or_else(|| "?".to_owned());
     log::info!(
         "Nemo connect: target={} source={} from={} to={} nat={} path={}",
         id,
-        source_id,
+        if source_id.is_empty() { "?" } else { source_id.as_str() },
         from_addr,
         to_addr,
         nat_type_name(nat_type),
@@ -7124,9 +7147,6 @@ pub(crate) async fn record_connection_negotiation(
     } else {
         "direct-punch"
     };
-    let source_id = controller_source_any(proto, source_field)
-        .map(|(sid, _, _)| sid)
-        .unwrap_or_default();
     upsert_connection(
         &mut store,
         &source_id,
@@ -11347,6 +11367,124 @@ mod tests {
         assert!(some.starts_with("blocked; sessions revoked as of 42"));
         assert!(some.contains("sessions it controls revoked on"));
         assert!(some.contains("\"111\"") && some.contains("\"222\""));
+    }
+
+    /// A registered, allowed controller and an authorised API state, for the S-2 review
+    /// tests that drive the real `block_peer`.
+    async fn s2_blockable_controller(db: &str, ctl: &str) -> (HbbsApiState, HeaderMap) {
+        let _ = std::fs::create_dir_all("target");
+        for suffix in ["", "-wal", "-shm", "-journal"] {
+            let _ = std::fs::remove_file(format!("{}{}", db, suffix));
+        }
+        let mut pm = PeerMap::new_for_test(db).await.expect("test db");
+        let peer = pm.get_or(ctl).await;
+        pm.update_pk(
+            ctl.to_owned(),
+            peer,
+            "203.0.113.21:21116".parse().expect("addr"),
+            hbb_common::bytes::Bytes::from_static(b"s2r-uuid"),
+            hbb_common::bytes::Bytes::from_static(b"s2r-pk"),
+            "203.0.113.21".to_owned(),
+        )
+        .await;
+        pm.set_peer_status(ctl, Some(1), None).await.expect("allow");
+        let (login_enc_pk, login_enc_sk) = box_::gen_keypair();
+        let state = HbbsApiState {
+            pm,
+            token: Some("s2r-test-token".to_owned()),
+            server_public_key: String::new(),
+            server_secret_key: None,
+            login_enc_pk,
+            login_enc_sk,
+        };
+        let mut auth = HeaderMap::new();
+        auth.insert(AUTHORIZATION, "Bearer s2r-test-token".parse().expect("header"));
+        (state, auth)
+    }
+
+    fn s2_remove_db(db: &str) {
+        for suffix in ["", "-wal", "-shm", "-journal"] {
+            let _ = std::fs::remove_file(format!("{}{}", db, suffix));
+        }
+    }
+
+    async fn s2_block_audit_line(ctl: &str) -> String {
+        STATS
+            .read()
+            .await
+            .events
+            .iter()
+            .rev()
+            .find(|e| e.kind == "peer-blocked" && e.peer_id.as_deref() == Some(ctl))
+            .expect("a block is audited")
+            .detail
+            .clone()
+    }
+
+    /// S-2 review: a controller that PROVED its device key and sent no source marker
+    /// passed the gates under its proven id, but its punch was filed under "", so Block
+    /// (and device-key delete) could not find the session it was running.
+    #[test]
+    fn blocking_a_proven_controller_without_a_marker_ends_its_punched_session() {
+        run_blocking_a_proven_controller_without_a_marker_ends_its_punched_session();
+    }
+    #[tokio::main(flavor = "current_thread")]
+    async fn run_blocking_a_proven_controller_without_a_marker_ends_its_punched_session() {
+        let db = format!("target/nemo_block_nomarker_test_{}.sqlite3", std::process::id());
+        // Unique ids: STATS and PEER_TERMINATE are process-global.
+        let ctl = "s2m-proven-controller";
+        let tgt = "s2m-target-punch-no-marker";
+        let (state, auth) = s2_blockable_controller(&db, ctl).await;
+        // Through the real recorder; the version string carries no `nemo-source-v1:`.
+        record_connection_negotiation(
+            tgt,
+            None,
+            "1.4.25",
+            "203.0.113.21:50000".parse().expect("addr"),
+            "203.0.113.40:21118".parse().expect("addr"),
+            0,
+            false,
+            false,
+            "",
+            Some(ctl),
+        )
+        .await;
+        assert!(
+            STATS
+                .read()
+                .await
+                .connections
+                .iter()
+                .any(|c| c.source_id == ctl && c.target_id == tgt),
+            "a proven controller's punch must be filed under the id the gates admitted"
+        );
+        let t0 = now_epoch_secs();
+        if let Err((code, Json(err))) = block_peer(Path(ctl.to_owned()), Extension(state), auth).await {
+            panic!("block failed: {} {}", code, err.error);
+        }
+        assert!(
+            peer_terminate_before(tgt) >= t0,
+            "the session {} -> {} must be revoked by Block",
+            ctl,
+            tgt
+        );
+        let line = s2_block_audit_line(ctl).await;
+        assert!(line.contains(tgt), "the audit line must name {}: {:?}", tgt, line);
+        s2_remove_db(&db);
+    }
+
+    #[test]
+    fn a_connection_row_is_filed_under_the_proven_controller_first() {
+        let marker = format!("1.4.25 {}m-1:{}", NEMO_SOURCE_PREFIX, base64::encode(b"uuid"));
+        // Proven, no marker: was "" and unfindable.
+        assert_eq!(connection_source_id(None, "1.4.25", Some("p-1")), "p-1");
+        assert_eq!(connection_source_id(None, "1.4.25", Some(" p-1 ")), "p-1");
+        // Proven and a marker: the gate already refused any disagreement, so they agree.
+        assert_eq!(connection_source_id(None, &marker, Some("m-1")), "m-1");
+        // No proof (require-device-key off): the marker, exactly as before.
+        assert_eq!(connection_source_id(None, &marker, None), "m-1");
+        assert_eq!(connection_source_id(None, &marker, Some("")), "m-1");
+        assert_eq!(connection_source_id(None, "1.4.25", None), "");
     }
 
     /// TODO 24: "unused — went direct" is a verdict made out of the ABSENCE of relay

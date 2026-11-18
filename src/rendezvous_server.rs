@@ -1507,6 +1507,9 @@ impl RendezvousServer {
                 forced_relay,
                 same_intranet,
                 &relay_server,
+                // S-2 review: file the row under the id the gates admitted, so Block and
+                // device-key delete can find a proven controller that sent no marker.
+                authed.map(|who| who.peer_id.as_str()),
             )
             .await;
             if same_intranet {
