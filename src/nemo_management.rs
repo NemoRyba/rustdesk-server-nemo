@@ -11525,4 +11525,48 @@ mod tests {
             Some("nemo-permanent-password (policy of peer 1)")
         );
     }
+
+    /// S-4: every setting the inline editor offers must be one the server stores. The
+    /// PUT runs `sanitize_management_policy`, which silently drops an unknown key and
+    /// still answers 200 -- so a control for a key it does not accept would look saved
+    /// and never reach the device. Also: every `password` field there is a key the
+    /// server masks, so a stored secret never lands in the page as plaintext.
+    #[test]
+    fn every_setting_the_inline_editor_offers_is_one_the_server_stores() {
+        let html = include_str!("nemo_admin.html");
+        let list = html
+            .split_once("const managementOptions = [")
+            .expect("managementOptions exists")
+            .1
+            .split_once("\n    ];")
+            .expect("managementOptions ends")
+            .0;
+        let rows: Vec<(&str, &str)> = list
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("[\""))
+            .filter_map(|rest| {
+                let (key, rest) = rest.split_once('"')?;
+                // , "Label", "type"
+                let ty = rest.split('"').nth(3)?;
+                Some((key, ty))
+            })
+            .collect();
+        assert!(rows.len() >= 50, "parsed only {} rows", rows.len());
+        let refused: Vec<&str> = rows
+            .iter()
+            .map(|(k, _)| *k)
+            .filter(|k| !is_management_policy_key(k))
+            .collect();
+        assert!(refused.is_empty(), "the server drops these inline keys: {:?}", refused);
+        for (key, ty) in &rows {
+            if *ty == "password" {
+                assert!(
+                    SECRET_POLICY_KEYS.contains(key),
+                    "{key} is a password field but the server does not mask it"
+                );
+            }
+        }
+        assert!(rows.iter().any(|(k, t)| *k == OPTION_NEMO_OUTBOUND_ENABLED && *t == "select"));
+        assert!(rows.iter().any(|(k, t)| *k == OPTION_NEMO_OUTBOUND_TARGETS && *t == "text"));
+    }
 }
