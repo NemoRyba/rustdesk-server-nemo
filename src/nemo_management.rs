@@ -7904,6 +7904,20 @@ async fn block_peer(
     // Same mechanism as cut: a revocation stamp the controlled side honours on its
     // next managed-policy poll (<=30s), where it closes every authorised session.
     let terminate_ts = set_peer_terminate(&id);
+    // S-2: ...and the sessions this peer is CONTROLLING. The stamp above only reaches
+    // the blocked machine as a target. The machines it controls check
+    // `nemo-blocked-ids` at logon only, so a session it already had on them went on
+    // after Block -- for a lost laptop, whose sessions all run in that direction, Block
+    // ended nothing. Deleting its device key already ended them; Block now does too,
+    // through the same lever: a revocation on every target the connection store shows
+    // it connected to, relayed or direct. Each target closes them itself on its next
+    // poll, so this needs no data path through the server.
+    //
+    // Called OUTSIDE the STATS lock below: it takes that lock itself, and tokio's
+    // RwLock is not reentrant. Called AFTER set_peer_policy, so the poll that carries
+    // the revocation to a target also carries the id in `nemo-blocked-ids`, and the
+    // controller's reconnect is refused there (and at the rendezvous gate already).
+    let controlled = terminate_sessions_from_controllers(&[id.clone()], "controller blocked").await;
     {
         let mut store = STATS.write().await;
         store.connections.retain(|c| c.target_id != id);
@@ -7912,10 +7926,27 @@ async fn block_peer(
             "peer-blocked",
             Some(&id),
             None,
-            format!("blocked; sessions revoked as of {}", terminate_ts),
+            block_audit_detail(terminate_ts, &controlled),
         );
     }
     Ok(resp)
+}
+
+/// The `peer-blocked` audit line: both directions Block ended, so the log says what
+/// the server did, including the case where it knew of no session controlled from here.
+fn block_audit_detail(terminate_ts: u64, controlled_targets: &[String]) -> String {
+    if controlled_targets.is_empty() {
+        format!(
+            "blocked; sessions revoked as of {}; no session controlled from this peer \
+             is known to this server",
+            terminate_ts
+        )
+    } else {
+        format!(
+            "blocked; sessions revoked as of {}; sessions it controls revoked on {:?}",
+            terminate_ts, controlled_targets
+        )
+    }
 }
 
 async fn allow_peer(
@@ -11137,6 +11168,185 @@ mod tests {
         for suffix in ["", "-wal", "-shm", "-journal"] {
             let _ = std::fs::remove_file(format!("{}{}", db, suffix));
         }
+    }
+
+    fn s2_connection(source: &str, target: &str, path: &str) -> ConnectionRecord {
+        let now = std::time::Instant::now();
+        ConnectionRecord {
+            source_id: source.to_owned(),
+            target_id: target.to_owned(),
+            source_addr: "203.0.113.20:50000".to_owned(),
+            target_addr: "203.0.113.30:21118".to_owned(),
+            path: path.to_owned(),
+            relay_server: if path == "relay" { "192.0.2.1".to_owned() } else { String::new() },
+            nat_type: String::new(),
+            detail: String::new(),
+            first_seen: now,
+            last_seen: now,
+            negotiations: 1,
+        }
+    }
+
+    /// S-2: Block must end the sessions the blocked peer is CONTROLLING, not only the
+    /// ones it hosts. `block_peer` used to stamp the revocation on the blocked id alone,
+    /// i.e. as a target. A machine it was controlling checks `nemo-blocked-ids` at
+    /// logon only, so the session already running there went on -- and for a lost
+    /// laptop, which only ever controls, Block ended nothing at all. Deleting its device
+    /// key already ended those sessions (`terminate_sessions_from_controllers`); this
+    /// pins Block to the same lever, relayed and direct alike.
+    ///
+    /// Drives the real handler: a test of `set_peer_terminate` alone would pass with or
+    /// without the fix.
+    #[test]
+    fn blocking_a_controller_revokes_the_sessions_it_is_controlling() {
+        run_blocking_a_controller_revokes_the_sessions_it_is_controlling();
+    }
+    #[tokio::main(flavor = "current_thread")]
+    async fn run_blocking_a_controller_revokes_the_sessions_it_is_controlling() {
+        let db = format!("target/nemo_block_controller_test_{}.sqlite3", std::process::id());
+        let _ = std::fs::create_dir_all("target");
+        for suffix in ["", "-wal", "-shm", "-journal"] {
+            let _ = std::fs::remove_file(format!("{}{}", db, suffix));
+        }
+        let mut pm = PeerMap::new_for_test(&db).await.expect("test db");
+        // Every id is unique to this test: STATS and PEER_TERMINATE are process-global
+        // and the other tests run in parallel.
+        let ctl = "s2-blocked-controller";
+        let other_ctl = "s2-other-controller";
+        let tgt_relay = "s2-target-relay";
+        let tgt_direct = "s2-target-direct";
+        let tgt_other = "s2-target-unrelated";
+        let unknown = "s2-unregistered-controller";
+        let tgt_unknown = "s2-target-of-unregistered";
+        let peer = pm.get_or(ctl).await;
+        pm.update_pk(
+            ctl.to_owned(),
+            peer,
+            "203.0.113.20:21116".parse().expect("addr"),
+            hbb_common::bytes::Bytes::from_static(b"s2-uuid"),
+            hbb_common::bytes::Bytes::from_static(b"s2-pk"),
+            "203.0.113.20".to_owned(),
+        )
+        .await;
+        pm.set_peer_status(ctl, Some(1), None).await.expect("allow");
+
+        let (login_enc_pk, login_enc_sk) = box_::gen_keypair();
+        let state = HbbsApiState {
+            pm: pm.clone(),
+            token: Some("s2-test-token".to_owned()),
+            server_public_key: String::new(),
+            server_secret_key: None,
+            login_enc_pk,
+            login_enc_sk,
+        };
+        let mut auth = HeaderMap::new();
+        auth.insert(AUTHORIZATION, "Bearer s2-test-token".parse().expect("header"));
+        {
+            let mut store = STATS.write().await;
+            // The blocked peer controls one machine over the relay and one over a
+            // published direct endpoint (no server-side data path at all).
+            store.connections.push(s2_connection(ctl, tgt_relay, "relay"));
+            store.connections.push(s2_connection(ctl, tgt_direct, "direct-endpoint"));
+            // Another controller, on a machine the blocked peer never touched.
+            store.connections.push(s2_connection(other_ctl, tgt_other, "direct-punch"));
+            // A row for an id that is not registered: Block must 404 before it ends
+            // anything.
+            store.connections.push(s2_connection(unknown, tgt_unknown, "relay"));
+        }
+
+        // Epoch seconds, and the stamp only moves forward: ">= t0" proves it was
+        // written during this run, whatever an earlier run left in the file.
+        let t0 = now_epoch_secs();
+        let resp = match block_peer(Path(ctl.to_owned()), Extension(state.clone()), auth.clone()).await {
+            Ok(resp) => resp,
+            Err((code, Json(err))) => panic!("block failed: {} {}", code, err.error),
+        };
+
+        // Admission: blocked, in the database and in what the dashboard is told.
+        assert_eq!(pm.peer_status(ctl).await.expect("status"), Some(0));
+        assert_eq!(resp.0.policy, "blocked");
+        assert!(!resp.0.allowed_for_control);
+        // The direction Block already covered is still covered.
+        assert!(
+            peer_terminate_before(ctl) >= t0,
+            "Block must still revoke the sessions the blocked peer hosts"
+        );
+        // S-2: the machines it is controlling are told to end their sessions.
+        for t in [tgt_relay, tgt_direct] {
+            assert!(
+                peer_terminate_before(t) >= t0,
+                "the session {} -> {} must be revoked by Block",
+                ctl,
+                t
+            );
+        }
+        // A machine the blocked peer never connected to is left alone.
+        assert!(
+            peer_terminate_before(tgt_other) < t0,
+            "Block revoked a machine the blocked peer was not connected to"
+        );
+        {
+            let store = STATS.read().await;
+            assert!(
+                !store.connections.iter().any(|c| c.source_id == ctl),
+                "the blocked controller's sessions must leave the Connections panel"
+            );
+            assert!(
+                store
+                    .connections
+                    .iter()
+                    .any(|c| c.source_id == other_ctl && c.target_id == tgt_other),
+                "another controller's session is not Block's business"
+            );
+            let event = store
+                .events
+                .iter()
+                .rev()
+                .find(|e| e.kind == "peer-blocked" && e.peer_id.as_deref() == Some(ctl))
+                .expect("a block is audited");
+            assert!(
+                event.detail.contains(tgt_relay) && event.detail.contains(tgt_direct),
+                "the audit line must name the machines whose sessions Block ended: {:?}",
+                event.detail
+            );
+        }
+
+        // An unregistered id is a 404 and ends nothing, in either direction.
+        let blocked_unknown = block_peer(Path(unknown.to_owned()), Extension(state), auth).await;
+        let Err((code, _)) = blocked_unknown else {
+            panic!("an unregistered id must not be blockable");
+        };
+        assert_eq!(code, StatusCode::NOT_FOUND);
+        assert!(peer_terminate_before(unknown) < t0);
+        assert!(peer_terminate_before(tgt_unknown) < t0);
+        {
+            let mut store = STATS.write().await;
+            assert!(
+                store
+                    .connections
+                    .iter()
+                    .any(|c| c.source_id == unknown && c.target_id == tgt_unknown),
+                "a refused block must not touch the connection store"
+            );
+            store
+                .connections
+                .retain(|c| c.source_id != other_ctl && c.source_id != unknown);
+        }
+
+        for suffix in ["", "-wal", "-shm", "-journal"] {
+            let _ = std::fs::remove_file(format!("{}{}", db, suffix));
+        }
+    }
+
+    #[test]
+    fn the_block_audit_line_says_whether_any_controlled_session_was_ended() {
+        let none = block_audit_detail(42, &[]);
+        assert!(none.starts_with("blocked; sessions revoked as of 42"));
+        assert!(none.contains("no session controlled from this peer"));
+        let some = block_audit_detail(42, &["111".to_owned(), "222".to_owned()]);
+        assert!(some.starts_with("blocked; sessions revoked as of 42"));
+        assert!(some.contains("sessions it controls revoked on"));
+        assert!(some.contains("\"111\"") && some.contains("\"222\""));
     }
 
     /// TODO 24: "unused — went direct" is a verdict made out of the ABSENCE of relay
