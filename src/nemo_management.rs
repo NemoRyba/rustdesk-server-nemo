@@ -248,6 +248,43 @@ fn overlay_machine_scoped(
         }
     }
 }
+
+/// Whose configured settings are layered over the global policy (see apply_identity_layers).
+enum IdentityLayers {
+    /// A verified, enabled user is signed in: their resolved policy
+    /// (`integration::user_policy`: the admin policy for an admin, else the assigned named,
+    /// the default or the inline user policy) REPLACES the device layers.
+    User(integration::UserManagedPolicy),
+    /// Nobody (verifiably) signed in: the machine's inline per-peer policy, then the named
+    /// policy assigned to the device, which wins over the inline one.
+    Device {
+        inline: ManagementPolicy,
+        named: Option<integration::UserManagedPolicy>,
+    },
+}
+
+/// The identity half of a machine's policy precedence: global -> (user | inline -> named),
+/// later winning, `allow_user_override` OR-ed. `client_policy` builds every delivered
+/// policy -- and so every control ticket -- with this, and the rendezvous controller gate
+/// computes a controller's effective outbound settings with the very same function
+/// (`effective_controller_options`), so the two cannot disagree about who wins (S-3).
+/// The machine-scoped overlay (`overlay_machine_scoped`) is the separate last step.
+fn apply_identity_layers(policy: &mut ManagementPolicy, layers: IdentityLayers) {
+    match layers {
+        IdentityLayers::User(up) => {
+            policy.allow_user_override = policy.allow_user_override || up.allow_user_override;
+            policy.options.extend(up.options);
+        }
+        IdentityLayers::Device { inline, named } => {
+            policy.allow_user_override = policy.allow_user_override || inline.allow_user_override;
+            policy.options.extend(inline.options);
+            if let Some(dp) = named {
+                policy.allow_user_override = policy.allow_user_override || dp.allow_user_override;
+                policy.options.extend(dp.options);
+            }
+        }
+    }
+}
 const OPTION_NEMO_KNOCK_KEY: &str = "nemo-knock-key";
 const OPTION_NEMO_KNOCK_HMAC_KEY: &str = "nemo-knock-hmac-key";
 // Per-peer SPA keys: `id,rijndael_b64,hmac_b64;...`, assembled per-controller from
@@ -5536,6 +5573,25 @@ fn session_device_binding_ok(bound: &str, proven: Option<&str>) -> bool {
     bound.is_empty() || proven == Some(bound)
 }
 
+/// The signed-in user whose policy a machine gets: the live session behind `token`, only
+/// while that user is enabled, and only when the token is spent from the device key its
+/// login proved (`proven` = the key THIS request proved, None = none). Anything else means
+/// "nobody signed in", i.e. the device's policy. `client_policy` serves this user's policy;
+/// the rendezvous controller gate evaluates the controller's outbound settings as this
+/// user's (S-3), so both resolve the user the same way.
+fn verified_policy_session(token: Option<&str>, proven: Option<&str>) -> Option<integration::Session> {
+    token
+        .and_then(integration::session_for_token)
+        .filter(|s| integration::user_is_enabled(&s.username))
+        .filter(|s| {
+            let ok = session_device_binding_ok(&s.device_key_pub, proven);
+            if !ok {
+                log::warn!("user policy withheld: user '{}' token spent from another device", s.username);
+            }
+            ok
+        })
+}
+
 fn verify_device_key(request: &ClientPolicyRequest) -> DeviceProof {
     let (Some(pub_b64), Some(sig_b64)) = (
         request.device_key_pub.as_deref(),
@@ -7588,17 +7644,7 @@ async fn client_policy(
     // A token spent from a machine other than the one that proved its login gets
     // the device's policy, never the user's (whose options can carry secrets).
     let proven = if device_key_ok { request.device_key_pub.as_deref() } else { None };
-    let user = access_token
-        .as_deref()
-        .and_then(integration::session_for_token)
-        .filter(|s| integration::user_is_enabled(&s.username))
-        .filter(|s| {
-            let ok = session_device_binding_ok(&s.device_key_pub, proven);
-            if !ok {
-                log::warn!("user policy withheld: user '{}' token spent from another device", s.username);
-            }
-            ok
-        });
+    let user = verified_policy_session(access_token.as_deref(), proven);
     let require_login = integration::require_login();
     // This machine's own settings for the machine-scoped keys (global + per-peer + named
     // device policy), which a signed-in user's policy must not replace.
@@ -7621,8 +7667,7 @@ async fn client_policy(
             let up = integration::user_policy(&session.username);
             let (source, name) = integration::user_policy_label(&session.username);
             policy_source = (source, name, session.username.clone());
-            policy.allow_user_override = policy.allow_user_override || up.allow_user_override;
-            policy.options.extend(up.options);
+            apply_identity_layers(&mut policy, IdentityLayers::User(up));
         }
         None => {
             // No logged-in user: use the per-device policy so a controlled host
@@ -7636,13 +7681,14 @@ async fn client_policy(
                 None if !peer_policy.options.is_empty() => ("device-inline", String::new(), String::new()),
                 None => ("global", String::new(), String::new()),
             };
-            policy.allow_user_override = policy.allow_user_override || peer_policy.allow_user_override;
-            policy.options.extend(peer_policy.options);
             // A named policy assigned to this device wins over its inline policy.
-            if let Some(dp) = integration::device_policy(&peer.id) {
-                policy.allow_user_override = policy.allow_user_override || dp.allow_user_override;
-                policy.options.extend(dp.options);
-            }
+            apply_identity_layers(
+                &mut policy,
+                IdentityLayers::Device {
+                    inline: peer_policy,
+                    named: integration::device_policy(&peer.id),
+                },
+            );
         }
     }
     set_logged_in_user(&mut policy.options, session_user.as_deref());
