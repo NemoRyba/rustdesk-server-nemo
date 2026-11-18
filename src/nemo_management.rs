@@ -5825,6 +5825,16 @@ fn global_policy_path() -> String {
 }
 
 fn load_global_policy() -> ManagementPolicy {
+    // A unit test must not read the operator's global policy either (the write side is
+    // closed the same way in nemo_integration::persist). Since S-3 the rendezvous
+    // controller gate reads the global outbound keys on every punch and relay, so a
+    // nemo_global_policy.json left in the checkout by a local hbbs run (it is written
+    // next to the binary's working directory) would otherwise decide the handler tests.
+    #[cfg(test)]
+    {
+        return ManagementPolicy::default();
+    }
+    #[cfg(not(test))]
     match std::fs::read_to_string(global_policy_path()) {
         Ok(text) => serde_json::from_str::<ManagementPolicy>(&text)
             .map(sanitize_management_policy)
@@ -5833,7 +5843,47 @@ fn load_global_policy() -> ManagementPolicy {
     }
 }
 
+// Test-only: a global policy for the CURRENT THREAD, consulted by global_policy() before
+// the process-wide static. Every handler test reads the global policy now (the S-3
+// outbound gate), and they run in parallel, so a test must never write GLOBAL_POLICY
+// itself; a thread-local reaches the real call sites without touching anyone else.
+#[cfg(test)]
+thread_local! {
+    static GLOBAL_POLICY_FOR_TEST: std::cell::RefCell<Option<ManagementPolicy>> =
+        std::cell::RefCell::new(None);
+}
+
+/// Test-only: use `options` as this thread's global policy until the guard is dropped
+/// (also on a panic, so a failing test cannot leak it into the next test on the thread).
+#[cfg(test)]
+#[must_use]
+pub(crate) fn set_global_policy_for_test(options: &[(&str, &str)]) -> GlobalPolicyForTestGuard {
+    let policy = ManagementPolicy {
+        allow_user_override: false,
+        options: options
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect(),
+    };
+    GLOBAL_POLICY_FOR_TEST.with(|g| *g.borrow_mut() = Some(policy));
+    GlobalPolicyForTestGuard
+}
+
+#[cfg(test)]
+pub(crate) struct GlobalPolicyForTestGuard;
+
+#[cfg(test)]
+impl Drop for GlobalPolicyForTestGuard {
+    fn drop(&mut self) {
+        GLOBAL_POLICY_FOR_TEST.with(|g| *g.borrow_mut() = None);
+    }
+}
+
 fn global_policy() -> ManagementPolicy {
+    #[cfg(test)]
+    if let Some(policy) = GLOBAL_POLICY_FOR_TEST.with(|g| g.borrow().clone()) {
+        return policy;
+    }
     GLOBAL_POLICY.read().unwrap().clone()
 }
 
