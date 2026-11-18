@@ -751,7 +751,7 @@
                 <th title="Number of direct (LAN / hole-punched) connection negotiations for this peer. Higher is good — it means sessions went direct.">Direct</th>
                 <th title="Number of times the server forced this peer onto the relay (e.g. a WAN↔LAN mismatch). 0 = never forced.">Forced<br>Relay</th>
                 <th title="The relay server address this peer would fall back to if a direct connection fails.">Relay</th>
-                <th title="Allow / Block (flip the policy), Reset (clear its managed policy), or Delete (remove the peer entirely).">Actions</th>
+                <th title="Allow / Block (flip the policy; Block also ends the machine's running sessions, both the ones it hosts and the ones it controls), Reset (clear its managed policy), or Delete (remove the peer entirely).">Actions</th>
               </tr>
             </thead>
             <tbody id="peers"></tbody>
@@ -2968,7 +2968,7 @@
               ${peer.pending_claim_key_id ? `<button class="primary" data-claim-approve-peer="${escapeAttr(peer.pending_claim_key_id)}" data-id="${escapeAttr(peer.id)}" data-claim-label="${escapeAttr(peer.pending_claim_key_label || "")}" title="Confirm that this machine is the one you gave that device key to. It is refused until you do.">Approve key</button>
               <button class="danger" data-claim-deny-peer="${escapeAttr(peer.pending_claim_key_id)}" data-id="${escapeAttr(peer.id)}" title="Refuse this pairing. The machine stays locked out and stops asking.">Deny key</button>` : ""}
               <button data-action="allow" data-id="${escapeHtml(peer.id)}">Allow</button>
-              <button class="danger" data-action="block" data-id="${escapeHtml(peer.id)}">Block</button>
+              <button class="danger" data-action="block" data-id="${escapeHtml(peer.id)}" title="Lock this machine out of the fleet. The server refuses the connections it brokers for it at once; a machine it reaches directly refuses it from that machine's next policy poll (~30 s). Its running sessions end within ~30 seconds, in both directions: the ones it hosts, and the ones it is controlling. A machine it controls closes them itself on its next policy poll and drops ALL its current sessions, so other controllers there have to reconnect. Only sessions this server still has a record of (connection or relay history) can be reached.">Block</button>
               <button data-action="reset-policy" data-id="${escapeHtml(peer.id)}">Reset</button>
               <button class="danger" data-action="delete" data-id="${escapeHtml(peer.id)}">Delete</button>
             </div>
