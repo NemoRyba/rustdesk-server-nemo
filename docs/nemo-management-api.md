@@ -101,6 +101,13 @@ git revert <nemo-management-api-commit>
 - `POST /nemo/api/peers/delete`
 - `GET /nemo/api/peers/{id}/management-policy`
 - `PUT /nemo/api/peers/{id}/management-policy` with JSON body `{"allow_user_override":false,"options":{"enable-clipboard":"N"}}`
+  — the peer's **inline** policy (the dashboard edits it in the peer detail panel). The PUT
+  replaces the whole options map, so send back every key you want to keep. Both routes answer
+  with stored secrets (`nemo-permanent-password`, `default-connect-password`, the knock keys, …)
+  replaced by `<managed-secret>`; sending that mask back keeps the stored value. Read one back
+  with `POST /nemo/api/secrets/reveal` `{"scope":"peer","name":"{id}","key":"…"}`, which is
+  written to the Log. `nemo-outbound-enabled` / `nemo-outbound-targets` set here are what the
+  rendezvous controller gate checks at the hole punch and relay.
 - `POST /nemo/api/client/policy` with JSON body `{"id":"123456789","uuid":"base64"}`
 - `GET /nemo/api/policy`
 - `PUT /nemo/api/policy` with JSON body `{"company_only":true}`

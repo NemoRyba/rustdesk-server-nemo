@@ -7411,9 +7411,11 @@ async fn get_peer_management_policy(
         .await
         .map_err(server_error)?
         .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "peer not found"))?;
+    // S4: secrets masked, like every other dashboard response carrying policy options.
+    // The stored value is handed out only by reveal_secret (scope "peer"), which logs it.
     Ok(Json(ManagementPolicyResponse {
         id: peer.id,
-        policy: management_policy_from_peer(&peer.management_policy),
+        policy: mask_secret_policy(management_policy_from_peer(&peer.management_policy)),
     }))
 }
 
@@ -7449,7 +7451,10 @@ async fn update_peer_management_policy(
         None,
         format!("options={}", policy.options.len()),
     );
-    Ok(Json(ManagementPolicyResponse { id, policy }))
+    // S4: answer with the masks, not the plaintext the restore above just put back.
+    // Otherwise every Save in the dashboard's inline-policy editor would ship the stored
+    // passwords to the browser, past the audited reveal route.
+    Ok(Json(ManagementPolicyResponse { id, policy: mask_secret_policy(policy) }))
 }
 
 // POST /nemo/api/client/audit/:kind (CLIENT_AUDIT_KINDS): the device-key proof is the auth.
@@ -11247,5 +11252,214 @@ mod tests {
         assert!(!allowed_for_status(None));
 
         COMPANY_ONLY.store(saved, Ordering::SeqCst);
+    }
+
+    /// S-4 (2026-11-18): the per-peer INLINE policy is the layer the rendezvous controller
+    /// gate reads (`controller_policy_rejection`), and until now nothing in the dashboard
+    /// could set it -- only a hand-made `PUT /nemo/api/peers/:id/management-policy`. The
+    /// peer detail panel now edits it through that same route, the way the dashboard
+    /// does: it sends back the options it was shown (secrets as the mask), with only the
+    /// edited keys changed. This pins the whole round trip:
+    /// - the outgoing switch and the target list set here are what the gate enforces;
+    /// - the GET and the PUT answer with the mask, never the stored password (the PUT
+    ///   used to echo the plaintext it had just restored, so every Save would have
+    ///   shipped it to the browser past the audited reveal);
+    /// - sending the mask back keeps the stored secret, and keys the editor does not
+    ///   list (`nemo-alias`) survive a save;
+    /// - the eye button's reveal (scope "peer") still returns the stored value.
+    #[test]
+    fn inline_peer_policy_round_trips_masked_and_feeds_the_controller_gate() {
+        run_inline_peer_policy_round_trips_masked_and_feeds_the_controller_gate();
+    }
+    #[tokio::main(flavor = "current_thread")]
+    async fn run_inline_peer_policy_round_trips_masked_and_feeds_the_controller_gate() {
+        use axum::body::HttpBody;
+        use axum::response::IntoResponse;
+
+        let db = format!("target/nemo_inline_policy_test_{}.sqlite3", std::process::id());
+        let _ = std::fs::create_dir_all("target");
+        for suffix in ["", "-wal", "-shm", "-journal"] {
+            let _ = std::fs::remove_file(format!("{}{}", db, suffix));
+        }
+        let mut pm = PeerMap::new_for_test(&db).await.expect("test db");
+        let id = "inline-policy-test-peer";
+        let peer = pm.get_or(id).await;
+        pm.update_pk(
+            id.to_owned(),
+            peer,
+            "203.0.113.21:21116".parse().expect("addr"),
+            hbb_common::bytes::Bytes::from_static(b"inline-uuid"),
+            hbb_common::bytes::Bytes::from_static(b"inline-pk"),
+            "203.0.113.21".to_owned(),
+        )
+        .await;
+        // Allowed, so the status gate (which runs before the policy one) stays out of it.
+        pm.set_peer_status(id, Some(1), None).await.expect("allow");
+
+        let (login_enc_pk, login_enc_sk) = box_::gen_keypair();
+        let state = HbbsApiState {
+            pm: pm.clone(),
+            token: Some("inline-test-token".to_owned()),
+            server_public_key: String::new(),
+            server_secret_key: None,
+            login_enc_pk,
+            login_enc_sk,
+        };
+        let mut auth = HeaderMap::new();
+        auth.insert(
+            AUTHORIZATION,
+            "Bearer inline-test-token".parse().expect("header"),
+        );
+        let put = |options: HashMap<String, String>, headers: HeaderMap, peer_id: &str| {
+            update_peer_management_policy(
+                Path(peer_id.to_owned()),
+                Extension(state.clone()),
+                headers,
+                Json(ManagementPolicyRequest {
+                    allow_user_override: false,
+                    options,
+                }),
+            )
+        };
+        let stored = |pm: PeerMap| async move {
+            management_policy_from_peer(
+                &pm.get_registered(id)
+                    .await
+                    .expect("db")
+                    .expect("registered")
+                    .management_policy,
+            )
+        };
+
+        // Nothing set: the gate has nothing to refuse this controller for.
+        assert_eq!(controller_policy_rejection(&pm, id, None, "target-a").await, None);
+
+        // The editor's first save: outgoing Off, a password, an alias.
+        let first = match put(
+            opts(&[
+                (OPTION_NEMO_OUTBOUND_ENABLED, "N"),
+                ("nemo-permanent-password", "inline-s3cret"),
+                ("nemo-alias", "Front desk"),
+            ]),
+            auth.clone(),
+            id,
+        )
+        .await
+        {
+            Ok(Json(resp)) => resp,
+            Err((code, Json(err))) => panic!("put failed: {} {}", code, err.error),
+        };
+        assert_eq!(
+            first.policy.options["nemo-permanent-password"], MANAGED_SECRET_MASK,
+            "the PUT must answer with the mask, not the stored password"
+        );
+        assert_eq!(first.policy.options[OPTION_NEMO_OUTBOUND_ENABLED], "N");
+        assert_eq!(
+            stored(pm.clone()).await.options["nemo-permanent-password"],
+            "inline-s3cret"
+        );
+        assert_eq!(
+            controller_policy_rejection(&pm, id, None, "target-a").await.as_deref(),
+            Some("outgoing connections are disabled by TBF policy"),
+            "Outgoing connections = Deny in the inline policy is what the gate enforces"
+        );
+
+        // The second save, exactly as the dashboard builds it: start from what it was
+        // shown (password still the mask), switch outgoing back to Not set and limit the
+        // targets instead.
+        let mut shown = first.policy.options.clone();
+        shown.remove(OPTION_NEMO_OUTBOUND_ENABLED);
+        shown.insert(
+            OPTION_NEMO_OUTBOUND_TARGETS.to_owned(),
+            "target-a, target-b".to_owned(),
+        );
+        let second = match put(shown, auth.clone(), id).await {
+            Ok(Json(resp)) => resp,
+            Err((code, Json(err))) => panic!("put failed: {} {}", code, err.error),
+        };
+        assert_eq!(second.policy.options["nemo-permanent-password"], MANAGED_SECRET_MASK);
+        let kept = stored(pm.clone()).await;
+        assert_eq!(
+            kept.options["nemo-permanent-password"], "inline-s3cret",
+            "sending the mask back must keep the stored password, never store the mask"
+        );
+        assert_eq!(kept.options["nemo-alias"], "Front desk", "unlisted keys survive a save");
+        assert!(!kept.options.contains_key(OPTION_NEMO_OUTBOUND_ENABLED));
+        assert_eq!(controller_policy_rejection(&pm, id, None, "target-a").await, None);
+        assert_eq!(controller_policy_rejection(&pm, id, None, "target-b").await, None);
+        assert_eq!(
+            controller_policy_rejection(&pm, id, None, "target-c").await.as_deref(),
+            Some("target is not allowed by TBF policy"),
+            "Allowed target IDs in the inline policy is what the gate enforces"
+        );
+
+        // The GET is masked as well.
+        let got = match get_peer_management_policy(
+            Path(id.to_owned()),
+            Extension(state.clone()),
+            auth.clone(),
+        )
+        .await
+        {
+            Ok(Json(resp)) => resp,
+            Err((code, Json(err))) => panic!("get failed: {} {}", code, err.error),
+        };
+        assert_eq!(got.policy.options["nemo-permanent-password"], MANAGED_SECRET_MASK);
+        assert_eq!(got.policy.options[OPTION_NEMO_OUTBOUND_TARGETS], "target-a, target-b");
+
+        // The eye button: the audited reveal still hands back the stored value.
+        let revealed = match reveal_secret(
+            Extension(state.clone()),
+            auth.clone(),
+            None,
+            Json(RevealSecretRequest {
+                scope: "peer".to_owned(),
+                name: id.to_owned(),
+                key: "nemo-permanent-password".to_owned(),
+            }),
+        )
+        .await
+        {
+            Ok(resp) => resp.into_response(),
+            Err((code, Json(err))) => panic!("reveal failed: {} {}", code, err.error),
+        };
+        assert_eq!(revealed.status(), StatusCode::OK);
+        let mut body = revealed.into_body();
+        let mut bytes = Vec::new();
+        while let Some(chunk) = body.data().await {
+            bytes.extend_from_slice(&chunk.expect("body chunk"));
+        }
+        let value: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(value["value"], "inline-s3cret");
+        assert!(
+            STATS.read().await.events.iter().any(|e| e.kind == "secret-revealed"
+                && e.peer_id.as_deref() == Some(id)),
+            "a reveal is written to the Log"
+        );
+
+        // Still admin-only, and still a 404 for an id that was never registered.
+        let Err((code, _)) = put(opts(&[]), HeaderMap::new(), id).await else {
+            panic!("a tokenless PUT must be refused");
+        };
+        assert_eq!(code, StatusCode::UNAUTHORIZED);
+        let Err((code, _)) = put(
+            opts(&[(OPTION_NEMO_OUTBOUND_ENABLED, "N")]),
+            auth.clone(),
+            "inline-policy-test-no-such-peer",
+        )
+        .await
+        else {
+            panic!("an unregistered id has no inline policy to set");
+        };
+        assert_eq!(code, StatusCode::NOT_FOUND);
+
+        // Clearing every key removes the inline policy, and the gate opens again.
+        assert!(put(opts(&[]), auth.clone(), id).await.is_ok());
+        assert!(stored(pm.clone()).await.options.is_empty());
+        assert_eq!(controller_policy_rejection(&pm, id, None, "target-c").await, None);
+
+        for suffix in ["", "-wal", "-shm", "-journal"] {
+            let _ = std::fs::remove_file(format!("{}{}", db, suffix));
+        }
     }
 }
