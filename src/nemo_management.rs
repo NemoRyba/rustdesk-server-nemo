@@ -11457,6 +11457,22 @@ mod tests {
         assert!(put(opts(&[]), auth.clone(), id).await.is_ok());
         assert!(stored(pm.clone()).await.options.is_empty());
         assert_eq!(controller_policy_rejection(&pm, id, None, "target-c").await, None);
+        // An inline policy with no option is not stored at all, so its override switch
+        // is not either (the dashboard says so instead of showing it ticked).
+        assert!(update_peer_management_policy(
+            Path(id.to_owned()),
+            Extension(state.clone()),
+            auth.clone(),
+            Json(ManagementPolicyRequest {
+                allow_user_override: true,
+                options: HashMap::new(),
+            }),
+        )
+        .await
+        .is_ok());
+        let raw = pm.get_registered(id).await.expect("db").expect("registered").management_policy;
+        assert!(raw.as_deref().unwrap_or("").is_empty(), "stored {:?}", raw);
+        assert!(!stored(pm.clone()).await.allow_user_override);
 
         for suffix in ["", "-wal", "-shm", "-journal"] {
             let _ = std::fs::remove_file(format!("{}{}", db, suffix));

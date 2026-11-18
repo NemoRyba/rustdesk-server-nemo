@@ -3174,15 +3174,17 @@
               <b>Outgoing connections</b> and <b>Allowed target IDs</b> are also checked by this server at the
               hole punch and the relay for every outgoing session of this device, <b>whoever is signed in</b>,
               so a modified client cannot skip them there. A direct connection (published endpoint or LAN)
-              does not pass that check: there the device's own client and the target's authorization check
-              apply, and both follow the policy the device received.
+              does not pass that check: there only the device's own client holds it back, plus the target
+              itself when <b>Require management authorization for every session</b> is on there. Both follow
+              the policy the device received, so a modified client is stopped on a direct path only by such
+              targets.
             </div>
             <details id="inlinePolicyMore"${inlinePolicyOpen ? " open" : ""}>
               <summary style="cursor:pointer;font-size:12px;">All other inline settings (${restSet} set)</summary>
               <div class="user-policy-grid" style="margin-top:8px;">${rest.map((o) => policyControlScoped(withStoredChoice(o, opts[o[0]] || ""), opts[o[0]] || "")).join("")}</div>
             </details>
             ${unlisted.length ? `<div style="font-size:12px;opacity:0.75;line-height:1.5;overflow-wrap:anywhere;" title="Keys this editor does not list, e.g. set through PUT /nemo/api/peers/:id/management-policy. Saving keeps them unchanged.">Also set, kept as they are on Save: ${unlisted.map((k) => `<code>${escapeHtml(k)}</code>${opts[k] === MANAGED_SECRET_MASK ? " (secret)" : ` = <code>${escapeHtml(opts[k])}</code>`}`).join(", ")}</div>` : ""}
-            <label style="display:flex;gap:8px;align-items:flex-start;cursor:pointer;font-size:12px;" title="Off (recommended): the policy this device receives while nobody is signed in is enforced. On: it goes out as defaults the device's user may change locally &mdash; the whole delivered policy, Global client defaults included.">
+            <label style="display:flex;gap:8px;align-items:flex-start;cursor:pointer;font-size:12px;" title="Off (recommended): the policy this device receives while nobody is signed in is enforced. On: it goes out as defaults the device's user may change locally &mdash; the whole delivered policy, Global client defaults included. Stored only together with at least one setting in this inline policy.">
               <input id="inlinePolicyOverride" type="checkbox" ${mp.allow_user_override ? "checked" : ""} style="margin-top:2px;">
               <span>Allow this device's user to change these locally</span>
             </label>
@@ -3464,10 +3466,18 @@ uci commit fwknopd; /etc/init.d/fwknopd restart`;
           });
           // The answer carries the masks, never the stored secrets.
           peer.management_policy = res.policy || { allow_user_override: false, options: {} };
+          // An inline policy without a single option is not stored at all (the row's
+          // column goes back to empty), so its override switch is not either -- even
+          // though the PUT answer echoes it. Show what is stored.
+          const empty = !Object.keys(peer.management_policy.options || {}).length;
+          const droppedOverride = empty && !!peer.management_policy.allow_user_override;
+          if (empty) peer.management_policy = { allow_user_override: false, options: {} };
           // Saved, so nothing is left to protect from the refresh (see saveEndpoint).
           detailDirty = false;
           renderDetail(true);
-          setMsg("inlinePolicyMsg", "Saved — the device gets it on its next policy poll", true);
+          setMsg("inlinePolicyMsg", droppedOverride
+            ? "Cleared — nothing set, so 'Allow … change these locally' is not stored either"
+            : empty ? "Cleared — this device has no inline policy now" : "Saved — the device gets it on its next policy poll", true);
           renderPeers();
         } catch (err) {
           setMsg("inlinePolicyMsg", err.message, false);
