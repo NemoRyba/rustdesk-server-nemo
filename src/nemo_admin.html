@@ -1485,8 +1485,8 @@
       ["approve-mode", "Approval mode", "select", [["", "Local","Use the client default."], ["password-click", "Password + click","Requires the password AND the local user to accept."], ["click", "Click","The local user must click Accept; no password."], ["password", "Password","Password only; connects without the local user accepting."]], "Whether an incoming connection needs a password, a local click, or both."],
       ["nemo-permanent-password", "Incoming access password", "password"],
       ["default-connect-password", "Outgoing default password", "password"],
-      ["nemo-outbound-enabled", "Outgoing connections", "select", [["", "Not set", "This policy says nothing about it; the other policy layers decide."], ["Y", "Allow", "This policy allows outgoing sessions. A Device policy assigned to the device, or a signed-in user's policy, can still say Deny."], ["N", "Deny", "This device may not start any outgoing session. The server refuses it at the hole punch and the relay, whoever is signed in on it."]], "Whether this device may connect OUT to other machines, i.e. act as a controller. Its incoming sessions are not affected."],
-      ["nemo-outbound-targets", "Allowed target IDs", "text", null, "The TBFDesk IDs this device may connect to, separated by commas, semicolons or spaces. Blank or * = no limit. The server refuses any other target at the hole punch and the relay."],
+      ["nemo-outbound-enabled", "Outgoing connections", "select", [["", "Not set", "This policy says nothing about it; the other policy layers decide."], ["Y", "Allow", "This policy allows outgoing sessions. A Device policy assigned to the device, or a signed-in user's policy, can still say Deny."], ["N", "Deny", "The server refuses every outgoing session of this device at the hole punch and the relay, whoever is signed in on it. A direct connection (published endpoint or LAN) is held back only while the device receives this Deny: not while a user is signed in, nor when an assigned Device policy says Allow."]], "Whether this device may connect OUT to other machines, i.e. act as a controller. Its incoming sessions are not affected."],
+      ["nemo-outbound-targets", "Allowed target IDs", "text", null, "The TBFDesk IDs this device may connect to, separated by commas, semicolons or spaces. Blank or * = no limit. The server refuses any other target at the hole punch and the relay, whoever is signed in. A direct connection is held back only while the device receives this list: not while a user is signed in, nor when an assigned Device policy sets its own."],
       ["disable-change-permanent-password", "Lock password changes", "bool"],
       ["temporary-password-length", "Temporary password length", "text"],
       ["access-mode", "Access mode", "text"],
@@ -3174,10 +3174,12 @@
               <b>Outgoing connections</b> and <b>Allowed target IDs</b> are also checked by this server at the
               hole punch and the relay for every outgoing session of this device, <b>whoever is signed in</b>,
               so a modified client cannot skip them there. A direct connection (published endpoint or LAN)
-              does not pass that check: there only the device's own client holds it back, plus the target
-              itself when <b>Require management authorization for every session</b> is on there. Both follow
-              the policy the device received, so a modified client is stopped on a direct path only by such
-              targets.
+              does not pass that check: there only the policy the device <i>received</i> holds it back, in the
+              device's own client and at a target that has <b>Require management authorization for every
+              session</b> on (the device gets no authorization for a target that policy refuses). So these two
+              hold back nothing on a direct path <b>while a user is signed in</b> on this device (it receives
+              that user's policy instead) or where an assigned <b>Device policy</b> sets them. A modified client
+              is stopped on a direct path only by such targets.
             </div>
             <details id="inlinePolicyMore"${inlinePolicyOpen ? " open" : ""}>
               <summary style="cursor:pointer;font-size:12px;">All other inline settings (${restSet} set)</summary>
