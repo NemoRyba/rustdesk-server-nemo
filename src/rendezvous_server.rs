@@ -3367,4 +3367,141 @@ mod tests {
         integration::put_user_for_test(admin, None);
         integration::put_session_for_test(token, None);
     }
+
+    /// S-3 on the RELAY path: a RequestRelay through `handle_tcp`, the frame a forced
+    /// relay ("Always connect via relay") sends instead of a punch. Same gate as the
+    /// punch, but its own call site -- including its own `device_pub_b64` argument, which
+    /// is what lets the signed-in user's policy count. Forwarded = hbbs recorded the
+    /// pending relay for this controller address; refused = it did not.
+    #[test]
+    fn relay_enforces_a_named_device_and_global_policy_and_honours_a_proven_user() {
+        run_relay_enforces_a_named_device_and_global_policy_and_honours_a_proven_user();
+    }
+    #[tokio::main(flavor = "current_thread")]
+    async fn run_relay_enforces_a_named_device_and_global_policy_and_honours_a_proven_user() {
+        use crate::nemo_integration as integration;
+        let ctl = "s3-relay-ctl";
+        let device_pub = "czMtcmVsYXktZGV2aWNlLWtleQ==";
+        let (policy, admin, user, tok_admin, tok_user) = (
+            "__s3_relay_named_off",
+            "__s3_relay_admin",
+            "__s3_relay_user",
+            "__s3_relay_tok_admin",
+            "__s3_relay_tok_user",
+        );
+        let db = temp_db();
+        let mut pm = PeerMap::new_for_test(&db.0).await.unwrap();
+        register(&pm, "ws-01", "198.51.100.9:41000", Some(1), true).await;
+        let peer = pm.get_or(ctl).await;
+        pm.update_pk(
+            ctl.to_owned(),
+            peer,
+            "203.0.113.9:55000".parse().unwrap(),
+            Bytes::from_static(b"s3-relay-uuid"),
+            Bytes::from_static(b"s3-relay-pk"),
+            "203.0.113.9".to_owned(),
+        )
+        .await;
+        pm.set_peer_status(ctl, Some(1), None).await.expect("allow controller");
+        let mut off = HashMap::new();
+        off.insert("nemo-outbound-enabled".to_owned(), "N".to_owned());
+        integration::put_policy_for_test(
+            policy,
+            Some(integration::UserManagedPolicy { allow_user_override: false, options: off }),
+        );
+        integration::set_device_policy(ctl, Some(policy));
+        let mut p_admin = integration::UserPermission::default();
+        p_admin.enabled = true;
+        p_admin.is_admin = true;
+        integration::put_user_for_test(admin, Some(p_admin));
+        let mut p_user = integration::UserPermission::default();
+        p_user.enabled = true;
+        p_user.allowed_targets = vec!["*".to_owned()];
+        let mut on = HashMap::new();
+        on.insert("nemo-outbound-enabled".to_owned(), "Y".to_owned());
+        p_user.policy = integration::UserManagedPolicy { allow_user_override: false, options: on };
+        integration::put_user_for_test(user, Some(p_user));
+        let session = |username: &str| integration::Session {
+            username: username.to_owned(),
+            display_name: String::new(),
+            email: String::new(),
+            device_key_pub: device_pub.to_owned(),
+            expires_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                + 3600,
+        };
+        integration::put_session_for_test(tok_admin, Some(session(admin)));
+        integration::put_session_for_test(tok_user, Some(session(user)));
+
+        let relay = |token: &str| -> Vec<u8> {
+            let mut msg = RendezvousMessage::new();
+            msg.set_request_relay(RequestRelay {
+                id: "ws-01".to_owned(),
+                nemo_source: MessageField::some(hbb_common::rendezvous_proto::NemoSource {
+                    id: ctl.to_owned(),
+                    uuid: b"s3-relay-uuid".to_vec().into(),
+                    token: token.to_owned(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+            msg.write_to_bytes().unwrap()
+        };
+        async fn relayed(rs: &RendezvousServer, addr: SocketAddr) -> Option<String> {
+            rs.pending_relay
+                .lock()
+                .await
+                .get(&try_into_v4(addr))
+                .map(|p| p.target_id.clone())
+        }
+        let proven = AuthedDevice {
+            device_pub_b64: device_pub.to_owned(),
+            peer_id: ctl.to_owned(),
+        };
+        let other_key = AuthedDevice {
+            device_pub_b64: "b3RoZXItcmVsYXkta2V5".to_owned(),
+            peer_id: ctl.to_owned(),
+        };
+        let mut rs = test_server(pm, "192.168.0.0/16");
+        let (push_tx, _push_rx) = tokio::sync::mpsc::unbounded_channel::<RendezvousMessage>();
+        let mut sink = None;
+        // One controller address per case, so each case reads only its own entry.
+        let at = |port: u16| -> SocketAddr { format!("203.0.113.9:{port}").parse().unwrap() };
+
+        // Refusals first, so a missing entry cannot be stale state.
+        // Nobody signed in: the named device policy's "outgoing off" applies.
+        assert!(rs.handle_tcp(&relay(""), &mut sink, at(56001), "", false, &push_tx, Some(&proven)).await);
+        assert_eq!(relayed(&rs, at(56001)).await, None, "nobody signed in: refused");
+        // The admin's token on a connection that proved ANOTHER key: nobody signed in.
+        assert!(rs.handle_tcp(&relay(tok_admin), &mut sink, at(56002), "", false, &push_tx, Some(&other_key)).await);
+        assert_eq!(relayed(&rs, at(56002)).await, None, "token not proven here: refused");
+
+        // The admin's token, proven: the admin policy replaces the device policy.
+        assert!(rs.handle_tcp(&relay(tok_admin), &mut sink, at(56003), "", false, &push_tx, Some(&proven)).await);
+        assert_eq!(relayed(&rs, at(56003)).await.as_deref(), Some("ws-01"), "proven admin: relayed");
+
+        // The global source on this path too (this thread only): outgoing off globally,
+        // no device policy. Nobody signed in and the admin are refused; a user whose own
+        // policy re-enables outgoing is relayed.
+        integration::set_device_policy(ctl, None);
+        {
+            let _global = crate::nemo_management::set_global_policy_for_test(&[("nemo-outbound-enabled", "N")]);
+            assert!(rs.handle_tcp(&relay(""), &mut sink, at(56004), "", false, &push_tx, Some(&proven)).await);
+            assert_eq!(relayed(&rs, at(56004)).await, None, "global off, nobody signed in: refused");
+            assert!(rs.handle_tcp(&relay(tok_admin), &mut sink, at(56005), "", false, &push_tx, Some(&proven)).await);
+            assert_eq!(relayed(&rs, at(56005)).await, None, "global off binds the admin too: refused");
+            assert!(rs.handle_tcp(&relay(tok_user), &mut sink, at(56006), "", false, &push_tx, Some(&proven)).await);
+            assert_eq!(relayed(&rs, at(56006)).await.as_deref(), Some("ws-01"), "user re-enables: relayed");
+        }
+
+        integration::put_policy_for_test(policy, None);
+        for u in [admin, user] {
+            integration::put_user_for_test(u, None);
+        }
+        for t in [tok_admin, tok_user] {
+            integration::put_session_for_test(t, None);
+        }
+    }
 }
