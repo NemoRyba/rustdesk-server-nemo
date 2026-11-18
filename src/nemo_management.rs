@@ -1176,6 +1176,12 @@ struct ConnectionRecord {
     path: String, // "direct-local" | "direct-punch" | "direct-endpoint" | "direct-failed" | "relay"
     relay_server: String,
     nat_type: String,
+    /// Why, for a direct-endpoint report: the controller's reason for "direct-failed"
+    /// (connect timeout / refused / key mismatch ...), or the failed attempts before an
+    /// "established". Empty for every path this server negotiated itself. Before this,
+    /// the dashboard showed a red "direct-failed" and the reason only in a tooltip of
+    /// the Devices table, where the next success overwrote it.
+    detail: String,
     first_seen: std::time::Instant,
     last_seen: std::time::Instant,
     negotiations: u64,
@@ -5924,6 +5930,7 @@ struct ConnectionResponse {
     path: String,
     relay_server: String,
     nat_type: String,
+    detail: String,
     age_ms: u64,
     duration_ms: u64,
     negotiations: u64,
@@ -5960,6 +5967,7 @@ async fn get_connections(
             path: c.path.clone(),
             relay_server: c.relay_server.clone(),
             nat_type: c.nat_type.clone(),
+            detail: c.detail.clone(),
             age_ms: now.duration_since(c.last_seen).as_millis() as u64,
             duration_ms: c.last_seen.duration_since(c.first_seen).as_millis() as u64,
             negotiations: c.negotiations,
@@ -7167,6 +7175,13 @@ fn record_direct_report(
     let ms = body.get("ms").and_then(|v| v.as_u64());
     let source_addr = from.map(|a| a.to_string()).unwrap_or_default();
     upsert_connection(store, controller, &target, &source_addr, &endpoint, path, "", "");
+    if let Some(c) = store
+        .connections
+        .iter_mut()
+        .find(|c| c.source_id == controller && c.target_id == target)
+    {
+        c.detail = reason.clone();
+    }
     let summary = match (path, ms) {
         ("direct-endpoint", Some(ms)) => format!("{} established {} ms via {}", controller, ms, endpoint),
         ("direct-endpoint", None) => format!("{} established via {}", controller, endpoint),
@@ -7204,6 +7219,8 @@ fn upsert_connection(
         existing.target_addr = to_addr.to_owned();
         existing.relay_server = relay_server.to_owned();
         existing.nat_type = nat_type.to_owned();
+        // A new outcome for the pair; record_direct_report sets its own reason after.
+        existing.detail.clear();
     } else {
         store.connections.push(ConnectionRecord {
             source_id: source_id.to_owned(),
@@ -7213,6 +7230,7 @@ fn upsert_connection(
             path: path.to_owned(),
             relay_server: relay_server.to_owned(),
             nat_type: nat_type.to_owned(),
+            detail: String::new(),
             first_seen: now,
             last_seen: now,
             negotiations: 1,
@@ -10884,6 +10902,13 @@ mod tests {
         record_direct_report(&mut store, "480170882", &failed, Some(from));
         assert_eq!(store.connections[0].path, "direct-failed", "same pair, latest outcome");
         assert_eq!(store.peers["352069946"].direct_endpoint_failed, 1);
+        // The reason is on the connection itself, where the red badge is.
+        assert_eq!(store.connections[0].detail, "connection refused");
+        // ...and goes away with the next outcome that has none.
+        record_direct_report(&mut store, "480170882", &ok, Some(from));
+        assert_eq!(store.connections[0].path, "direct-endpoint");
+        assert_eq!(store.connections[0].detail, "");
+        record_direct_report(&mut store, "480170882", &failed, Some(from));
 
         // Not a session: a relay-only skip is logged only; a bad target is ignored.
         for body in [
@@ -11028,6 +11053,7 @@ mod tests {
                 path: "relay".to_owned(),
                 relay_server: "192.0.2.1".to_owned(),
                 nat_type: "SYMMETRIC".to_owned(),
+                detail: String::new(),
                 first_seen: now,
                 last_seen: now,
                 negotiations: 1,
