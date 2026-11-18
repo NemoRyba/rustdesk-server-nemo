@@ -11462,4 +11462,43 @@ mod tests {
             let _ = std::fs::remove_file(format!("{}{}", db, suffix));
         }
     }
+
+    /// S-4: the inline policy's editor has to stay RENDERED. It was defined
+    /// (`managementOptions`) and never shown for months, which left the layer the
+    /// rendezvous gate reads settable only by hand-made API calls.
+    #[test]
+    fn the_peer_detail_renders_an_editor_for_the_inline_policy() {
+        let html = include_str!("nemo_admin.html");
+        let detail = html
+            .split_once("function renderDetail(force) {")
+            .expect("renderDetail exists")
+            .1;
+        assert!(
+            detail.contains("${inlinePolicyEditorHtml(peer)}"),
+            "the peer detail must render the inline policy editor"
+        );
+        let editor = html
+            .split_once("function inlinePolicyEditorHtml(peer) {")
+            .expect("the editor exists")
+            .1
+            .split_once("function renderDetail(force) {")
+            .expect("the editor ends before renderDetail")
+            .0;
+        // Outgoing connections and Allowed target IDs come first.
+        assert!(html.contains(&format!(
+            "const INLINE_OUTBOUND_KEYS = [\"{OPTION_NEMO_OUTBOUND_ENABLED}\", \"{OPTION_NEMO_OUTBOUND_TARGETS}\"];"
+        )));
+        assert!(editor.contains("INLINE_OUTBOUND_KEYS.map("));
+        assert!(editor.contains("managementOptions.filter"), "the other inline keys are listed too");
+        // Saves through the existing route, starting from the options it was shown, so
+        // masked secrets and keys it does not list survive.
+        assert!(detail.contains("/management-policy`, {\n            method: \"PUT\""));
+        assert!(detail.contains("const options = Object.assign({}, policyOptions);"));
+        // The eye button on its secrets goes through the audited reveal of THIS peer.
+        assert!(html.contains("if (ip) return { scope: 'peer', name: ip.dataset.peer, key };"));
+        assert_eq!(
+            reveal_secret_label("peer", "1", "nemo-permanent-password").as_deref(),
+            Some("nemo-permanent-password (policy of peer 1)")
+        );
+    }
 }
