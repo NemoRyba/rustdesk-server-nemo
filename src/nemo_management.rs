@@ -6746,7 +6746,17 @@ fn outbound_policy_rejection(
 ///   withholds it on a non-confidential socket (client.rs nemo_source_marker) --, an
 ///   expired or unknown token, a disabled user, or a token bound to another key: nobody
 ///   is signed in, so the DEVICE layers apply (fail closed: an unproven user never lifts
-///   a device restriction). The user gate below refuses the bad-token cases on its own.
+///   a device restriction). The user gate (nemo_user_connection_rejection, which runs
+///   after this one) refuses a token bound to another key on its own, and an absent,
+///   unknown, expired or disabled-user token only while require-login is on. Because
+///   this gate runs first, a controller its device layers refuse gets THIS reason
+///   ("outgoing ... disabled" / "target is not allowed") rather than the user gate's.
+/// - The other side of "an unproven user never lifts a device restriction": a user
+///   policy STRICTER than the device layers binds only while the token is presented.
+///   With require-login off, a controller that leaves the token out gets the device
+///   layers here -- exactly what its policy poll and ticket give it without a token, so
+///   gate and ticket still agree. Make the device layers (global / named / inline) the
+///   floor that must hold for everyone, or turn require-login on.
 /// - Admins get no exemption here, as in the ticket: an admin's policy is the admin
 ///   policy layered over the global one, so an admin is refused only when that says so
 ///   (outbound "N", or targets that exclude this one) -- and then their ticket is withheld
