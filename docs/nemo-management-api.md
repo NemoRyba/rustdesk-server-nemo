@@ -96,11 +96,14 @@ git revert <nemo-management-api-commit>
   over `nemo-policy-report:{id}:{ts}:{sha256(report)}`; reports without a valid one are ignored.
 - `POST /nemo/api/peers/{id}/block` — blocks the peer and ends its running sessions in
   both directions: the ones it hosts, and the ones it is controlling (every machine the
-  connection store shows it connected to, relayed or direct). As with
+  connection store shows it connected to, relayed or direct, and every machine hbbs
+  brokered a relay to for it that hbbr has not reported ended). As with
   `/connections/cut`, each machine closes them itself on its next policy poll (~30 s) and
   drops all of its sessions, not only the blocked controller's. A session the server never
   saw negotiated, or no longer holds in its connection history (restart, history limit),
-  is not reached; the blocked id is still refused at its next logon there.
+  is not reached; the blocked id is still refused at its next logon there. That refusal
+  starts with each machine's next poll: a direct-endpoint session the blocked peer opens
+  to a machine before that poll is not ended by this call.
 - `POST /nemo/api/peers/{id}/allow`
 - `POST /nemo/api/peers/{id}/reset-policy`
 - `POST /nemo/api/peers/{id}/delete`
