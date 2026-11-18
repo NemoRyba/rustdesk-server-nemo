@@ -1485,8 +1485,8 @@
       ["approve-mode", "Approval mode", "select", [["", "Local","Use the client default."], ["password-click", "Password + click","Requires the password AND the local user to accept."], ["click", "Click","The local user must click Accept; no password."], ["password", "Password","Password only; connects without the local user accepting."]], "Whether an incoming connection needs a password, a local click, or both."],
       ["nemo-permanent-password", "Incoming access password", "password"],
       ["default-connect-password", "Outgoing default password", "password"],
-      ["nemo-outbound-enabled", "Outgoing connections", "select", [["", "Local"], ["Y", "Allow"], ["N", "Deny"]]],
-      ["nemo-outbound-targets", "Allowed target IDs", "text"],
+      ["nemo-outbound-enabled", "Outgoing connections", "select", [["", "Not set", "This policy says nothing about it; the other policy layers decide."], ["Y", "Allow", "This policy allows outgoing sessions. A Device policy assigned to the device, or a signed-in user's policy, can still say Deny."], ["N", "Deny", "The server refuses every outgoing session of this device at the hole punch and the relay, whoever is signed in on it. A direct connection (published endpoint or LAN) is held back only while the device receives this Deny: not while a user is signed in, nor when an assigned Device policy says Allow."]], "Whether this device may connect OUT to other machines, i.e. act as a controller. Its incoming sessions are not affected."],
+      ["nemo-outbound-targets", "Allowed target IDs", "text", null, "The TBFDesk IDs this device may connect to, separated by commas, semicolons or spaces. Blank or * = no limit. The server refuses any other target at the hole punch and the relay, whoever is signed in. A direct connection is held back only while the device receives this list: not while a user is signed in, nor when an assigned Device policy sets its own."],
       ["disable-change-permanent-password", "Lock password changes", "bool"],
       ["temporary-password-length", "Temporary password length", "text"],
       ["access-mode", "Access mode", "text"],
@@ -3117,6 +3117,86 @@
       return detailDirty || detail.contains(document.activeElement);
     }
 
+    // S-4: the peer's INLINE policy -- the options stored on its own row
+    // (PUT /nemo/api/peers/:id/management-policy). It used to have no editor at all
+    // (managementOptions was defined but never rendered), although it is the layer the
+    // server's hole-punch / relay controller gate reads nemo-outbound-* from. Outgoing
+    // connections and Allowed target IDs come first; the rest of managementOptions sits
+    // in a collapsed list. Controls carry no ids (policyControlScoped): the per-user
+    // inline editor renders policyControl's "policy-<key>" ids into the same page.
+    // Secrets arrive masked; pwSecretContext maps this panel to the audited reveal
+    // (scope "peer").
+    const INLINE_OUTBOUND_KEYS = ["nemo-outbound-enabled", "nemo-outbound-targets"];
+    // Whether "All other inline settings" is expanded, so the 5 s rebuild keeps it open.
+    let inlinePolicyOpen = false;
+    // A select whose stored value (e.g. written through the API) is not one of its
+    // choices would show "Local" and DELETE that value on the next Save. Offer the stored
+    // value as an extra, selected choice instead, so saving keeps it.
+    function withStoredChoice(option, value) {
+      const [key, label, type, choices, desc] = option;
+      if (type === "text" || type === "password" || !value) return option;
+      const items = choices || BOOL_CHOICES;
+      if (items.some((it) => it[0] === value)) return option;
+      return [key, label, type, items.concat([[value, `${value} (stored)`, "The stored value; this list does not offer it. Kept as it is on Save."]]), desc];
+    }
+    function inlinePolicyEditorHtml(peer) {
+      const mp = peer.management_policy || {};
+      const opts = mp.options || {};
+      const listed = new Set(managementOptions.map((o) => o[0]));
+      const setCount = Object.keys(opts).length;
+      const outbound = INLINE_OUTBOUND_KEYS.map((key) => managementOptions.find((o) => o[0] === key)).filter(Boolean);
+      const outboundHtml = outbound.map((option) => {
+        const value = opts[option[0]] || "";
+        const [key, label, type, choices, desc] = withStoredChoice(option, value);
+        const lt = desc ? ` title="${escapeAttr(desc)}"` : "";
+        const field = type === "text"
+          ? `<input type="text" class="mono" data-policy-key="${escapeHtml(key)}" value="${escapeHtml(value)}" placeholder="— not set: no limit —"${lt}>`
+          : `<select data-policy-key="${escapeHtml(key)}"${lt}>${(choices || BOOL_CHOICES).map((it) => `<option value="${escapeHtml(it[0])}" ${value === it[0] ? "selected" : ""}${it[2] ? ` title="${escapeAttr(it[2])}"` : ""}>${escapeHtml(it[1])}</option>`).join("")}</select>`;
+        return `<div class="fld"><label${lt}>${escapeHtml(label)}</label>${field}</div>`;
+      }).join("");
+      const rest = managementOptions.filter((o) => !INLINE_OUTBOUND_KEYS.includes(o[0]));
+      const restSet = rest.filter((o) => (opts[o[0]] || "") !== "").length;
+      const unlisted = Object.keys(opts).filter((k) => !listed.has(k)).sort();
+      const devicePolicyName = (integ.devicePolicies || {})[peer.id] || "";
+      return `
+          <div id="inlinePolicyPanel" data-peer="${escapeHtml(peer.id)}" style="display:grid;gap:8px;margin-top:6px;border-top:1px solid rgba(128,128,128,0.25);padding-top:12px;">
+            <div style="font-weight:600;font-size:13px;" title="The options stored on this device's own row. Same keys as a named policy, for this one device.">Inline policy (this device only)
+              ${setCount ? `<span class="badge allowed" style="margin-left:4px">${setCount} set</span>` : '<span class="badge" style="margin-left:4px;opacity:0.7">nothing set</span>'}</div>
+            <div style="font-size:12px;opacity:0.75;line-height:1.5;">
+              While <b>nobody is signed in</b> on this device, it receives these on top of the
+              <b>Global client defaults</b>. A <b>Device policy</b> assigned above wins for every key it also
+              sets, and a signed-in user's own policy replaces this one. Blank / <i>Not set</i> = this policy
+              says nothing about that setting.
+              ${devicePolicyName ? `<br><b>Device policy &ldquo;${escapeHtml(devicePolicyName)}&rdquo; is assigned</b>: where it sets a key, its value is what the device receives.` : ""}
+            </div>
+            ${outboundHtml}
+            <div style="font-size:12px;opacity:0.75;line-height:1.5;">
+              <b>Outgoing connections</b> and <b>Allowed target IDs</b> are also checked by this server at the
+              hole punch and the relay for every outgoing session of this device, <b>whoever is signed in</b>,
+              so a modified client cannot skip them there. A direct connection (published endpoint or LAN)
+              does not pass that check: there only the policy the device <i>received</i> holds it back, in the
+              device's own client and at a target that has <b>Require management authorization for every
+              session</b> on (the device gets no authorization for a target that policy refuses). So these two
+              hold back nothing on a direct path <b>while a user is signed in</b> on this device (it receives
+              that user's policy instead) or where an assigned <b>Device policy</b> sets them. A modified client
+              is stopped on a direct path only by such targets.
+            </div>
+            <details id="inlinePolicyMore"${inlinePolicyOpen ? " open" : ""}>
+              <summary style="cursor:pointer;font-size:12px;">All other inline settings (${restSet} set)</summary>
+              <div class="user-policy-grid" style="margin-top:8px;">${rest.map((o) => policyControlScoped(withStoredChoice(o, opts[o[0]] || ""), opts[o[0]] || "")).join("")}</div>
+            </details>
+            ${unlisted.length ? `<div style="font-size:12px;opacity:0.75;line-height:1.5;overflow-wrap:anywhere;" title="Keys this editor does not list, e.g. set through PUT /nemo/api/peers/:id/management-policy. Saving keeps them unchanged.">Also set, kept as they are on Save: ${unlisted.map((k) => `<code>${escapeHtml(k)}</code>${opts[k] === MANAGED_SECRET_MASK ? " (secret)" : ` = <code>${escapeHtml(opts[k])}</code>`}`).join(", ")}</div>` : ""}
+            <label style="display:flex;gap:8px;align-items:flex-start;cursor:pointer;font-size:12px;" title="Off (recommended): the policy this device receives while nobody is signed in is enforced. On: it goes out as defaults the device's user may change locally &mdash; the whole delivered policy, Global client defaults included. Stored only together with at least one setting in this inline policy.">
+              <input id="inlinePolicyOverride" type="checkbox" ${mp.allow_user_override ? "checked" : ""} style="margin-top:2px;">
+              <span>Allow this device's user to change these locally</span>
+            </label>
+            <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+              <button id="inlinePolicySave" class="primary">Save inline policy</button>
+              <span id="inlinePolicyMsg" style="font-size:12px;opacity:0.8;"></span>
+            </div>
+          </div>`;
+    }
+
     function renderDetail(force) {
       const peer = state.peers.find((item) => item.id === state.selectedId);
       const detail = $("detail");
@@ -3134,8 +3214,6 @@
       const managementPolicy = peer.management_policy || {};
       const policyOptions = managementPolicy.options || {};
       const allowUserOverride = !!managementPolicy.allow_user_override;
-      const advancedOptions = {};
-      Object.keys(policyOptions).sort().forEach((key) => advancedOptions[key] = policyOptions[key]);
       detail.className = "detail";
       detail.innerHTML = `
         <dl class="kv">
@@ -3223,7 +3301,8 @@
               <span id="devicePolicyMsg" style="font-size:12px;opacity:0.8;"></span>
             </div>
           </div>
-          <div style="font-size:12px;opacity:0.75;line-height:1.5;margin-top:8px;">Session settings (file transfer, view-only, terminal, etc.) are managed through <b>named policies</b>. Assign one above, or create and edit them in <b>ACL &amp; Policy</b>. A logged-in user's own policy still overrides the device policy.</div>
+          <div style="font-size:12px;opacity:0.75;line-height:1.5;margin-top:8px;">Session settings (file transfer, view-only, terminal, etc.) are managed through <b>named policies</b>. Assign one above, or create and edit them in <b>ACL &amp; Policy</b>. The <b>inline policy</b> below holds settings for this device alone. A logged-in user's own policy still overrides both.</div>
+          ${inlinePolicyEditorHtml(peer)}
         </div>
       `;
       // M1-CLAIM: the same confirm/deny the peer row offers, for the operator who got
@@ -3364,6 +3443,64 @@ uci commit fwknopd; /etc/init.d/fwknopd restart`;
           return;
         }
         saveKnockKey(true);
+      });
+
+      // ---- Inline policy (S-4) ----
+      const inlineMore = $("inlinePolicyMore");
+      if (inlineMore) inlineMore.addEventListener("toggle", () => { inlinePolicyOpen = inlineMore.open; });
+      const inlineSave = $("inlinePolicySave");
+      if (inlineSave) inlineSave.addEventListener("click", async () => {
+        // The 5 s refresh replaces state.peers with NEW objects and, while this panel is
+        // being edited, skips the rebuild -- so by the time Save is clicked, `peer` and
+        // `policyOptions` can belong to an object no longer in state.peers. Work on the
+        // live entry: writing the answer only to the orphan made the rebuild below show
+        // the values from BEFORE this Save under "Saved", and a second Save from that
+        // view quietly undid the first (e.g. took a Deny out again).
+        const livePeer = () => state.peers.find((p) => p.id === peer.id) || peer;
+        // The PUT replaces the whole inline policy. Start from what the server last
+        // showed (secrets as the mask, which it restores to the stored value), so keys
+        // this editor does not list -- nemo-alias, anything set through the API --
+        // survive, and set or remove only the keys rendered here.
+        const options = Object.assign({}, ((livePeer().management_policy || {}).options) || policyOptions);
+        $("inlinePolicyPanel").querySelectorAll("[data-policy-key]").forEach((el) => {
+          const v = (el.value || "").trim();
+          if (v !== "") options[el.dataset.policyKey] = v;
+          else delete options[el.dataset.policyKey];
+        });
+        const override = $("inlinePolicyOverride");
+        try {
+          const res = await api(`/nemo/api/peers/${encodeURIComponent(peer.id)}/management-policy`, {
+            method: "PUT",
+            body: JSON.stringify({ allow_user_override: override ? override.checked : allowUserOverride, options })
+          });
+          // The answer carries the masks, never the stored secrets.
+          let saved = res.policy || { allow_user_override: false, options: {} };
+          // The server drops a key it does not accept or a value over its length limit
+          // (sanitize_management_policy) and still answers 200: name those, not "Saved".
+          const kept = saved.options || {};
+          const notKept = Object.keys(options).filter((k) => !Object.prototype.hasOwnProperty.call(kept, k)).sort();
+          // An inline policy without a single option is not stored at all (the row's
+          // column goes back to empty), so its override switch is not either -- even
+          // though the PUT answer echoes it. Show what is stored.
+          const empty = !Object.keys(kept).length;
+          const droppedOverride = empty && !!saved.allow_user_override;
+          if (empty) saved = { allow_user_override: false, options: {} };
+          peer.management_policy = saved;
+          livePeer().management_policy = saved;
+          // Saved, so nothing is left to protect from the refresh (see saveEndpoint).
+          detailDirty = false;
+          renderDetail(true);
+          if (notKept.length) {
+            setMsg("inlinePolicyMsg", `Saved, but the server did not keep: ${notKept.join(", ")} (a setting it does not accept, or a value that is too long)`, false);
+          } else {
+            setMsg("inlinePolicyMsg", droppedOverride
+              ? "Cleared — nothing set, so 'Allow … change these locally' is not stored either"
+              : empty ? "Cleared — this device has no inline policy now" : "Saved — the device gets it on its next policy poll", true);
+          }
+          renderPeers();
+        } catch (err) {
+          setMsg("inlinePolicyMsg", err.message, false);
+        }
       });
 
       const dps = $("devicePolicySelect");
@@ -4396,6 +4533,9 @@ uci commit fwknopd; /etc/init.d/fwknopd restart`;
       if (def) return { scope: 'policy', name: def.dataset.policyName, key };
       const up = input.closest('#userPolicyPanel[data-user]');
       if (up) return { scope: 'user', name: up.dataset.user, key };
+      // The peer detail's inline policy editor: the secret is on that peer's own row.
+      const ip = input.closest('#inlinePolicyPanel[data-peer]');
+      if (ip) return { scope: 'peer', name: ip.dataset.peer, key };
       return null;
     }
     function decoratePwInput(input) {
