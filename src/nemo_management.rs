@@ -7937,9 +7937,34 @@ async fn block_peer(
     // RwLock is not reentrant. Called AFTER set_peer_policy, so the poll that carries
     // the revocation to a target also carries the id in `nemo-blocked-ids`, and the
     // controller's reconnect is refused there (and at the rendezvous gate already).
-    let controlled = terminate_sessions_from_controllers(&[id.clone()], "controller blocked").await;
+    let mut controlled =
+        terminate_sessions_from_controllers(&[id.clone()], "controller blocked").await;
     {
         let mut store = STATS.write().await;
+        // S-2 review: ...and the relayed sessions the connection store cannot name. A
+        // RequestRelay sent WITHOUT a punch first (any client can send one) is gated
+        // exactly like a punch but never writes a connection row, so the helper above
+        // does not see it. hbbs did broker it, though, and filed the grant under the
+        // controller's PROVEN id (record_relay_grant). Here in Block only, so device-key
+        // delete and the user/permission evictions keep their exact behaviour.
+        for t in relay_targets_of_controller(&store, &id) {
+            if controlled.contains(&t) {
+                continue;
+            }
+            let ts = set_peer_terminate(&t);
+            record_event_locked(
+                &mut store,
+                "connection-cut",
+                Some(&t),
+                None,
+                format!(
+                    "sessions revoked as of {} (controller blocked; relayed session brokered \
+                     for controller {:?})",
+                    ts, id
+                ),
+            );
+            controlled.push(t);
+        }
         store.connections.retain(|c| c.target_id != id);
         record_event_locked(
             &mut store,
@@ -7950,6 +7975,29 @@ async fn block_peer(
         );
     }
     Ok(resp)
+}
+
+/// The targets of the relayed sessions hbbs brokered for `controller` that may still be
+/// running. Only a row hbbr reported and then dropped is known to have ended; a row it
+/// never reported counts as running, because that is also what every row looks like
+/// when the relay's counters do not reach hbbs (separate containers, another relay),
+/// and Block must over-revoke there, never under.
+fn relay_targets_of_controller(store: &NemoStatsStore, controller: &str) -> Vec<String> {
+    let mut targets: Vec<String> = Vec::new();
+    if controller.is_empty() {
+        return targets;
+    }
+    for r in store.relay_sessions.iter() {
+        let known_ended = !r.live && r.last_sample_at.is_some();
+        if r.source_id == controller
+            && !known_ended
+            && !r.target_id.is_empty()
+            && !targets.contains(&r.target_id)
+        {
+            targets.push(r.target_id.clone());
+        }
+    }
+    targets
 }
 
 /// The `peer-blocked` audit line: both directions Block ended, so the log says what
@@ -11369,6 +11417,18 @@ mod tests {
         assert!(some.contains("\"111\"") && some.contains("\"222\""));
     }
 
+    fn s2_relay_row(source: &str, target: &str, live: bool, sampled: bool) -> RelaySessionRecord {
+        RelaySessionRecord {
+            session: format!("label-{}-{}", source, target),
+            source_id: source.to_owned(),
+            target_id: target.to_owned(),
+            brokered_at: "t0".to_owned(),
+            live,
+            last_sample_at: if sampled { Some("t1".to_owned()) } else { None },
+            ..Default::default()
+        }
+    }
+
     /// A registered, allowed controller and an authorised API state, for the S-2 review
     /// tests that drive the real `block_peer`.
     async fn s2_blockable_controller(db: &str, ctl: &str) -> (HbbsApiState, HeaderMap) {
@@ -11471,6 +11531,88 @@ mod tests {
         let line = s2_block_audit_line(ctl).await;
         assert!(line.contains(tgt), "the audit line must name {}: {:?}", tgt, line);
         s2_remove_db(&db);
+    }
+
+    /// S-2 review: a RequestRelay sent without a punch first passes the same controller
+    /// gates but writes no connection row; only the relay row hbbs files at the grant
+    /// names the controller. Block must reach that target too.
+    #[test]
+    fn blocking_a_controller_ends_its_relayed_sessions_that_have_no_connection_row() {
+        run_blocking_a_controller_ends_its_relayed_sessions_that_have_no_connection_row();
+    }
+    #[tokio::main(flavor = "current_thread")]
+    async fn run_blocking_a_controller_ends_its_relayed_sessions_that_have_no_connection_row() {
+        let db = format!("target/nemo_block_relayonly_test_{}.sqlite3", std::process::id());
+        // Unique ids: STATS and PEER_TERMINATE are process-global.
+        let ctl = "s2r-blocked-controller";
+        let other_ctl = "s2r-other-controller";
+        let tgt_live = "s2r-target-relay-live";
+        let tgt_unsampled = "s2r-target-unsampled";
+        let tgt_ended = "s2r-target-ended";
+        let tgt_other = "s2r-target-other";
+        let (state, auth) = s2_blockable_controller(&db, ctl).await;
+        {
+            let mut store = STATS.write().await;
+            // Relayed and reported live by hbbr; and brokered but never reported (the
+            // shape of every row when the relay's counters do not reach hbbs).
+            store.relay_sessions.push(s2_relay_row(ctl, tgt_live, true, true));
+            store.relay_sessions.push(s2_relay_row(ctl, tgt_unsampled, false, false));
+            // hbbr reported it and then dropped it: that session is over.
+            store.relay_sessions.push(s2_relay_row(ctl, tgt_ended, false, true));
+            // Somebody else's live relayed session.
+            store.relay_sessions.push(s2_relay_row(other_ctl, tgt_other, true, true));
+        }
+        let t0 = now_epoch_secs();
+        if let Err((code, Json(err))) = block_peer(Path(ctl.to_owned()), Extension(state), auth).await {
+            panic!("block failed: {} {}", code, err.error);
+        }
+        for t in [tgt_live, tgt_unsampled] {
+            assert!(
+                peer_terminate_before(t) >= t0,
+                "the relayed session {} -> {} must be revoked by Block",
+                ctl,
+                t
+            );
+        }
+        assert!(
+            peer_terminate_before(tgt_ended) < t0,
+            "a relayed session hbbr saw end is not revoked again"
+        );
+        assert!(
+            peer_terminate_before(tgt_other) < t0,
+            "another controller's relayed session is not Block's business"
+        );
+        let line = s2_block_audit_line(ctl).await;
+        for t in [tgt_live, tgt_unsampled] {
+            assert!(line.contains(t), "the audit line must name {}: {:?}", t, line);
+        }
+        assert!(!line.contains(tgt_ended) && !line.contains(tgt_other), "{:?}", line);
+        STATS
+            .write()
+            .await
+            .relay_sessions
+            .retain(|r| r.source_id != ctl && r.source_id != other_ctl);
+        s2_remove_db(&db);
+    }
+
+    #[test]
+    fn relay_targets_of_a_controller_are_the_ones_not_known_to_have_ended() {
+        let mut store = NemoStatsStore::default();
+        store.relay_sessions.push(s2_relay_row("c1", "t-live", true, true));
+        store.relay_sessions.push(s2_relay_row("c1", "t-live", true, true));
+        store.relay_sessions.push(s2_relay_row("c1", "t-unsampled", false, false));
+        store.relay_sessions.push(s2_relay_row("c1", "t-ended", false, true));
+        store.relay_sessions.push(s2_relay_row("c1", "", true, true));
+        store.relay_sessions.push(s2_relay_row("c2", "t-other", true, true));
+        // An older client that sends no marker is filed under "": Block never runs on
+        // an empty id, and if it did it must not sweep up every such row.
+        store.relay_sessions.push(s2_relay_row("", "t-anon", true, true));
+        assert_eq!(
+            relay_targets_of_controller(&store, "c1"),
+            vec!["t-live".to_owned(), "t-unsampled".to_owned()]
+        );
+        assert!(relay_targets_of_controller(&store, "").is_empty());
+        assert!(relay_targets_of_controller(&store, "c3").is_empty());
     }
 
     #[test]
